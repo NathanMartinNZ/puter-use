@@ -1,6 +1,6 @@
 [project]
 name = "puter-use"
-version = "1.0.0"
+version = "1.0.1"
 description = "Background computer use for macOS: an agent gets its own cursor and operates app windows without touching yours."
 readme = "README.md"
 license = "MIT"

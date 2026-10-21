@@ -20,7 +20,10 @@ keyboard are never used, so they can keep working. Loop: windows -> screenshot(w
 act(actions) -> repeat. act returns a new screenshot only when the window visibly changed. \
 Screenshots are downscaled to save context: give x,y in the screenshot's own pixels (they are \
 mapped to the real window for you) and use screenshot(region=...) to read small text. act waits \
-for the window to settle by itself, so you rarely need a wait action.
+for the window to settle by itself, so you rarely need a wait action. Keys go to the app's key \
+window: if the user brings another window of that app forward, keyboard actions stop with an error \
+naming that window (nothing is typed into theirs) - wait until it's back, don't work around it. \
+Your clicks still go to your window.
 Aim by what things say where you can: target: "Save" names the element showing that text and is \
 looked up as the action runs, so it can't miss when the window shifts (find lists matches). Batch \
 every step you can predict into one act call (fill a form, press a key sequence), and prefer \
@@ -230,10 +233,14 @@ async def act(actions: list[Action], window: int | str | None = None, text: Outl
       act (they'd take the user's typing): one left open is closed and its items are listed.
     - scroll {x?,y?, scroll_x?, scroll_y?}: pixels, positive = right/down (e.g. scroll_y: 600)
     - type {text, element|x,y?, clear?, submit?}: into the focused field, or click the given one first;
-      clear empties it, submit presses Return. Long text is pasted (your clipboard is restored);
-      "\n" is the Return key, "\t" Tab.
+      in a browser's address bar the new address replaces the old (never added to it); clear empties
+      it, submit presses Return. Long text is pasted (your clipboard is restored); "\n" is the Return
+      key, "\t" Tab.
     - keypress {keys, repeat?}: "cmd+t", ["ctrl","a"], or a sequence "Tab Tab Return" /
       ["cmd+a","BackSpace"]; repeat 1-100. Names: Return, Tab, Escape, BackSpace, Delete, Up, PageDown, F5
+    - Keys and menu commands act on the app's key window. If another window of the same app has it (the
+      user's), typing, shortcuts, modifier-clicks and menu commands stop with an error naming that
+      window: nothing is done there. Clicks still go to this window. Wait until it's back, then retry.
     - key_down/key_up {keys}: hold keys over later actions; hold_key {keys, ms ≤ 10000}. mouse_down {x,y|element},
       move (drags while down), mouse_up {x?,y?}. Anything still held is let go at the end.
     - menu {item: "File > Export as PDF…"}: a menu-bar command, no pointer needed (menus lists them)

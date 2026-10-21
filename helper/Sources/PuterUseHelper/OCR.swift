@@ -2,7 +2,7 @@ import AppKit
 import Vision
 
 /// Reading text off the pixels, for what accessibility doesn't expose: canvas and game apps, images,
-/// PDFs drawn as pictures, some Electron and Java apps. Slower than accessibility (0.1–0.6 s a window)
+/// PDFs drawn as pictures, some Electron and Java apps. Slower than accessibility (0.1-0.6 s a window)
 /// and approximate, so it's only the fallback.
 enum OCR {
     struct Line {

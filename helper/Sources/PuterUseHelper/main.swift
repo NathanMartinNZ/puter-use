@@ -4,7 +4,7 @@ import AppKit
 // Accessibility permissions, serves a JSON-lines API on a Unix socket, and draws the
 // agent's own cursor + "agent in control" badge so the user's real cursor is never used.
 
-let version = "1.0.0"
+let version = "1.0.1"
 
 func socketPath() -> String {
     if let p = ProcessInfo.processInfo.environment["PUTER_USE_SOCKET"], !p.isEmpty { return p }

@@ -25,11 +25,13 @@ number from an outline, `find` or marks) or `target` (the text it shows, see [Na
 - `move {x,y}`, `drag {path:[[x,y],…]}`
 - `scroll {x?,y?,scroll_x?,scroll_y?}` (pixels, positive = right/down)
 - `type {text, element|x,y?, clear?, submit?}`: with a field given, it's clicked first (the caret goes
-  after its text); `clear` empties it, `submit` presses Return. Only text fields: naming a button
-  fails, and `clear` fails if the focus isn't on a text field (select-all and delete elsewhere could
-  empty a whole list). If the click doesn't put the caret in the field, nothing is typed
+  after its text; a selection the app made, like the whole address a browser selects when its address
+  bar is clicked, is kept, so the new text replaces it); `clear` empties it, `submit` presses Return.
+  Text typed at the focus into a browser's address bar replaces the address too. Only text fields:
+  naming a button fails, and `clear` fails if the focus isn't on a text field (select-all and delete
+  elsewhere could empty a whole list). If the click doesn't put the caret in the field, nothing is typed
 - `keypress {keys, repeat?}`: a shortcut (`"cmd+t"`, `["ctrl","a"]`) or a sequence (`"Tab Tab Return"`,
-  `["cmd+a","BackSpace"]`), pressed `repeat` times (1–100) with a person's pauses between keys
+  `["cmd+a","BackSpace"]`), pressed `repeat` times (1-100) with a person's pauses between keys
 - `key_down {keys}` / `key_up {keys?}` hold keys across later actions (every event carries a held
   modifier, and a click while shift is held is a shift-click, as with a real keyboard); `type` refuses
   while they're held (`key_up` first). `hold_key {keys, ms}` (up to 10 s); `mouse_down {x,y|element, keys?}`, `move`
@@ -60,6 +62,14 @@ number from an outline, `find` or marks) or `target` (the text it shows, see [Na
 - `macro {name, vars?}`: replays a saved macro (see [Macros](#macros))
 - `wait {ms}`, only for something slow (a page load, a search). `act` already waits for the window to
   settle after each batch.
+
+**Keyboard isolation.** Key events go to the app's key window, not the window they're stamped for. If
+another window of the same app has the keyboard (you brought one forward), keyboard actions and menu
+commands (which act on the focused window) stop with an error naming that window instead of acting on
+yours; the check repeats before each keystroke, so taking the keyboard mid-text stops it there. Clicks
+and accessibility actions still go to the agent's window. Switch away (or focus its window) and
+retry; `foreground=true` is the explicit fallback that raises the app and uses the real keyboard,
+interrupting you.
 
 An element behind an open sheet or modal dialog can't be pressed, set or focused, just as a person
 couldn't click it: the action fails and names the sheet's buttons.

@@ -20,6 +20,6 @@ for the CLI, in your shell.
 | `PUTER_USE_PASTE_OVER` | `100` | text longer than this many characters (per line) is pasted instead of typed; `0` = always type |
 | `PUTER_USE_SESSION` | `mcp-<pid>` / `default` | the session requests belong to (see [Sessions](tools.md#sessions)) |
 | `PUTER_USE_APP_CARDS` | `1` | `0` turns off the line about an app on the first look at it |
-| `PUTER_USE_OUTLINE_CHARS` | `8000` | longest accessibility outline sent (500–40000) |
+| `PUTER_USE_OUTLINE_CHARS` | `8000` | longest accessibility outline sent (500-40000) |
 | `PUTER_USE_TRACE` | unset | a file to log every event sent and cursor frame drawn (for `scripts/check_motion.py`) |
 | `PUTER_USE_SHOTS` | `~/Library/Caches/puter-use/shots` | where the CLI writes screenshots |

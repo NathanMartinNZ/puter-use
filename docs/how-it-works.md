@@ -25,6 +25,15 @@ open-codex-computer-use and cua-driver, and verified here on macOS 27:
 | menus and popovers close when the app deactivates | the target stays AppKit-active between calls. It's released on `release`, on switching apps, or after 2 idle minutes. If you bring the app forward yourself, the hold is simply dropped: an app that's really in front is never told it's inactive (Firefox would ignore your clicks until you switched apps) |
 | a primer click outside a menu dismisses it | clicks that land on the app's own menu, popover or sheet go to that window, without a primer |
 
+**Keyboard isolation.** Key events follow the app's key window, whatever window they're stamped with.
+So before every key, puter-use checks that the target window is still the app's key window. If another
+window of the same app has it (the user brought one forward), typing, shortcuts, modifier-clicks and
+menu commands (which act on the focused window) stop and say which window has the keyboard, rather
+than acting on the user's. Clicks are stamped with their window and still go to the agent's. The check
+happens again before each keystroke while typing, so taking the keyboard mid-text stops it there.
+`foreground=true` is the explicit fallback: it raises the app and uses the real keyboard, interrupting
+the user.
+
 A click on a button, checkbox, pop-up, link or other control named by element uses `AXPress` and
 skips event routing altogether (the pointer still travels there, so the app sees it hover). Anything
 else named by element, such as a text field or a list row, gets a real click at its centre, since
@@ -50,20 +59,20 @@ frame (120 Hz) the next point of the path is drawn *and* sent to the app as a mo
 dragged event while a button is held). A click goes down only when the pointer arrives. The path is
 modelled on human reaching, which is also what OpenAI's helper approximates:
 
-- **Curved path.** A cubic Bézier that bulges 4–10% to one side early and straightens on approach.
+- **Curved path.** A cubic Bézier that bulges 4-10% to one side early and straightens on approach.
   Several candidate arcs are scored and the one that stays over the target window wins, since the
   cursor is drawn just above that window.
-- **Duration from Fitts's law.** 0.11 s + 0.09 s · log₂(1 + distance/14 pt), clamped to 0.14–0.85 s.
-- **Bell-shaped speed.** A minimum-jerk profile, `10t³ − 15t⁴ + 6t⁵`.
-- **Overshoot and correction.** On moves over 160 pt, the pointer goes 1.5–3.5% (at most 12 pt) past the
+- **Duration from Fitts's law.** 0.11 s + 0.09 s · log₂(1 + distance/14 pt), clamped to 0.14-0.85 s.
+- **Bell-shaped speed.** A minimum-jerk profile, `10t³ - 15t⁴ + 6t⁵`.
+- **Overshoot and correction.** On moves over 160 pt, the pointer goes 1.5-3.5% (at most 12 pt) past the
   target, then makes a short corrective move back.
 - **Drags** follow the agent's points exactly (they matter when drawing or selecting). Gentle bends
   are taken in one bell-shaped sweep; at a sharp corner (over 55°) the hand slows to a stop, pauses a
   beat and sets off again.
 - **Holding still** with a button down isn't perfectly still: the pointer makes a faint tremor (a
   fraction of a point, ~10 Hz), sent as dragged events, as a hand on a mouse does.
-- **Clicks** go down a beat (40–220 ms) after the pointer arrives and hold the button for 45–140 ms,
-  like a finger; a double-click's clicks are 70–200 ms apart. A click with modifiers (`keys: "shift"`)
+- **Clicks** go down a beat (40-220 ms) after the pointer arrives and hold the button for 45-140 ms,
+  like a finger; a double-click's clicks are 70-200 ms apart. A click with modifiers (`keys: "shift"`)
   presses the modifier keys before setting off and releases them after.
 - **Back on a window** after the pointer was hidden (20 s idle), it starts where it was left, so the
   app never sees it jump.
@@ -98,7 +107,7 @@ whether the selection is being dragged away, so the caret is put at the click po
 click lands on plain text. Double- and triple-click (word, line) and Shift+arrow keys work as they
 are. Apps that handle the events themselves (browsers, Electron, custom views) need none of this.
 
-The cost is time: a click or move takes 0.14–0.85 s, and a 100-character sentence takes about 9 s to
+The cost is time: a click or move takes 0.14-0.85 s, and a 100-character sentence takes about 9 s to
 type. That's still small next to a model call, so batching actions remains the big win.
 `PUTER_USE_CURSOR_SPEED` and `PUTER_USE_TYPING_WPM` change the pace; `0` makes either instant.
 

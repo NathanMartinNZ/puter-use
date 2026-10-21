@@ -9,6 +9,36 @@ extension AX {
         ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(value(el, kAXRoleAttribute) as? String ?? "")
     }
 
+    /// The window (`wid`) an element is in, as accessibility reports it.
+    static func windowID(_ el: AXUIElement) -> CGWindowID? {
+        guard let w = value(el, kAXWindowAttribute), CFGetTypeID(w) == AXUIElementGetTypeID() else { return nil }
+        var id: CGWindowID = 0
+        return _AXUIElementGetWindow(w as! AXUIElement, &id) == .success ? id : nil
+    }
+
+    /// Whether the element is in window `wid` (for elements from the app's focus, which may be another
+    /// window of it: the user's).
+    static func isInWindow(_ el: AXUIElement, _ wid: CGWindowID) -> Bool {
+        wid == 0 || windowID(el) == wid
+    }
+
+    /// A browser's own text field (its address bar, find bar, …) rather than something in the page: one
+    /// holds a single address, so clicking it selects what's there and typing replaces it.
+    @MainActor static func isBrowserAddressBar(_ el: AXUIElement, pid: pid_t) -> Bool {
+        guard Handlers.isBrowser(pid), isTextInput(el) else { return false }
+        var cur = el
+        for _ in 0..<40 {
+            guard let p = value(cur, kAXParentAttribute), CFGetTypeID(p) == AXUIElementGetTypeID() else { break }
+            cur = p as! AXUIElement
+            switch value(cur, kAXRoleAttribute) as? String {
+            case "AXWebArea": return false  // part of the page
+            case "AXToolbar": return true
+            default: continue
+            }
+        }
+        return true  // it tops out in the browser's chrome, not in a page
+    }
+
     /// Controls whose accessibility press is what a click does. A click on anything else (a text field,
     /// a list row, a picture) means where it lands: that one gets a real click.
     static let pressable: Set<String> = [

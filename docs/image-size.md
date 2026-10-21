@@ -7,7 +7,7 @@ smallest dimensions that keep UI text readable, and compression only keeps the p
 - **Scale.** 0.75 output pixels per screen point, with the aspect ratio kept. That's 0.75× a
   non-Retina screenshot and 0.375× a Retina one. Points are the same on both kinds of display, so the
   result is too.
-  - 9–11 pt text (Hacker News subtext, Google Ads tables) stays legible.
+  - 9-11 pt text (Hacker News subtext, Google Ads tables) stays legible.
   - At 0.6 it blurs, and below about 0.55 the agent has to zoom. A zoom costs a whole extra model call,
     which is far more than the tokens saved.
 - **Cap.** At most 1000 tokens, about the 1024×768 that Anthropic and OpenAI recommend for computer
@@ -39,5 +39,5 @@ smallest dimensions that keep UI text readable, and compression only keeps the p
 anti-aliased text, so it stays sharp at a few KB. If a photo- or video-heavy window would push it past
 `PUTER_USE_MAX_BYTES`, it falls back to JPEG.
 
-- WebP is 10–40% smaller in bytes, but saves no tokens, and some harnesses don't accept it.
+- WebP is 10-40% smaller in bytes, but saves no tokens, and some harnesses don't accept it.
 - JPEG's chroma subsampling blurs small coloured text.

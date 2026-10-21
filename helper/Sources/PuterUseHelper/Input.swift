@@ -200,10 +200,22 @@ enum Input {
     /// Type `text` with a typist's rhythm (see `Typist`): every key goes down and comes up after a human
     /// hold, the next one may go down before the last is up, and Shift is pressed around capitals and
     /// symbols. Newlines and tabs are the Return and Tab keys.
-    static func type(_ text: String, _ route: Route, typist: Typist) async {
-        struct Stroke { let t: Double; let order: Int; let fire: () -> Void }
+    ///
+    /// `stillSafe` is asked before every key: false stops right there (letting go of the keys still down)
+    /// and is returned. A key goes to the app's key window, which may have become the user's.
+    @discardableResult
+    static func type(_ text: String, _ route: Route, typist: Typist, stillSafe: (() -> Bool)? = nil) async -> Bool {
+        struct Stroke {
+            let t: Double
+            let order: Int
+            let down: CGKeyCode?  // the key it holds down, if any
+            let up: CGKeyCode?
+            let fire: () -> Void
+        }
         var strokes: [Stroke] = []
-        func at(_ t: Double, _ fire: @escaping () -> Void) { strokes.append(Stroke(t: t, order: strokes.count, fire: fire)) }
+        func at(_ t: Double, down: CGKeyCode? = nil, up: CGKeyCode? = nil, _ fire: @escaping () -> Void) {
+            strokes.append(Stroke(t: t, order: strokes.count, down: down, up: up, fire: fire))
+        }
         let shiftCode = Keys.modifierCodes["shift"]!
         var t = 0.0, prev: Character?, prevShift = false, lastDown = -1.0
         var shiftUpAt: Double?  // Shift is down and comes up at this time unless the next key needs it too
@@ -224,31 +236,39 @@ enum Input {
             // capital went down and before the next key; at speed, this key waits for room to do so.
             let gap = 0.001
             if shift, shiftUpAt == nil {
-                let down = max(t - typist.modifierLead(), lastDown + gap)
-                t = max(t, down + gap)
-                at(down) { key(shiftCode, down: true, flags: .maskShift, route) }
+                let pressAt = max(t - typist.modifierLead(), lastDown + gap)
+                t = max(t, pressAt + gap)
+                at(pressAt, down: shiftCode) { key(shiftCode, down: true, flags: .maskShift, route) }
             } else if !shift, let up = shiftUpAt {
-                let release = max(min(up, t - gap), lastDown + gap)
-                t = max(t, release + gap)
-                at(release) { key(shiftCode, down: false, flags: [], route) }
+                let liftAt = max(min(up, t - gap), lastDown + gap)
+                t = max(t, liftAt + gap)
+                at(liftAt, up: shiftCode) { key(shiftCode, down: false, flags: [], route) }
                 shiftUpAt = nil
             }
             let flags: CGEventFlags = shift ? .maskShift : []
             let dwell = typist.dwell()
-            at(t) { key(code, down: true, flags: flags, route, text: payload) }
-            at(t + dwell) { key(code, down: false, flags: flags, route, text: payload) }
+            at(t, down: code) { key(code, down: true, flags: flags, route, text: payload) }
+            at(t + dwell, up: code) { key(code, down: false, flags: flags, route, text: payload) }
             upAt[code] = t + dwell
             if shift { shiftUpAt = t + dwell + typist.modifierTrail() }
             lastDown = t
             prev = ch
             prevShift = shift
         }
-        if let up = shiftUpAt { at(up) { key(shiftCode, down: false, flags: [], route) } }
+        if let up = shiftUpAt { at(up, up: shiftCode) { key(shiftCode, down: false, flags: [], route) } }
 
         let start = ProcessInfo.processInfo.systemUptime
+        var pressed = Set<CGKeyCode>()
         for s in strokes.sorted(by: { ($0.t, $0.order) < ($1.t, $1.order) }) {
             await sleep(s.t - (ProcessInfo.processInfo.systemUptime - start))
+            if let stillSafe, !stillSafe() {
+                for code in pressed { key(code, down: false, flags: [], route) }  // leave nothing held
+                return false
+            }
             s.fire()
+            if let d = s.down { pressed.insert(d) }
+            if let u = s.up { pressed.remove(u) }
         }
+        return true
     }
 }

@@ -12,8 +12,8 @@ Everything puter-use does, in more detail than the [README](../README.md).
   - Only the target window is captured, even if other windows cover it, together with its menus,
     popovers and sheets.
   - Screenshots are sized for tokens, not pixels: 0.75 px per screen point, at most 1000 image tokens,
-    snapped to the model's 28 px tiles. A typical window costs 350–800 tokens and is sent as a
-    5–60 KB palette PNG. See [Image size](image-size.md).
+    snapped to the model's 28 px tiles. A typical window costs 350-800 tokens and is sent as a
+    5-60 KB palette PNG. See [Image size](image-size.md).
   - Windows the agent opens (e.g. a browser window from `cmd+n`) are followed automatically. They keep
     their size unless you set `PUTER_USE_WINDOW_SIZE`, which shrinks them so screenshots stay sharp.
   - To read exact values, the agent can ask for just the text in a box (`region` with `image=false`).

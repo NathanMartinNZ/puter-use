@@ -13,8 +13,10 @@ Computer Use, for any agent that speaks MCP.
 
 - **Works in the background.** Events go straight to the target window. Your real pointer never
   moves and the app you're using stays in front. A purple cursor shows where the agent is acting.
+  If you take the keyboard in the same app (bring another of its windows forward), its typing and
+  shortcuts stop and say so, rather than landing in your window.
 - **Light on context.** Only the target window is captured, even when it's covered, at about
-  350–800 image tokens. After an action, a new screenshot is sent only if the window changed.
+  350-800 image tokens. After an action, a new screenshot is sent only if the window changed.
 - **Hard to misclick.** The agent can aim by what a control says (`target: "Save"`) instead of by
   pixels, and a batch stops if something opens over the window part-way through.
 - **Fewer model calls.** One call runs many steps: clicks, typing, shortcuts, menu commands, a whole
@@ -191,6 +193,11 @@ server or CLI. It starts on demand. Input goes to one app's process through priv
   - Canvas, GPU and game apps (Blender, Unity, games) and some Electron or Java apps read the hardware
     pointer or drop per-process events. For those, use `foreground=true` (`--fg`). It raises the app
     and uses the real cursor and keyboard.
+- **Same app, another window.** Keys go to the app's key window, whatever window they're stamped
+  for: if you bring another window of the agent's app forward, its typing, shortcuts, modifier-clicks
+  and menu commands stop with an error naming the window that has the keyboard, instead of acting on
+  yours. Its clicks still go to its own window. Switch away (or focus its window) and retry, or use
+  `foreground=true` knowingly.
 - **Hover.** Apps work out hover from the real pointer (AppKit tracking areas, Firefox), so a
   background `move` reaches the app as mouse-moved events but doesn't light up hover effects or open
   hover menus. Click instead, or use `foreground=true`.

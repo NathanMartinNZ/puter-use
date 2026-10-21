@@ -354,10 +354,18 @@ enum Handlers {
         }
     }
 
-    static let keyboardActions: Set<String> = [
+    nonisolated static let keyboardActions: Set<String> = [
         "type", "type_text", "keypress", "key", "press_key", "hotkey", "key_down", "keydown", "key_up", "keyup",
         "hold_key", "hold", "fill", "navigate", "goto", "go_to", "paste",
     ]
+
+    /// Actions that act on the app's keyboard focus: keys (including the modifiers a click or drag holds)
+    /// and menu commands, which act on the focused window. That window has to be the app's key one first.
+    nonisolated static func actsOnKeyboardFocus(_ a: [String: Any]) -> Bool {
+        if keyboardActions.contains(kind(a)) || kind(a) == "menu" || kind(a) == "menu_item" { return true }
+        guard a["keys"] != nil || a["modifiers"] != nil else { return false }
+        return ["click", "double_click", "triple_click", "right_click", "middle_click", "mouse_down", "drag"].contains(kind(a))
+    }
 
     /// The app's menu bar as text (every command and its shortcut), or the items matching `query`.
     static func menus(_ p: [String: Any]) throws -> [String: Any] {
@@ -526,6 +534,7 @@ enum Handlers {
             if type == "triple_click" { count = 3 }
             guard let (p, node) = try await actionPoint(a, t) else { return }
             let r = try route(t, at: p, foreground: foreground)
+            if !flags.isEmpty { try guardKeyboard(r) }  // its modifiers go to whichever window has the keyboard
             if button == "left" { try Policy.checkPress(a, node: node, at: p, pid: r.pid) }
             if let item = a["item"], let last = AX.menuPath(item).last {
                 try Policy.checkItem(a, last)
@@ -603,6 +612,7 @@ enum Handlers {
             await pointer.move(to: p, r)
             await Input.sleep(clickTiming.aim())
             // Its keys stay down with the button, as a hand holds shift through a shift-drag.
+            if !Keys.splitCombo(a["keys"] ?? a["modifiers"]).isEmpty { try guardKeyboard(r) }
             for k in Keys.splitCombo(a["keys"] ?? a["modifiers"]) where !run.heldKeys.contains(where: { $0.name == Keys.normalize(k) }) {
                 try run.keyDown(k, r)
                 run.buttonKeys.append(k)
@@ -638,6 +648,7 @@ enum Handlers {
             }
             guard pts.count >= 2 else { throw HelperError("drag needs path [[x,y],[x,y],...] (or from/to)") }
             let r = try route(t, at: pts[0], foreground: foreground)
+            if !flags.isEmpty { try guardKeyboard(r) }  // its modifiers go to whichever window has the keyboard
             let button = (a["button"] as? String) ?? "left"
             // Down and up on a button presses it, as a click would.
             if button == "left" { try Policy.checkPress(a, node: nil, at: pts[0], pid: r.pid) }
@@ -726,6 +737,7 @@ enum Handlers {
                 return
             }
             guard !keys.isEmpty else { throw HelperError("\(type) needs keys, e.g. \"shift\" or \"cmd+option\"") }
+            try guardKeyboard(r)  // a held key would be pressed in whichever window has the keyboard
             // What they do with the keys already held: a shortcut, Return or Space on a button, a character.
             let combo = run.heldKeys.map(\.name) + keys
             try Policy.checkShortcuts(a, [combo], r.pid)
@@ -747,12 +759,15 @@ enum Handlers {
             }
         case "menu", "menu_item":
             guard let pid = pid(t) else { throw HelperError("menu needs a window target") }
+            // A menu command acts on the app's focused window (Paste, Select All, Undo, …): not another one.
+            let menuRoute = try route(t, at: nil, foreground: foreground)
+            try guardKeyboard(menuRoute)
             let path = AX.menuPath(a["item"] ?? a["path"] ?? a["text"])
             let (chosen, shortcut) = try AX.pressMenu(pid: pid, path: path) { try Policy.checkItem(a, $0) }
             if let shortcut {
                 // A background app's menus are only brought up to date when opened, so "disabled" may be
                 // stale; its shortcut is checked by the app as it's pressed.
-                try await press(Keys.splitCombo(shortcut), try route(t, at: nil, foreground: foreground))
+                try await press(Keys.splitCombo(shortcut), menuRoute)
                 notes.append("\(chosen) looked disabled in its menu (which may be out of date): pressed its shortcut \(shortcut)")
             } else if AX.menuKey(chosen) != AX.menuKey(path.joined(separator: " > ")) {
                 notes.append("menu \(chosen)")
@@ -780,7 +795,10 @@ enum Handlers {
             try Policy.checkSecureFocus(r.pid)
             if foreground { prepareForeground(r) }
             Clipboard.borrow(text)
-            try await press(["cmd", "v"], r)
+            do { try await press(["cmd", "v"], r) } catch {
+                Clipboard.giveBack()
+                throw error
+            }
             Clipboard.giveBack()
         case "set_value":
             guard let n = try elementNode(a, t) else { throw HelperError("set_value needs element or target") }
@@ -847,9 +865,34 @@ enum Handlers {
         if Policy.typesText(combo) { try Policy.checkSecureFocus(r.pid) }
     }
 
+    /// Whether keys sent for `r` reach the window they're meant for. Key events follow the app's key window
+    /// (their window stamp doesn't change that), so when the user has another window of the same app in
+    /// front, typing would land in theirs.
+    static func keysReachTarget(_ r: Route) -> Bool {
+        guard !r.foreground, r.wid != 0 else { return true }  // foreground is the explicit, user-visible fallback
+        if let key = AX.focusedWindow(pid: r.pid) { return key == r.wid }
+        return !Hold.isFront(r.pid)  // can't tell which window has it: only safe while the user is in another app
+    }
+
+    /// Stop before keys that would land in a window the user is using rather than the agent's. Nothing is
+    /// ever typed into the user's window: if their window has the keyboard, the action stops and says so.
+    static func guardKeyboard(_ r: Route) throws {
+        guard !keysReachTarget(r) else { return }
+        let app = Policy.appName(r.pid)
+        if let key = AX.focusedWindow(pid: r.pid), let w = Windows.info(key) {
+            let what = w.title.isEmpty ? "window #\(key)" : "window #\(key) \"\(AX.clip(w.title, 40))\""
+            throw HelperError("another window of \(app) has the keyboard (\(what), not the agent's #\(r.wid)): "
+                + "it would act on that one instead, so the action didn't run. Wait until the keyboard is back in "
+                + "#\(r.wid) (the user may be using \(app)), then try again")
+        }
+        throw HelperError("\(app)'s keyboard may be in a window other than the agent's #\(r.wid): the action didn't "
+            + "run, since it would act there. Wait until the user is out of \(app), then try again")
+    }
+
     /// Press a shortcut or key. Chromium ignores key equivalents while in the background, so there the
     /// matching menu item is pressed instead.
     static func press(_ keys: [String], _ r: Route) async throws {
+        try guardKeyboard(r)
         if !r.foreground, Windows.isChromium(r.pid), NSRunningApplication(processIdentifier: r.pid)?.isActive != true,
            let title = AX.pressMenuShortcut(pid: r.pid, keys: keys) {
             notes.append("\(keys.joined(separator: "+")) → menu \"\(title)\"")
@@ -868,6 +911,20 @@ enum Handlers {
         // Typing with a key held down would mix the two (and type's own Shift would let go of a held one).
         if !Input.held.isEmpty {
             throw HelperError("keys are held down (key_down): key_up first, or press combinations with keypress")
+        }
+        // A browser's address bar holds one address: typing a new one replaces the old (cmd+l and a click
+        // select it; when the caret was just left in it, select it here rather than add to it). Only in
+        // the agent's own window: the app's focus may be the user's window.
+        let focused = isBrowser(r.pid) ? AX.focusedElement(pid: r.pid) : nil
+        let focusedHere = focused.map { f in
+            r.wid == 0 || (AX.windowID(f).map { $0 == r.wid } ?? keysReachTarget(r))
+        } ?? false
+        if let f = focused, focusedHere, AX.isBrowserAddressBar(f, pid: r.pid),
+           let current = AX.value(f, kAXValueAttribute) as? String, !current.isEmpty,
+           (AX.selectedRange(f)?.length ?? 0) == 0,
+           !AX.select(f, CFRange(location: 0, length: (current as NSString).length)) {
+            try await press(["cmd", "a"], r)  // accessibility didn't take it: its own select-all
+            await Input.sleep(typist.between())
         }
         var stretches: [(text: String, end: Character?)] = []
         var run = ""
@@ -891,20 +948,36 @@ enum Handlers {
                 throw HelperError("stopped partway through the text: \(ok); the first \(sent) characters were typed. "
                     + "Ask the user; if they agree, type the rest with \"confirm\": true")
             }
+            // The user may have taken the keyboard since the last stretch (a long text takes a while).
+            try guardKeyboard(r)
             if i > 0 { await Input.sleep(typist.between()) }
             let end = s.end.map { String($0) } ?? ""
             if pasteOver > 0, s.text.count > pasteOver {
                 await Input.sleep(typist.instant ? 0 : Double.random(in: 0.15...0.35))  // reach for the shortcut
                 Clipboard.borrow(s.text)
-                try await press(["cmd", "v"], r)
+                do { try await press(["cmd", "v"], r) } catch {
+                    Clipboard.giveBack()
+                    throw error
+                }
                 Clipboard.giveBack()
                 await Input.sleep(typist.instant ? 0.03 : Double.random(in: 0.12...0.25))
-                if !end.isEmpty { await Input.type(end, r, typist: typist) }
-            } else {
-                await Input.type(s.text + end, r, typist: typist)
+                if !end.isEmpty,
+                   !(await Input.type(end, r, typist: typist, stillSafe: { keysReachTarget(r) })) {
+                    throw typingInterrupted(sent, r)
+                }
+            } else if !(await Input.type(s.text + end, r, typist: typist, stillSafe: { keysReachTarget(r) })) {
+                throw typingInterrupted(sent, r)
             }
             sent += s.text.count + end.count
         }
+    }
+
+    /// Another window of the app took the keyboard partway through the text.
+    private static func typingInterrupted(_ sent: Int, _ r: Route) -> HelperError {
+        let sofar = sent == 0 ? "only part of it had gone out" : "the first \(sent) characters had gone out"
+        return HelperError("stopped partway through the text: another window of \(Policy.appName(r.pid)) took the "
+            + "keyboard (not the agent's #\(r.wid)); \(sofar), and nothing more was typed. Wait until the keyboard "
+            + "is back, then type the rest")
     }
 
     /// Button holds are a hand's, whatever the typing speed; instant only when the pointer jumps (speed 0).
@@ -982,7 +1055,7 @@ enum Handlers {
         if !foreground, case .window(let w) = t, !Hold.isFront(w.pid) {
             if Hold.activate(pid: w.pid, wid: w.id) { try await Task.sleep(nanoseconds: 30_000_000) }
             // Keyboard input (and key equivalents like cmd+a) only reach a window AppKit considers key.
-            if actions.contains(where: { keyboardActions.contains(kind($0)) }) {
+            if actions.contains(where: { actsOnKeyboardFocus($0) }) {
                 SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
                 try await Task.sleep(nanoseconds: 30_000_000)
             }

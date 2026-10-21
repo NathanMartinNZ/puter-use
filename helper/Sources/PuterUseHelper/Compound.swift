@@ -50,12 +50,16 @@ extension Handlers {
             }
             field = n
         }
-        if field == nil, let f = AX.focusedElement(pid: r.pid), AX.isTextInput(f) {
+        if field == nil, let f = AX.focusedElement(pid: r.pid), AX.isInWindow(f, r.wid), AX.isTextInput(f) {
             let role = AX.value(f, kAXRoleAttribute) as? String ?? ""
             field = AX.Node(element: f, frame: AX.frame(f), role: role, label: AX.label(f), name: AX.roleNames[role] ?? "field")
         }
         let length = field.flatMap { (AX.value($0.element, kAXValueAttribute) as? String).map { ($0 as NSString).length } }
-        if a["clear"] as? Bool == true {
+        // A browser's address bar holds one address: a new one replaces it. (A click selects the old one
+        // there, and moving the caret to its end made two URLs run together.)
+        let addressBar = field.map { AX.isBrowserAddressBar($0.element, pid: r.pid) } ?? false
+        let replace = a["clear"] as? Bool ?? addressBar
+        if replace {
             guard field != nil else {
                 // Select-all and delete on whatever has the focus could empty a list of mail, not a field.
                 let focus = AX.focusedElement(pid: r.pid).map(AX.describe) ?? "nothing"
@@ -69,8 +73,12 @@ extension Handlers {
                 try await press(["BackSpace"], r)
             }
             await Input.sleep(typist.between())
-        } else if let field, let length {  // the click landed mid-text: type after what's there
-            AX.select(field.element, CFRange(location: length, length: 0))
+        } else if let field, let length {
+            // Keep a selection the app made itself (a click in one selects all): typing replaces it, as
+            // it would for a person. Otherwise the click landed mid-text: type after what's there.
+            if (AX.selectedRange(field.element)?.length ?? 0) == 0 {
+                AX.select(field.element, CFRange(location: length, length: 0))
+            }
         }
         try await typeText(text, r)
         if a["submit"] as? Bool == true {

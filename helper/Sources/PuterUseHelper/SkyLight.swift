@@ -52,7 +52,7 @@ enum SkyLight {
     }
 
     /// Make the app's AppKit layer believe it is (or isn't) active, with `wid` as its focused window.
-    /// WindowServer focus — and so the user's frontmost app and keyboard — is untouched.
+    /// WindowServer focus (and so the user's frontmost app and keyboard) is untouched.
     @discardableResult
     static func setAppKitActive(pid: pid_t, wid: CGWindowID, _ active: Bool) -> Bool {
         record(pid) { r in
