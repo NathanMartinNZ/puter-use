@@ -18,5 +18,6 @@ let package = Package(
         ),
         // A test window that logs the events it receives (see scripts/check_motion.py).
         .executableTarget(name: "PuterUseProbe", path: "Sources/PuterUseProbe", linkerSettings: [.linkedFramework("AppKit")]),
+        .testTarget(name: "PuterUseHelperTests", dependencies: ["PuterUseHelper"], path: "Tests/PuterUseHelperTests"),
     ]
 )

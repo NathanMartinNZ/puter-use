@@ -197,9 +197,11 @@ extension AX {
         throw HelperError("empty menu path")
     }
 
-    /// A shortcut as a set of key names, so "shift+cmd+E" and "cmd+shift+e" are the same.
+    /// A shortcut as a set of key names, so "shift+cmd+E" and "cmd+shift+e" are the same. Every name
+    /// `Keys.modifiers` presses as Command reads as "cmd": "super+q" is "cmd+q".
     static func comboKey(_ s: String) -> Set<String> {
-        let alias = ["command": "cmd", "control": "ctrl", "opt": "option", "alt": "option", "⌘": "cmd", "⇧": "shift"]
+        let alias = ["command": "cmd", "meta": "cmd", "super": "cmd", "win": "cmd", "windows": "cmd", "control": "ctrl",
+                     "opt": "option", "alt": "option", "⌘": "cmd", "⇧": "shift"]
         return Set(s.lowercased().split(separator: "+").map { k in
             let n = Keys.normalize(String(k).trimmingCharacters(in: .whitespaces))
             return alias[n] ?? n
