@@ -163,7 +163,8 @@ enum Policy {
                                        "screenshot"]
 
     /// The action being run (set by act), for routes that only find their app at the point (`.screen`).
-    nonisolated(unsafe) static var running: [String: Any]?
+    /// Task-local: a request of another session, run while this one waits, doesn't see it (or its confirm).
+    @TaskLocal static var running: [String: Any]?
 
     /// Before an action on an app: may the agent do it there?
     static func checkAction(_ a: [String: Any], pid: pid_t?) throws {

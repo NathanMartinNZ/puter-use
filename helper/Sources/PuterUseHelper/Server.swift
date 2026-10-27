@@ -51,6 +51,8 @@ final class Server {
     }
 
     func start() {
+        // A client that hangs up before its reply fails the write (EPIPE) rather than ending the helper.
+        signal(SIGPIPE, SIG_IGN)
         let listenFD = fd
         Thread.detachNewThread {
             while true {

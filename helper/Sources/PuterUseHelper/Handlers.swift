@@ -139,7 +139,10 @@ enum Handlers {
             return .window(w)
         }
         if let n = num(v), !(v is String && Int(v as! String) == nil) {
-            guard let w = Windows.info(CGWindowID(n)) else { throw HelperError("window \(Int(n)) not found") }
+            // An id no window can have (negative, fractional, past UInt32) is not found either.
+            guard let id = CGWindowID(exactly: n), let w = Windows.info(id) else {
+                throw HelperError("window \(Int(exactly: n).map(String.init) ?? "\(n)") not found")
+            }
             return .window(w)
         }
         guard let s = (v as? String)?.trimmingCharacters(in: .whitespaces), !s.isEmpty else {
@@ -1090,31 +1093,31 @@ enum Handlers {
             defer { notes += AX.remarks; AX.remarks.removeAll() }
             do {
                 try Policy.checkAction(a, pid: pid(run.target))
-                Policy.running = a
-                defer { Policy.running = nil }
-                // Saved as it stands now: element numbers and pixels only mean something until the window changes.
-                let step = saveAs == nil ? nil : Macros.record(a, run.target)
-                // Keys pressed with a mouse button down: the hand on the mouse still trembles meanwhile.
-                let tremor: Task<Void, Never>? = run.heldButton.flatMap { held in
-                    keyboardActions.contains(kind(a)) || kind(a) == "menu"
-                        ? Task { await pointer.hold(30, held.route, button: held.button) } : nil
-                }
-                defer {
-                    tremor?.cancel()
-                    if tremor != nil { pointer.endHold() }
-                }
-                try await perform(a, run)
-                if let step { recorded.append(step) }
-                done += 1
-                if i < actions.count - 1 {
-                    if let (button, r) = run.heldButton {  // a hand holding the button down never quite stops
-                        await pointer.hold(0.06, r, button: button)
-                    } else if mayOpen(a) {
-                        await run.settle()
-                        // A menu left open would take the next actions' keys (and the user's): closed now.
-                        if !foreground, let pid = pid(run.target) { await closeLeftOpenMenu(pid: pid, wait: false) }
-                    } else {
-                        await Input.ms(60)
+                try await Policy.$running.withValue(a) {
+                    // Saved as it stands now: element numbers and pixels only mean something until the window changes.
+                    let step = saveAs == nil ? nil : Macros.record(a, run.target)
+                    // Keys pressed with a mouse button down: the hand on the mouse still trembles meanwhile.
+                    let tremor: Task<Void, Never>? = run.heldButton.flatMap { held in
+                        keyboardActions.contains(kind(a)) || kind(a) == "menu"
+                            ? Task { await pointer.hold(30, held.route, button: held.button) } : nil
+                    }
+                    defer {
+                        tremor?.cancel()
+                        if tremor != nil { pointer.endHold() }
+                    }
+                    try await perform(a, run)
+                    if let step { recorded.append(step) }
+                    done += 1
+                    if i < actions.count - 1 {
+                        if let (button, r) = run.heldButton {  // a hand holding the button down never quite stops
+                            await pointer.hold(0.06, r, button: button)
+                        } else if mayOpen(a) {
+                            await run.settle()
+                            // A menu left open would take the next actions' keys (and the user's): closed now.
+                            if !foreground, let pid = pid(run.target) { await closeLeftOpenMenu(pid: pid, wait: false) }
+                        } else {
+                            await Input.ms(60)
+                        }
                     }
                 }
             } catch let ok as Policy.NeedsOK {
