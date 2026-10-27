@@ -12,3 +12,6 @@ helper/.build/
 
 # macOS
 .DS_Store
+
+# Other
+docs/design/
