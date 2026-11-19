@@ -1,11 +1,18 @@
 import Foundation
 
+/// A reply to write, and what to do once it's written (for clients that don't report delivery).
+struct Reply: @unchecked Sendable {
+    let data: Data
+    var written: (@MainActor () -> Void)? = nil
+}
+
 struct HelperError: Error, CustomStringConvertible {
     let description: String
     init(_ message: String) { description = message }
 }
 
-/// Unix-socket server speaking newline-delimited JSON: {"id", "cmd", "params"} → {"id", "ok", "result"|"error"}.
+/// Unix-socket server speaking newline-delimited JSON: {"id", "client", "cmd", "session", "params", "done",
+/// "lost"} → {"id", "ok", "result"|"error"}. A client that hangs up cancels its request (`Connection`).
 /// A connection's requests run one at a time, on the main actor; different connections (sessions) run
 /// side by side, taking turns at their awaits, with `AppLocks` keeping two off the same app.
 final class Server {
@@ -75,7 +82,9 @@ final class Server {
                 let line = buffer.subdata(in: buffer.startIndex..<nl)
                 buffer.removeSubrange(buffer.startIndex...nl)
                 if line.isEmpty { continue }
-                var out = handle(line)
+                // Nothing to write when the client gave up on it (it has hung up).
+                guard let reply = handle(line, client) else { continue }
+                var out = reply.data
                 out.append(0x0A)
                 let ok = out.withUnsafeBytes { raw -> Bool in
                     var off = 0
@@ -87,20 +96,23 @@ final class Server {
                     return true
                 }
                 if !ok { return }
+                if let written = reply.written {
+                    DispatchQueue.main.async { MainActor.assumeIsolated { written() } }
+                }
             }
         }
     }
 
-    private final class Box: @unchecked Sendable { var data = Data() }
+    private final class Box: @unchecked Sendable { var reply: Reply? }
 
-    private static func handle(_ line: Data) -> Data {
+    private static func handle(_ line: Data, _ fd: Int32) -> Reply? {
         let box = Box()
         let done = DispatchSemaphore(value: 0)
         Task { @MainActor in
-            box.data = await Handlers.dispatch(line)
+            box.reply = await Handlers.dispatch(line, fd: fd)
             done.signal()
         }
         done.wait()
-        return box.data
+        return box.reply
     }
 }

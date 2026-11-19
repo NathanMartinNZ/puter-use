@@ -53,7 +53,7 @@ final class Run {
     var visibleBefore = Set<CGWindowID>(), existedBefore = Set<CGWindowID>()  // the app's windows at the start
     var moved = false  // the batch switched to another window: old coordinates don't apply to it
     var heldKeys: [(name: String, code: CGKeyCode, flag: CGEventFlags)] = []
-    var heldButton: (button: String, route: Route)?
+    var heldButton: (button: String, route: Route, at: CGPoint)?  // `at`: where it went down
     var buttonKeys: [String] = []  // keys pressed with mouse_down's own keys, let go with mouse_up
     var clipboard: String?  // read by a clipboard action, for the result
     var pidAtStart: pid_t = 0
@@ -74,10 +74,7 @@ final class Run {
     }
 
     /// What the agent last saw of each window's surroundings (set when it's shown a screenshot).
-    static var seen: [CGWindowID: WindowSet] {
-        get { Session.current.seen }
-        set { Session.current.seen = newValue }
-    }
+    static var seen: Store<CGWindowID, WindowSet> { Session.current.seen }
 
     init(target: Target, foreground: Bool, guarded: Bool, box: CGSize?) {
         self.target = target
@@ -104,24 +101,35 @@ final class Run {
     /// After an action that may open something (a click, Return, a shortcut, a menu item): give a sheet,
     /// dialog or menu a moment to appear, and if one does, let it finish animating in before the next
     /// action. Costs ~0.15 s when nothing opens.
-    func settle() async {
+    func settle() async throws {
         guard case .window(let w) = target else { return }
         let start = WindowSet.of(w)
         var now = start
         for _ in 0..<6 {
-            await Input.ms(25)
+            try await Run.pause(0.025)
             now = WindowSet.of(w)
             if now != start { break }
         }
         guard now != start, now.size != nil else { return }
         var frames = now.over.compactMap { Windows.info($0)?.frame }
         for _ in 0..<15 {  // until nothing over the window moves or grows (sheets slide in)
-            await Input.ms(40)
+            try await Run.pause(0.04)
             let next = now.over.compactMap { Windows.info($0)?.frame }
             if next == frames { break }
             frames = next
         }
-        await Input.ms(80)  // and draws its contents
+        try await Run.pause(0.08)  // and draws its contents
+    }
+
+    /// Wait `seconds`, in short slices: stops (Cancelled) as soon as the client hangs up.
+    static func pause(_ seconds: Double) async throws {
+        let end = ProcessInfo.processInfo.systemUptime + seconds
+        while true {
+            try Connection.check()
+            let left = end - ProcessInfo.processInfo.systemUptime
+            if left <= 0 { return }
+            await Input.sleep(min(0.05, left))
+        }
     }
 
     /// Switch the rest of the batch to `w` (a window the batch opened), keeping it ready for keys.
@@ -132,10 +140,12 @@ final class Run {
         visibleBefore.insert(w.id)
         existedBefore.insert(w.id)
         Handlers.notes.append(note ?? "now on new window #\(w.id)")
+        Connection.current?.work.opened.append(w.id)
         if !locked.contains(w.pid) {  // another app: wait for any other session driving it
             try await AppLocks.acquire(w.pid)
             locked.insert(w.pid)
         }
+        try Connection.check()
         if !foreground, !Hold.isFront(w.pid) {
             _ = Hold.activate(pid: w.pid, wid: w.id)
             SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
@@ -144,7 +154,7 @@ final class Run {
     }
 
     /// A window of `pid` that wasn't there before, once it appears (up to `timeout` seconds).
-    func newWindow(pid: pid_t, timeout: Double) async -> WinInfo? {
+    func newWindow(pid: pid_t, timeout: Double) async throws -> WinInfo? {
         let deadline = Date().addingTimeInterval(timeout)
         repeat {
             if let w = Windows.all(onScreenOnly: true).first(where: {
@@ -152,7 +162,7 @@ final class Run {
             }) {
                 return w
             }
-            await Input.ms(80)
+            try await Run.pause(0.08)
         } while Date() < deadline
         return nil
     }
@@ -186,12 +196,17 @@ final class Run {
     }
 
     /// Let go of everything still held at the end of the batch (keys last pressed first).
-    func releaseAll(_ typist: Typist) async -> [String] {
+    /// After a cancel, a button still down ends the drag the way `Handlers.endDrag` does.
+    func releaseAll(_ typist: Typist, cancelled: Bool = false) async -> [String] {
         var released: [String] = []
-        if let (button, r) = heldButton {
-            let (_, up, _, btn) = Input.buttonTypes(button)
-            let p = Handlers.pointer.tip ?? CGPoint(x: r.frame.midX, y: r.frame.midY)
-            Input.mouse(up, p, r, button: btn)
+        if let (button, r, at) = heldButton {
+            if cancelled {
+                await Handlers.endDrag(r, from: at, button: button)
+            } else {
+                let (_, up, _, btn) = Input.buttonTypes(button)
+                let p = Handlers.pointer.tip ?? CGPoint(x: r.frame.midX, y: r.frame.midY)
+                Input.mouse(up, p, r, button: btn)
+            }
             heldButton = nil
             released.append("\(button) button")
         }

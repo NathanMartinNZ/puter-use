@@ -59,7 +59,7 @@ extension AX {
     static func select(_ el: AXUIElement, _ r: CFRange) -> Bool {
         var r = r
         guard let v = AXValueCreate(.cfRange, &r) else { return false }
-        return AXUIElementSetAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, v) == .success
+        return write(el, kAXSelectedTextRangeAttribute, v) == .success
     }
 
     /// The selection once the app has finished with a gesture: the same twice in a row, 40 ms apart

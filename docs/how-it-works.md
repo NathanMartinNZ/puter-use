@@ -39,6 +39,14 @@ skips event routing altogether (the pointer still travels there, so the app sees
 else named by element, such as a text field or a list row, gets a real click at its centre, since
 where a click lands matters there.
 
+Web pages in Firefox (and other Gecko browsers) are the exception: Gecko's `AXPress` fires no pointer
+events, so controls that listen for `pointerdown` ignore it. There a control gets a real click, at a
+point the app's hit test says is on it: its text, its centre or a quarter point. If something else is
+over every point (a banner, an overlay), or another window of the app would take the click, it's
+pressed through accessibility instead, with a note. Gecko's hit test doesn't see elements with no
+accessible, such as an `aria-hidden` backdrop, so a click there lands on the backdrop, as a person's
+would.
+
 Verified with Claude/VS Code in front and the real cursor never moving:
 
 - **TextEdit:** click-to-place, typing including Unicode, `cmd+a`/`cmd+z`, double-click a word, drag-select, scroll

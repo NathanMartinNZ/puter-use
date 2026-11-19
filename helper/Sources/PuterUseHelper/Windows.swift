@@ -83,6 +83,18 @@ enum Windows {
         return hit
     }
 
+    nonisolated(unsafe) private static var geckoCache: [pid_t: Bool] = [:]
+
+    /// Firefox and the other Gecko apps (its channels, Zen, Tor Browser, LibreWolf, Thunderbird): their
+    /// bundle has the XUL library. Cached per pid, "not Gecko" too: it's asked on every accessibility lookup.
+    static func isGecko(_ pid: pid_t) -> Bool {
+        if let hit = geckoCache[pid] { return hit }
+        guard let url = NSRunningApplication(processIdentifier: pid)?.bundleURL else { return false }  // not cached: may be a moment
+        let hit = FileManager.default.fileExists(atPath: url.appendingPathComponent("Contents/MacOS/XUL").path)
+        geckoCache[pid] = hit
+        return hit
+    }
+
     /// Electron apps (VS Code, Slack, …) are Chromium inside but not browsers.
     static func isElectron(_ pid: pid_t) -> Bool {
         guard let url = NSRunningApplication(processIdentifier: pid)?.bundleURL else { return false }
@@ -169,7 +181,7 @@ enum Windows {
         while Date() < deadline {
             let wins = targetable(app: query)
             if !wins.isEmpty { return wins }
-            try await Task.sleep(nanoseconds: 200_000_000)
+            try await Run.pause(0.2)  // stops when the client hangs up
         }
         throw HelperError("\(query) launched but has no window yet (try again, or open one with cmd+n)")
     }

@@ -80,6 +80,14 @@ enum AX {
         AXUIElementSetMessagingTimeout(app, 1.5)
         // Chromium/Electron only build their accessibility tree when asked.
         AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        // So does Firefox (Gecko), for clients asking for the "enhanced" UI: done on the first look at it, so
+        // find and target: see its pages from the start. Never for other apps: some native ones change
+        // behaviour with it.
+        if Windows.isGecko(pid), !enhanced.contains(pid) {
+            enhanced.insert(pid)
+            AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+            usleep(400_000)  // it builds the tree
+        }
         return app
     }
 
@@ -107,7 +115,7 @@ enum AX {
               settable.boolValue else { return false }
         var size = CGSize(width: min(f.width, box.width), height: min(f.height, box.height))
         guard size != f.size, let v = AXValueCreate(.cgSize, &size) else { return false }
-        return AXUIElementSetAttributeValue(win, kAXSizeAttribute as CFString, v) == .success
+        return write(win, kAXSizeAttribute, v) == .success
     }
 
     static let roleNames: [String: String] = [
@@ -141,23 +149,14 @@ enum AX {
     }
 
     nonisolated(unsafe) static var enhanced: Set<pid_t> = []
-    nonisolated(unsafe) static var lastCount: [CGWindowID: Int] = [:]  // elements numbered by the last outline
 
     /// Indexed outline, e.g. `[3] button "Back"` / ` [7] field "Search" ="cats" focused`.
     /// `within` (global points) limits it to elements overlapping that area, e.g. one table row.
     static func outline(pid: pid_t, wid: CGWindowID, within: CGRect? = nil, maxElements: Int = 300,
                         maxChars: Int = 8000, interactive: Bool = false) -> String? {
-        let text = buildOutline(pid: pid, wid: wid, within: within, maxElements: maxElements, maxChars: maxChars,
-                                interactive: interactive)
-        // Firefox/Gecko only builds its accessibility tree once a client asks for "enhanced" UI.
-        if (lastCount[wid] ?? 0) < 3, !enhanced.contains(pid) {
-            enhanced.insert(pid)
-            AXUIElementSetAttributeValue(appElement(pid), "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-            usleep(400_000)
-            return buildOutline(pid: pid, wid: wid, within: within, maxElements: maxElements, maxChars: maxChars,
-                                interactive: interactive)
-        }
-        return text
+        // (Firefox's tree is switched on in `appElement`.)
+        buildOutline(pid: pid, wid: wid, within: within, maxElements: maxElements, maxChars: maxChars,
+                     interactive: interactive)
     }
 
     /// The text inside `within` (global points) in reading order, one line per visual line, unclipped:
@@ -340,7 +339,6 @@ enum AX {
         }
 
         walk(win, depth: 0, indent: 0, parentLabel: nil)
-        lastCount[wid] = nodes.count
         reg.lines = numbered
         reg.prune(keeping: seen)
         if truncated { lines.append("… (truncated; zoom with region or use a screenshot)") }
@@ -359,14 +357,17 @@ enum AX {
         let role = value(n.element, kAXRoleAttribute) as? String
         if role == n.role, n.label == nil || label(n.element) == n.label { return n }
         let was = "\(n.name) \(n.label.map { "\"\(clip($0, 40))\"" } ?? "")".trimmingCharacters(in: .whitespaces)
-        if let label = n.label, let parent = n.parent, let pid = pidOf(n.element) ?? Windows.info(wid)?.pid {
+        var like: [(id: Int, frame: CGRect?)] = []
+        if let label = n.label, let pid = pidOf(n.element) ?? Windows.info(wid)?.pid {
             let same = search(pid: pid, windows: [wid], query: label, limit: 20).filter {
                 $0.exact && (value($0.element, kAXRoleAttribute) as? String) == n.role
-            }.filter { m in
-                value(m.element, kAXParentAttribute).map { CFGetTypeID($0) == AXUIElementGetTypeID() && CFEqual($0, parent) } == true
             }
-            if same.count == 1 {
-                let again = Node(element: same[0].element, frame: same[0].frame, role: n.role, label: n.label, name: n.name,
+            func parentOf(_ el: AXUIElement) -> AXUIElement? {
+                value(el, kAXParentAttribute).flatMap { CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil }
+            }
+            let here = n.parent.map { parent in same.filter { m in parentOf(m.element).map { CFEqual($0, parent) } == true } } ?? []
+            if here.count == 1, let parent = n.parent {
+                let again = Node(element: here[0].element, frame: here[0].frame, role: n.role, label: n.label, name: n.name,
                                  parent: parent)
                 reg.ids[n.element] = nil
                 reg.ids[again.element] = index
@@ -374,8 +375,30 @@ enum AX {
                 remarks.append("element \(index) had been replaced; used the \(was) there now")
                 return again
             }
+            // Elsewhere (another row, say) it's not used, but listed: the agent picks.
+            like = same.prefix(5).map { m in
+                (reg.number(Node(element: m.element, frame: m.frame, role: n.role, label: AX.label(m.element), name: n.name,
+                                 parent: parentOf(m.element))), m.frame)
+            }
         }
-        throw HelperError("element \(index) (\(was)) is gone or changed: look again (outline or find) for its new number")
+        throw Gone(index: index, was: was, like: like)
+    }
+
+    /// An element number whose element is gone or changed, and the ones like it in the window now.
+    struct Gone: Error, CustomStringConvertible {
+        let index: Int
+        let was: String
+        let like: [(id: Int, frame: CGRect?)]
+        var description: String { text(nil) }
+
+        /// `place` says where a frame is (screenshot pixels), if it can.
+        func text(_ place: ((CGRect) -> String?)?) -> String {
+            let head = "element \(index) (\(was)) is gone or changed"
+            guard !like.isEmpty else { return head + ": look again (outline or find) for its new number" }
+            let list = like.map { m in "[\(m.id)]" + (m.frame.flatMap { place?($0) }.map { " at \($0)" } ?? "") }
+            return head + "; the window now shows \(like.count == 1 ? "one" : "\(like.count)") like it: "
+                + list.joined(separator: ", ") + ". If that's what you meant, use its number (it isn't picked for you)"
+        }
     }
 
     /// Title, description, placeholder or help: what an element is called (not what it contains).
@@ -415,7 +438,7 @@ enum AX {
         // Some (SwiftUI) elements report success for any action name; only try ones they list.
         let supported = Set(actionNames(n))
         return names.contains { (supported.isEmpty || supported.contains($0))
-            && AXUIElementPerformAction(n.element, $0 as CFString) == .success }
+            && act(n.element, $0) == .success }
     }
 
     /// Whether a disclosure triangle, outline row or expandable element is open (nil if it isn't one).
@@ -435,12 +458,12 @@ enum AX {
         for attr in ["AXExpanded", "AXDisclosing"] {
             var settable: DarwinBoolean = false
             if AXUIElementIsAttributeSettable(el, attr as CFString, &settable) == .success, settable.boolValue,
-               AXUIElementSetAttributeValue(el, attr as CFString, open as CFBoolean) == .success {
+               write(el, attr, open as CFBoolean) == .success {
                 usleep(60_000)
                 if expanded(el) == open { return true }
             }
         }
-        guard AXUIElementPerformAction(el, kAXPressAction as CFString) == .success else { return false }
+        guard act(el, kAXPressAction) == .success else { return false }
         usleep(60_000)
         return expanded(el).map { $0 == open } ?? true
     }
@@ -453,21 +476,24 @@ enum AX {
     }
 
     static func setValue(_ n: Node, _ text: String) -> Bool {
-        AXUIElementSetAttributeValue(n.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-        return AXUIElementSetAttributeValue(n.element, kAXValueAttribute as CFString, text as CFString) == .success
+        write(n.element, kAXFocusedAttribute, kCFBooleanTrue)
+        return write(n.element, kAXValueAttribute, text as CFString) == .success
     }
 
     static func focus(_ n: Node) -> Bool {
-        AXUIElementSetAttributeValue(n.element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success
+        write(n.element, kAXFocusedAttribute, kCFBooleanTrue) == .success
     }
 
     /// One-line description of the app's focused element, e.g. `field "Search"`.
-    static func focusedSummary(pid: pid_t) -> String? {
+    /// What has the keyboard focus. With `wid`, only if it's in that window: the app's focus may be in
+    /// another of its windows (the user's).
+    static func focusedSummary(pid: pid_t, wid: CGWindowID? = nil) -> String? {
         let app = appElement(pid)
         guard let f = value(app, kAXFocusedUIElementAttribute) else { return nil }
         let el = f as! AXUIElement
         let role = value(el, kAXRoleAttribute) as? String ?? ""
         guard role != "AXWindow", role != "AXApplication" else { return nil }
+        if let wid, wid != 0, let other = windowID(el), other != wid { return "in another window (#\(other))" }
         let subrole = value(el, kAXSubroleAttribute) as? String
         var name = roleNames[role] ?? String(role.dropFirst(2)).lowercased()
         if subrole == "AXSecureTextField" { name = "password" }
@@ -481,7 +507,7 @@ enum AX {
     /// menu item carrying that shortcut and press it via accessibility instead.
     static func pressMenuShortcut(pid: pid_t, keys: [String]) -> String? {
         guard let (item, title) = menuItem(pid: pid, shortcut: keys),
-              AXUIElementPerformAction(item, kAXPressAction as CFString) == .success else { return nil }
+              act(item, kAXPressAction) == .success else { return nil }
         return title
     }
 
@@ -546,14 +572,15 @@ enum AX {
 
     static func closeWindow(pid: pid_t, wid: CGWindowID) -> Bool {
         guard let w = window(pid: pid, wid: wid), let b = value(w, kAXCloseButtonAttribute) else { return false }
-        return AXUIElementPerformAction(b as! AXUIElement, kAXPressAction as CFString) == .success
+        return act(b as! AXUIElement, kAXPressAction) == .success
     }
 
     static func raise(pid: pid_t, wid: CGWindowID) {
+        guard !Connection.hungUp else { return }
         NSRunningApplication(processIdentifier: pid)?.activate()
         if let w = window(pid: pid, wid: wid) {
-            AXUIElementPerformAction(w, kAXRaiseAction as CFString)
-            AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
+            act(w, kAXRaiseAction)
+            write(w, kAXMainAttribute, kCFBooleanTrue)
         }
     }
 }

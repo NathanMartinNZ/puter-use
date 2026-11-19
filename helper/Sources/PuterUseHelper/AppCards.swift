@@ -8,16 +8,13 @@ enum AppCards {
         get { Session.current.cards }
         set { Session.current.cards = newValue }
     }
-    static var shown: Set<String> {
-        get { Session.current.carded }
-        set { Session.current.carded = newValue }
-    }
+    static var shown: Store<String, Bool> { Session.current.carded }
 
     static func card(pid: pid_t) -> String? {
         guard enabled, let app = NSRunningApplication(processIdentifier: pid), app.activationPolicy == .regular else { return nil }
         let id = app.bundleIdentifier ?? "pid \(pid)"
-        guard !shown.contains(id) else { return nil }
-        shown.insert(id)
+        guard shown[id] == nil else { return nil }
+        shown[id] = true
         let name = app.localizedName ?? id
         var parts: [String] = []
         if let tip = quirk(app) { parts.append(tip) }

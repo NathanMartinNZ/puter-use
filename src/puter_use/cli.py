@@ -216,7 +216,9 @@ def build_action(args: argparse.Namespace) -> dict:
 
 
 async def run(args: argparse.Namespace) -> int:
-    h = Helper(session("default"))
+    # One request per process: it can't report later whether the reply reached anyone, so the helper
+    # counts a reply it wrote as delivered.
+    h = Helper(session("default"), reports=False)
     try:
         if args.cmd == "setup":
             print(f"helper: {app_path()}")

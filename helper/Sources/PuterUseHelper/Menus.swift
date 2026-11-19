@@ -183,7 +183,7 @@ extension AX {
                     }
                     throw HelperError("\(name) is disabled right now")
                 }
-                guard AXUIElementPerformAction(el, kAXPressAction as CFString) == .success else {
+                guard act(el, kAXPressAction) == .success else {
                     throw HelperError("couldn't press \(name) (disabled?)")
                 }
                 return (name, nil)

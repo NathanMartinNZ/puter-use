@@ -52,29 +52,92 @@ enum Handlers {
         get { Session.current.pasteOver }
         set { Session.current.pasteOver = newValue }
     }
-    static var meta: [CGWindowID: Meta] {
-        get { Session.current.meta }
-        set { Session.current.meta = newValue }
-    }
+    static var meta: Store<CGWindowID, Meta> { Session.current.meta }
     static var pointer: Pointer { Session.current.pointer }
 
-    static func dispatch(_ line: Data) async -> Data {
+    /// Commands that never wait their turn or take part in delivery reports: the handshake (status), quit
+    /// and permissions work whatever else the session is doing, for any client.
+    nonisolated static let exempt: Set<String> = ["status", "quit", "permissions"]
+    /// Bumped when a client and helper of different versions can't work together (see client.py).
+    nonisolated static let protocolVersion = 2
+
+    /// One request. A session's requests run one at a time, in order; the client's reports on its earlier
+    /// requests are applied first. A request whose client hangs up is cancelled and gets no reply.
+    static func dispatch(_ line: Data, fd: Int32 = -1) async -> Reply? {
         guard let req = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            return encode(["id": NSNull(), "ok": false, "error": "request must be a JSON object"])
+            return Reply(data: encode(["id": NSNull(), "ok": false, "error": "request must be a JSON object"]))
         }
         let p = req["params"] as? [String: Any] ?? [:]
+        let cmd = req["cmd"] as? String ?? ""
         let session = Session.named((req["session"] ?? p["session"]) as? String ?? "default")
-        session.lastUse = Date()
-        return await Session.$current.withValue(session) { await handle(req, p) }
+        let client = (req["client"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let key = exempt.contains(cmd) ? nil : client.flatMap { c in (req["id"] as? Int).map { RequestKey(client: c, id: $0) } }
+        let conn = Connection(fd: fd, key: key, reports: req["reports"] as? Bool != false)
+        if exempt.contains(cmd) {
+            let reply = await Connection.$current.withValue(conn) {
+                await Session.$current.withValue(session) { await handle(req, p) }
+            }
+            return reply.map { Reply(data: encode($0)) }
+        }
+        return await Connection.$current.withValue(conn) {
+            await Session.$current.withValue(session) { await take(turn: session, req, p, conn) }
+        }
     }
 
-    static func handle(_ req: [String: Any], _ p: [String: Any]) async -> Data {
+    /// A request that waits its turn, settles the client's reports, and takes part in them.
+    private static func take(turn session: Session, _ req: [String: Any], _ p: [String: Any], _ conn: Connection) async -> Reply? {
+        do { try await session.turns.take() } catch { return nil }  // gave up while waiting: never ran
+        defer { session.turns.done() }
+        session.lastUse = Date()
+        let key = conn.key
+        if let client = key?.client ?? (req["client"] as? String) {
+            session.account(client: client, done: ints(req["done"]), lost: ints(req["lost"]))
+        }
+        if let key { session.enter(key) }
+        let reply = await handle(req, p)
+        if let key { session.record(key, conn.work) }
+        // Cancelled, or the client hung up as it finished: the result won't reach the agent.
+        guard var reply, !conn.hungUp() else {
+            if let key { session.lost(key) }
+            return nil
+        }
+        // Notes about earlier calls whose results were lost go with every reply until one that carried
+        // them is known to have arrived.
+        var carried: [Int] = []
+        if reply["ok"] as? Bool == true, var result = reply["result"] as? [String: Any] {
+            let (ids, notes) = session.carry(key)
+            if !notes.isEmpty {
+                result["notes"] = notes + (result["notes"] as? [String] ?? [])
+                reply["result"] = result
+                carried = ids
+            }
+        }
+        var out = Reply(data: encode(reply))
+        if !conn.reports || key == nil {  // no reports will come: written counts as delivered
+            out.written = { session.written(key, notes: carried) }
+        }
+        return out
+    }
+
+    /// When the running binary was built (its modification time at launch, seconds since 1970).
+    nonisolated static let builtAt: Double = {
+        guard let path = Bundle.main.executablePath,
+              let d = try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date else { return 0 }
+        return d.timeIntervalSince1970
+    }()
+
+    nonisolated static func ints(_ v: Any?) -> [Int] { (v as? [Any] ?? []).compactMap { $0 as? Int } }
+
+    /// Run the command: the reply, or nil if it was cancelled.
+    static func handle(_ req: [String: Any], _ p: [String: Any]) async -> [String: Any]? {
         let id: Any = req["id"] ?? NSNull()
         do {
             Hold.touch()
             let result: [String: Any]
             switch req["cmd"] as? String ?? "" {
-            case "status": result = ["version": version, "pid": Int(Windows.ownPID), "permissions": Permissions.status()]
+            case "status":
+                result = ["version": version, "protocol": protocolVersion, "pid": Int(Windows.ownPID),
+                          "built": builtAt, "permissions": Permissions.status()]
             case "permissions": result = Permissions.request()
             case "windows": result = try await windows(p)
             case "screenshot": result = try await screenshot(p)
@@ -92,14 +155,17 @@ enum Handlers {
                 result = [:]
             case let other: throw HelperError("unknown command \(other)")
             }
-            return encode(["id": id, "ok": true, "result": result])
+            return ["id": id, "ok": true, "result": result]
         } catch {
-            return encode(["id": id, "ok": false, "error": "\(error)"])
+            if error is Cancelled || Connection.hungUp { return nil }
+            return ["id": id, "ok": false, "error": "\(error)"]
         }
     }
 
     static func encode(_ obj: [String: Any]) -> Data {
-        (try? JSONSerialization.data(withJSONObject: obj, options: [])) ?? Data("{\"ok\":false}".utf8)
+        if let d = try? JSONSerialization.data(withJSONObject: obj, options: []) { return d }
+        let id = (obj["id"] as? Int).map(String.init) ?? "null"
+        return Data("{\"id\":\(id),\"ok\":false,\"error\":\"the reply couldn't be encoded\"}".utf8)
     }
 
     // MARK: - params
@@ -135,25 +201,49 @@ enum Handlers {
                 throw HelperError("no window selected: pass window (an id from windows, an app name, or \"screen\")")
             }
             if cur == 0 { return .screen }
-            guard let w = Windows.info(cur) else { throw HelperError("window \(cur) no longer exists") }
-            return .window(w)
+            guard let w = Windows.info(cur) else { throw HelperError("window \(cur) no longer exists" + appWindows(cur)) }
+            return used(w)
         }
         if let n = num(v), !(v is String && Int(v as! String) == nil) {
             // An id no window can have (negative, fractional, past UInt32) is not found either.
             guard let id = CGWindowID(exactly: n), let w = Windows.info(id) else {
-                throw HelperError("window \(Int(exactly: n).map(String.init) ?? "\(n)") not found")
+                throw HelperError("window \(Int(exactly: n).map(String.init) ?? "\(n)") not found"
+                    + (CGWindowID(exactly: n).map(appWindows) ?? ""))
             }
-            return .window(w)
+            return used(w)
         }
         guard let s = (v as? String)?.trimmingCharacters(in: .whitespaces), !s.isEmpty else {
             throw HelperError("bad window value")
         }
         if s.lowercased() == "screen" { return .screen }
         if let w = Windows.targetable(app: s).first(where: { $0.onScreen }) ?? Windows.targetable(app: s).first {
-            return .window(w)
+            return used(w)
         }
         if Windows.runningApp(s) != nil { throw HelperError("\(s) is running but has no windows (use windows with launch=true)") }
         throw HelperError("no window for \"\(s)\" (not running? use windows with launch=true)")
+    }
+
+    /// Whether action `a` sent keys into a text field (so a menu now open is that field's suggestions).
+    static func typedIntoField(_ a: [String: Any]?, _ pid: pid_t) -> Bool {
+        guard let a, keyboardActions.contains(kind(a)) else { return false }
+        return AX.focusedElement(pid: pid).map(AX.isTextInput) ?? false
+    }
+
+    /// A window the session works on: its app is remembered, for when it's gone.
+    static func used(_ w: WinInfo) -> Target {
+        Session.current.windowApps[w.id] = (w.app, w.pid)
+        return .window(w)
+    }
+
+    /// For a window that's gone: whose it was and that app's windows now (" (it was Firefox's; …)"), the
+    /// same process's only (another copy of the app is someone else's), the agent's own marked.
+    static func appWindows(_ id: CGWindowID) -> String {
+        guard let (app, pid) = Session.current.windowApps[id] else { return "" }
+        let now = Windows.targetable().filter { $0.pid == pid }.prefix(8).map { w in
+            "#\(w.id)" + (w.title.isEmpty ? "" : " \"\(AX.clip(w.title, 40))\"") + (agentWindows.contains(w.id) ? " (yours)" : "")
+        }
+        return now.isEmpty ? " (it was \(app)'s, which has no windows now)"
+            : " (it was \(app)'s; its windows now: \(now.joined(separator: ", ")))"
     }
 
     // MARK: - commands
@@ -385,10 +475,12 @@ enum Handlers {
     /// not), just what changed since (when that's shorter).
     static func accessibility(_ t: Target, _ o: Opts = Opts([:]), within: CGRect? = nil, diff: Bool = false) -> [String: Any] {
         var out: [String: Any] = [:]
-        if within == nil, let pid = pid(t), let f = AX.focusedSummary(pid: pid) { out["focused"] = f }
+        if within == nil, let pid = pid(t), let f = AX.focusedSummary(pid: pid, wid: t.key) { out["focused"] = f }
         if case .window(let w) = t {
             let full = AX.outline(pid: w.pid, wid: w.id, within: within, maxChars: o.maxChars, interactive: o.interactive)
-            out["text"] = full ?? "(no accessibility tree for this window)"
+            out["text"] = full.map { $0.isEmpty ? (o.interactive
+                ? "(no interactive elements in this window; try text: true, or find)"
+                : "(no accessibility elements in this window)") : $0 } ?? "(no accessibility tree for this window)"
             if full != nil, within == nil, let lines = AX.registries[w.id]?.lines {
                 let sent = Session.current.outlines[w.id]
                 if diff, let sent, sent.interactive == o.interactive, let changes = outlineChanges(sent.lines, lines) {
@@ -486,7 +578,7 @@ enum Handlers {
     /// coordinates. Text with no accessibility element is looked for on screen.
     static func actionPoint(_ a: [String: Any], _ t: Target, required: Bool = true) async throws -> (CGPoint, AX.Node?)? {
         if let idx = num(a["element"]), case .window(let w) = t {
-            let n = try AX.node(w.id, Int(idx))
+            let n = try numbered(w, Int(idx), t)
             try reachable(n.element, "element \(Int(idx))")
             guard let c = AX.center(n) else { throw HelperError("element \(Int(idx)) has no position") }
             return (c, n)
@@ -535,8 +627,9 @@ enum Handlers {
             var count = int(a["count"] ?? a["clicks"], 1)
             if type == "double_click" { count = 2 }
             if type == "triple_click" { count = 3 }
-            guard let (p, node) = try await actionPoint(a, t) else { return }
-            let r = try route(t, at: p, foreground: foreground)
+            guard let (aimed, node) = try await actionPoint(a, t) else { return }
+            var p = aimed
+            var r = try route(t, at: p, foreground: foreground)
             if !flags.isEmpty { try guardKeyboard(r) }  // its modifiers go to whichever window has the keyboard
             if button == "left" { try Policy.checkPress(a, node: node, at: p, pid: r.pid) }
             if let item = a["item"], let last = AX.menuPath(item).last {
@@ -564,16 +657,52 @@ enum Handlers {
             }
             // A menu to choose from is opened with a real click: one opened through accessibility doesn't
             // follow the pointer.
-            let viaAX = node.map { AX.isPressable($0.element) } == true && count == 1 && allFlags.isEmpty && !foreground
+            var viaAX = node.map { AX.isPressable($0.element) } == true && count == 1 && allFlags.isEmpty && !foreground
                 && (button == "left" || button == "right") && a["_pointer"] == nil && a["item"] == nil
+            // Web content in Firefox gets a real click instead: its accessibility press fires no pointer
+            // events, which many web controls go by (see webAim). Aimed where the page really shows it.
+            var web = false
+            var over: String?  // pressed because something's over it: what (a click there would land on that)
+            if viaAX, button == "left", let node, case .window(let w) = t,
+               let how = try await webAim(node, w.id, pid: r.pid) {
+                switch how {
+                case .post(let q):
+                    let rq = try route(t, at: q, foreground: false)
+                    if rq.wid == w.id {
+                        (p, r, viaAX, web) = (q, rq, false, true)
+                    } else {  // a window of the app over it there (picture-in-picture, a smaller one) would take it
+                        over = "is under another window of \(w.app) (#\(rq.wid))"
+                    }
+                case .press(let why):
+                    over = why
+                }
+            }
             if foreground { prepareForeground(r) }
             if !viaAX { await Input.primer(r) }
             let mods = await Input.pressModifiers(flags, r, typist: clickTiming)  // keys held on the way, as a hand does
             await pointer.move(to: p, r)
             await Input.sleep(clickTiming.aim())
+            // The page may have moved while the pointer was on its way: aim again once; else press it.
+            if web, let node, case .window(let w) = t, blocked(reach(node, at: p, wid: w.id, pid: r.pid)) != nil {
+                if let seen = visiblePart(node, w.id), case .post(let q) = aim(node, seen, wid: w.id, pid: r.pid),
+                   case let rq = try route(t, at: q, foreground: false), rq.wid == w.id {
+                    (p, r) = (q, rq)
+                    await pointer.move(to: p, r)
+                    await Input.sleep(clickTiming.aim())
+                }
+                if let el = blocked(reach(node, at: p, wid: w.id, pid: r.pid)) {
+                    (viaAX, web) = (true, false)
+                    over = "looks covered by \(coverName(el)) (or the page moved under the pointer)"
+                }
+            }
             if viaAX, let node, AX.perform(node, button == "right" ? "showmenu" : "press") {
+                if let over { notes.append("\(aimName(a)) \(over); pressed it through accessibility") }
                 pointer.click()
                 return
+            }
+            if viaAX, let over {  // a click at its spot would land on what's over it
+                await Input.releaseModifiers(mods, r, typist: clickTiming)
+                throw HelperError("\(aimName(a)) \(over), and pressing it through accessibility didn't work: nothing was done")
             }
             if viaAX {  // no accessibility press: click after all
                 await Input.primer(r)
@@ -595,7 +724,7 @@ enum Handlers {
             if a["item"] != nil { try await pickFromMenu(a, r, t) }
         case "move", "mouse_move", "hover":
             guard let (p, _) = try await actionPoint(a, t) else { return }
-            if let (button, r) = run.heldButton {  // a button is down: this is a drag
+            if let (button, r, _) = run.heldButton {  // a button is down: this is a drag
                 await pointer.move(to: p, r, button: button)
             } else {
                 await pointer.move(to: p, try route(t, at: p, foreground: foreground))
@@ -622,16 +751,20 @@ enum Handlers {
                 await Input.sleep(clickTiming.modifierLead())
             }
             let (down, _, _, btn) = Input.buttonTypes(button)
+            try Connection.check()  // no button goes down for a batch that's been given up
             Input.newClickGroup()
             Input.mouse(down, p, r, button: btn)
             pointer.click()
-            run.heldButton = (button, r)
+            run.heldButton = (button, r, p)
         case "mouse_up":
-            guard let (button, r) = run.heldButton else { throw HelperError("no mouse button is down (mouse_down first)") }
+            guard let (button, r, _) = run.heldButton else { throw HelperError("no mouse button is down (mouse_down first)") }
             if let (p, _) = try await actionPoint(a, t, required: false) {
-                await pointer.move(to: p, r, button: button)
-                await pointer.hold(clickTiming.clickHold(), r, button: button)
+                // Cut short: the button stays held, and the cancel ends the drag (`endDrag`), so it isn't
+                // dropped partway.
+                guard await pointer.move(to: p, r, button: button),
+                      await pointer.hold(clickTiming.clickHold(), r, button: button) else { throw Cancelled() }
             }
+            try Connection.check()
             let (_, up, _, btn) = Input.buttonTypes(button)
             Input.mouse(up, pointer.tip ?? CGPoint(x: r.frame.midX, y: r.frame.midY), r, button: btn, flags: flags)
             run.heldButton = nil
@@ -662,14 +795,23 @@ enum Handlers {
             let selectedBefore = textStart.flatMap { AX.selectedRange($0.element) }
             await Input.primer(r)
             let mods = await Input.pressModifiers(flags, r, typist: clickTiming)
-            await pointer.move(to: pts[0], r)
+            let there = await pointer.move(to: pts[0], r)
             await Input.sleep(clickTiming.aim())
+            if !there || Connection.hungUp {  // given up before the button went down
+                await Connection.ungated { await Input.releaseModifiers(mods, r, typist: clickTiming) }
+                throw Cancelled()
+            }
             Input.newClickGroup()
             Input.mouse(down, pts[0], r, button: btn, flags: flags)
             pointer.click()
-            await pointer.hold(clickTiming.clickHold(), r, button: button, flags: flags)
-            await pointer.stroke(pts, r, button: button, flags: flags)
-            await pointer.hold(clickTiming.clickHold(), r, button: button, flags: flags)
+            var whole = await pointer.hold(clickTiming.clickHold(), r, button: button, flags: flags)
+            if whole { whole = await pointer.stroke(pts, r, button: button, flags: flags) }
+            if whole { whole = await pointer.hold(clickTiming.clickHold(), r, button: button, flags: flags) }
+            if !whole {  // the client hung up partway: end the drag without dropping anything somewhere new
+                await endDrag(r, from: pts[0], button: button)
+                await Connection.ungated { await Input.releaseModifiers(mods, r, typist: clickTiming) }
+                throw Cancelled()
+            }
             Input.mouse(up, pts[pts.count - 1], r, button: btn, flags: flags)
             await Input.releaseModifiers(mods, r, typist: clickTiming)
             if let textStart {
@@ -754,7 +896,7 @@ enum Handlers {
                 try run.keyDown(k, r)
             }
             if type.hasPrefix("hold") {
-                await Input.sleep(seconds)
+                try await Run.pause(seconds)
                 for (i, k) in keys.reversed().enumerated() {
                     if i > 0 { await Input.sleep(typist.modifierTrail()) }
                     try run.keyUp(k, r)
@@ -787,6 +929,7 @@ enum Handlers {
             try await waitFor(a, run)
         case "clipboard":
             if let text = a["text"] as? String {
+                try Connection.check()
                 Clipboard.set(text)
                 notes.append("clipboard set (\(text.count) characters; what was there is replaced)")
             } else {
@@ -797,6 +940,7 @@ enum Handlers {
             let r = try route(t, at: nil, foreground: foreground)
             try Policy.checkSecureFocus(r.pid)
             if foreground { prepareForeground(r) }
+            try Connection.check()
             Clipboard.borrow(text)
             do { try await press(["cmd", "v"], r) } catch {
                 Clipboard.giveBack()
@@ -831,15 +975,27 @@ enum Handlers {
             let given = a["ms"] ?? a["seconds"] ?? a["duration"]
             let ms = num(a["ms"]) ?? num(a["seconds"] ?? a["duration"]).map { $0 * 1000 } ?? (given == nil ? 1000 : -1)
             guard ms >= 0, ms <= 30000 else { throw HelperError("wait takes ms, a number from 0 to 30000") }
-            if let (button, r) = run.heldButton {  // a hand holding a button down never quite stops
-                await pointer.hold(ms / 1000, r, button: button)
+            if let (button, r, _) = run.heldButton {  // a hand holding a button down never quite stops
+                if !(await pointer.hold(ms / 1000, r, button: button)) { throw Cancelled() }
             } else {
-                await Input.sleep(ms / 1000)
+                try await Run.pause(ms / 1000)
             }
         case "activate", "raise", "focus_window":
             guard case .window(let w) = t else { return }
             AX.raise(pid: w.pid, wid: w.id)
-            try await Task.sleep(nanoseconds: 250_000_000)
+            try await Run.pause(0.25)
+            // Keys after it go to the app's key window: check it's this one (when the app says), and try
+            // again twice before saying it isn't.
+            for _ in 0..<2 {
+                guard let key = AX.focusedWindow(pid: w.pid), key != w.id else { break }
+                SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
+                AX.raise(pid: w.pid, wid: w.id)
+                try await Run.pause(0.25)
+            }
+            if let key = AX.focusedWindow(pid: w.pid), key != w.id {
+                throw HelperError("\(w.app) didn't bring window #\(w.id) forward: its keyboard is still in #\(key), so "
+                    + "keys would go there. Look at the screen before going on")
+            }
         case "close_window", "close":
             guard case .window(let w) = t else { throw HelperError("close_window needs a window target") }
             if !AX.closeWindow(pid: w.pid, wid: w.id) { throw HelperError("window has no close button") }
@@ -884,6 +1040,16 @@ enum Handlers {
         let app = Policy.appName(r.pid)
         if let key = AX.focusedWindow(pid: r.pid), let w = Windows.info(key) {
             let what = w.title.isEmpty ? "window #\(key)" : "window #\(key) \"\(AX.clip(w.title, 40))\""
+            if agentWindows.contains(key) {
+                // Moving the keyboard between windows of the app the user is in would take it from them.
+                if Hold.isFront(r.pid) {
+                    throw HelperError("your other \(what) has \(app)'s keyboard, and \(app) is the user's front app, so "
+                        + "puter-use won't move it (that would take it from them): the action didn't run. Work in #\(key), "
+                        + "or wait until the user leaves \(app)")
+                }
+                throw HelperError("your other \(what) has \(app)'s keyboard, and it couldn't be moved to #\(r.wid): the "
+                    + "action didn't run. Work in #\(key), or close it if you're done with it")
+            }
             throw HelperError("another window of \(app) has the keyboard (\(what), not the agent's #\(r.wid)): "
                 + "it would act on that one instead, so the action didn't run. Wait until the keyboard is back in "
                 + "#\(r.wid) (the user may be using \(app)), then try again")
@@ -895,6 +1061,7 @@ enum Handlers {
     /// Press a shortcut or key. Chromium ignores key equivalents while in the background, so there the
     /// matching menu item is pressed instead.
     static func press(_ keys: [String], _ r: Route) async throws {
+        try Connection.check()
         try guardKeyboard(r)
         if !r.foreground, Windows.isChromium(r.pid), NSRunningApplication(processIdentifier: r.pid)?.isActive != true,
            let title = AX.pressMenuShortcut(pid: r.pid, keys: keys) {
@@ -951,28 +1118,120 @@ enum Handlers {
                 throw HelperError("stopped partway through the text: \(ok); the first \(sent) characters were typed. "
                     + "Ask the user; if they agree, type the rest with \"confirm\": true")
             }
+            try Connection.check()
             // The user may have taken the keyboard since the last stretch (a long text takes a while).
             try guardKeyboard(r)
             if i > 0 { await Input.sleep(typist.between()) }
             let end = s.end.map { String($0) } ?? ""
             if pasteOver > 0, s.text.count > pasteOver {
                 await Input.sleep(typist.instant ? 0 : Double.random(in: 0.15...0.35))  // reach for the shortcut
+                try Connection.check()
                 Clipboard.borrow(s.text)
                 do { try await press(["cmd", "v"], r) } catch {
                     Clipboard.giveBack()
                     throw error
                 }
                 Clipboard.giveBack()
+                try Connection.check()
+                Connection.current?.work.typed += s.text.count
                 await Input.sleep(typist.instant ? 0.03 : Double.random(in: 0.12...0.25))
                 if !end.isEmpty,
                    !(await Input.type(end, r, typist: typist, stillSafe: { keysReachTarget(r) })) {
-                    throw typingInterrupted(sent, r)
+                    throw try interruption(sent, r)
                 }
             } else if !(await Input.type(s.text + end, r, typist: typist, stillSafe: { keysReachTarget(r) })) {
-                throw typingInterrupted(sent, r)
+                throw try interruption(sent, r)
             }
             sent += s.text.count + end.count
         }
+    }
+
+    /// Why typing stopped short: the client hanging up is a cancel, not the user taking the keyboard.
+    private static func interruption(_ sent: Int, _ r: Route) throws -> HelperError {
+        try Connection.check()
+        return typingInterrupted(sent, r)
+    }
+
+    /// End a drag whose client hung up, without dropping what's dragged somewhere new. If the agent's
+    /// window has the app's keyboard, Escape cancels the drag (in AppKit and browsers) and the button
+    /// comes up where it is. Otherwise Escape would go to the user's window of that app (cancelling their
+    /// rename, closing their sheet), so the pointer goes back to where the drag started and lets go there.
+    static func endDrag(_ r: Route, from start: CGPoint, button: String) async {
+        let (_, up, _, btn) = Input.buttonTypes(button)
+        await Connection.ungated {
+            if keysReachTarget(r), escapeIsOnlyTheDrags(r) {
+                let esc = Keys.named["escape"] ?? 0x35
+                Input.key(esc, down: true, flags: [], r, withHeld: false)
+                await Input.ms(30)
+                Input.key(esc, down: false, flags: [], r, withHeld: false)
+                Input.mouse(up, pointer.tip ?? start, r, button: btn)
+            } else {
+                await pointer.move(to: start, r, button: button)
+                Input.mouse(up, start, r, button: btn)
+            }
+        }
+    }
+
+    /// Whether Escape in `r`'s window would only end a drag: not in a sheet or dialog, or a window with a
+    /// cancel button or a sheet open, where it would cancel that (discarding a form).
+    static func escapeIsOnlyTheDrags(_ r: Route) -> Bool {
+        guard let w = AX.window(pid: r.pid, wid: r.wid) else { return false }
+        if AX.value(w, kAXSubroleAttribute) as? String != "AXStandardWindow" { return false }
+        if AX.value(w, kAXCancelButtonAttribute) != nil { return false }
+        return !AX.children(w).contains { AX.value($0, kAXRoleAttribute) as? String == "AXSheet" }
+    }
+
+    /// An action in a few words, for the note about a call whose result never reached the agent. Typed
+    /// text is counted, not repeated.
+    static func brief(_ a: [String: Any]) -> String {
+        let k = kind(a)
+        var aim = ""
+        if let t = a["target"] {
+            aim = " \"\(AX.clip((t as? [String: Any])?["text"] as? String ?? "\(t)", 30))\""
+        } else if let e = num(a["element"]) {
+            aim = " element \(Int(e))"
+        } else if let x = num(a["x"]), let y = num(a["y"]) {
+            aim = " at (\(Int(x)),\(Int(y)))"
+        }
+        switch k {
+        case "type", "type_text", "paste":
+            let n = (a["text"] as? String ?? a["value"] as? String ?? "").count
+            return "\(k == "paste" ? "pasted" : "typed") \(n) character\(n == 1 ? "" : "s")" + (aim.isEmpty ? "" : " into\(aim)")
+                + (a["submit"] as? Bool == true ? ", then Return" : "")
+        case "keypress", "key", "press_key", "hotkey":
+            return "pressed " + Keys.sequence(a["keys"] ?? a["key"] ?? a["text"]).map { $0.joined(separator: "+") }.joined(separator: " ")
+        case "menu", "menu_item":
+            return "menu " + AX.menuPath(a["item"] ?? a["path"] ?? a["text"]).joined(separator: " > ")
+        case "fill":
+            return "filled \((a["fields"] as? [Any])?.count ?? 0) fields" + (a["submit"] != nil ? " and submitted" : "")
+        case "navigate", "goto", "go_to":
+            return "went to " + AX.clip(a["url"] as? String ?? "", 60)
+        default:
+            return k + aim + (a["item"].map { " > \($0)" } ?? "")
+        }
+    }
+
+    /// The action under way when the client gave up, and how far it got.
+    static func partway(_ n: Int, _ a: [String: Any]) -> String {
+        guard let w = Connection.current?.work else { return "action \(n) (\(kind(a))) was under way" }
+        var bits: [String] = []
+        if let f = w.fields { bits.append(f.done == 0 ? "none of its \(f.of) fields was done" : "fields 1-\(f.done) of \(f.of) were done") }
+        bits += w.did
+        if w.typed > 0 {
+            let text = w.fields == nil ? a["text"] as? String ?? a["value"] as? String : nil
+            let of = text.map { t in " of \(t.filter { !$0.isNewline && $0 != "\t" }.count)" } ?? ""
+            bits.append("\(w.typed)\(of) characters had gone out" + (w.fields == nil ? "" : " in the next one"))
+        }
+        if bits.isEmpty { return "action \(n) (\(kind(a))) was under way: it may or may not have taken effect" }
+        return "action \(n) (\(kind(a))) stopped partway: " + bits.joined(separator: ", ")
+    }
+
+    /// Windows of the batch's app that weren't there when it started.
+    static func openedBy(_ run: Run) -> [CGWindowID] {
+        Windows.all(onScreenOnly: true).filter {
+            $0.pid == run.pidAtStart && $0.layer == 0 && !run.visibleBefore.contains($0.id)
+                && $0.frame.width >= 200 && $0.frame.height >= 120
+        }.map(\.id)
     }
 
     /// Another window of the app took the keyboard partway through the text.
@@ -1052,15 +1311,28 @@ enum Handlers {
         AppCards.enabled = p["app_cards"] as? Bool != false
         var errors: [String] = []
         var done = 0
+        var cancelled = false
+        if case .window(let w) = t { Connection.current?.work.window = "\(w.app) #\(w.id)" }
+        Connection.current?.work.total = actions.count
+        Session.current.acts += 1
+        Connection.current?.work.first = base
         notes = expanded
         // Background apps drop clicks (as "activation clicks") and key equivalents. Tell the target's AppKit
         // layer it is active (and keep it so between calls, see `Hold`); the user's real focus is untouched.
+        try Connection.check()
         if !foreground, case .window(let w) = t, !Hold.isFront(w.pid) {
             if Hold.activate(pid: w.pid, wid: w.id) { try await Task.sleep(nanoseconds: 30_000_000) }
             // Keyboard input (and key equivalents like cmd+a) only reach a window AppKit considers key.
             if actions.contains(where: { actsOnKeyboardFocus($0) }) {
                 SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
                 try await Task.sleep(nanoseconds: 30_000_000)
+                // Not taken (Firefox ignores it) while another of the agent's own windows has the keyboard: a
+                // click just outside this one's content moves it, as a click on the window would. Never from
+                // a window of the user's: their keyboard stays where they left it (guardKeyboard says so).
+                if let key = AX.focusedWindow(pid: w.pid), key != w.id, agentWindows.contains(key) {
+                    await Input.primer(try route(t, at: nil, foreground: false), force: true)
+                    try await Run.pause(0.1)
+                }
             }
         } else {
             Hold.release(for: Session.current)
@@ -1068,6 +1340,13 @@ enum Handlers {
         var stopped: String?
         var confirm: [String: Any]?
         for (i, a) in actions.enumerated() {
+            if Connection.hungUp {  // the client gave up: nothing more runs
+                cancelled = true
+                break
+            }
+            Connection.current?.work.typed = 0
+            Connection.current?.work.did = []
+            Connection.current?.work.fields = nil
             // A macro step by position means the same only with the same things open over the window as
             // when it was saved.
             if run.guarded, !foreground, Macros.positional(a), case .window(let w) = run.target {
@@ -1106,21 +1385,27 @@ enum Handlers {
                         if tremor != nil { pointer.endHold() }
                     }
                     try await perform(a, run)
+                    try Connection.check()  // given up partway: whether this one took effect isn't known
                     if let step { recorded.append(step) }
                     done += 1
+                    Connection.current?.work.done = done
+                    Connection.current?.work.steps.append(brief(a))
                     if i < actions.count - 1 {
-                        if let (button, r) = run.heldButton {  // a hand holding the button down never quite stops
+                        if let (button, r, _) = run.heldButton {  // a hand holding the button down never quite stops
                             await pointer.hold(0.06, r, button: button)
                         } else if mayOpen(a) {
-                            await run.settle()
+                            try await run.settle()
                             // A menu left open would take the next actions' keys (and the user's): closed now.
-                            if !foreground, let pid = pid(run.target) { await closeLeftOpenMenu(pid: pid, wait: false) }
+                            if !foreground, let pid = pid(run.target) {
+                                await closeLeftOpenMenu(pid: pid, wait: false, afterKeys: typedIntoField(a, pid),
+                                                        route: try? route(run.target, at: nil, foreground: false))
+                            }
                         } else {
                             await Input.ms(60)
                         }
                     }
                 }
-            } catch let ok as Policy.NeedsOK {
+            } catch let ok as Policy.NeedsOK where !Connection.hungUp {
                 // Nothing of it has happened yet (or only what `partly` says): the agent asks the user, then
                 // repeats it with confirm: true.
                 let n = base + i + 1
@@ -1138,13 +1423,41 @@ enum Handlers {
                 if saveAs != nil { confirm?["recorded"] = recorded }  // to save the whole batch once it's carried on
                 break
             } catch {
+                if error is Cancelled || Connection.hungUp {
+                    cancelled = true
+                    // (A wait or look that was cut short did nothing.)
+                    if done == i, !["wait", "sleep", "wait_for", "waitfor", "screenshot"].contains(kind(a)) {
+                        Connection.current?.work.partial = partway(base + i + 1, a)
+                    }
+                    break
+                }
                 errors.append("action \(base + i + 1) (\(a["type"] ?? "?")): \(error)")
                 break
             }
         }
+        if cancelled || Connection.hungUp {
+            // The client gave up: let go of what's held and close a menu left open (cleanup always runs),
+            // then stop. No settle, screenshot or record of what was shown: no one would see it.
+            if let w = Connection.current?.work { Connection.current?.work.opened += openedBy(run).filter { !w.opened.contains($0) } }
+            await Connection.ungated {
+                _ = await run.releaseAll(clickTiming, cancelled: true)
+                if !foreground, let pid = pid(run.target) {  // not remembered: the agent never hears of it
+                    await closeLeftOpenMenu(pid: pid, wait: true, route: try? route(run.target, at: nil, foreground: false),
+                                            remember: false)
+                }
+            }
+            throw Cancelled()
+        }
         let released = await run.releaseAll(clickTiming)
         if !foreground, let pid = pid(run.target) {
-            await closeLeftOpenMenu(pid: pid, wait: done > 0 && actions.indices.contains(done - 1) && mayOpen(actions[done - 1]))
+            let last = done > 0 && actions.indices.contains(done - 1) ? actions[done - 1] : nil
+            let typed = typedIntoField(last, pid)
+            // A web page's combo box (a search box with suggestions) shows its list a moment after the keys: wait for it.
+            let combo = typed && AX.focusedElement(pid: pid).map {
+                AX.value($0, kAXRoleAttribute) as? String == "AXComboBox" && AX.webArea(of: $0) != nil
+            } == true
+            await closeLeftOpenMenu(pid: pid, wait: (last.map(mayOpen) ?? false) || combo, afterKeys: typed,
+                                    route: try? route(run.target, at: nil, foreground: false))
         }
         if !released.isEmpty { notes.append("let go of \(released.joined(separator: ", ")) (still held at the end)") }
         if let saveAs {
@@ -1165,6 +1478,7 @@ enum Handlers {
             else { return false }
             target = .window(nw)
             agentWindows.insert(nw.id)
+            Connection.current?.work.opened.append(nw.id)
             current = nw.id
             before = nil
             return true
@@ -1293,6 +1607,9 @@ enum Handlers {
 enum Hold {
     static var held: [pid_t: CGWindowID] = [:]
     static var lastUse: [pid_t: Date] = [:]
+    /// Held since this batch, not before: the app's first click after it's told it's active is still an
+    /// activation click (Firefox drops it), so the primer spends one even though its window is key.
+    static var fresh = Set<pid_t>()
     static let idle: TimeInterval = 120
     private static var timer: Timer?
     private static var observer: NSObjectProtocol?
@@ -1311,6 +1628,7 @@ enum Hold {
         let me = Session.current
         for other in me.holding where other != pid { drop(other, from: me) }
         guard SkyLight.setAppKitActive(pid: pid, wid: wid, true) else { return false }
+        if held[pid] == nil { fresh.insert(pid) }
         held[pid] = wid
         me.holding.insert(pid)
         lastUse[pid] = Date()
@@ -1351,6 +1669,7 @@ enum Hold {
     /// No longer ours to release (the user brought it forward, or it's released).
     private static func forget(_ pid: pid_t) {
         held[pid] = nil
+        fresh.remove(pid)
         lastUse[pid] = nil
         for s in Session.all.values { s.holding.remove(pid) }
     }

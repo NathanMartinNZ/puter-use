@@ -24,12 +24,22 @@ extension Handlers {
     /// Elements of window `w`, or of a sheet, popover or menu of its app over it, showing `spec`'s text:
     /// whole-label matches if there are any, and controls before bare labels saying the same thing.
     static func matches(_ sp: Spec, _ w: WinInfo, limit: Int = 30) -> [AX.Match] {
+        narrowed(candidates(sp, w, limit: limit), sp)
+    }
+
+    /// Every element of `w` (or of what's open over it) showing `spec`'s text, as all or part of its label.
+    static func candidates(_ sp: Spec, _ w: WinInfo, limit: Int) -> [AX.Match] {
         // Over it: a menu, popover or panel, or a sheet or dialog (not another of the app's own windows).
         let over = Windows.popups(over: w).filter { o in
             o.frame.intersects(w.frame)
                 && AX.window(pid: w.pid, wid: o.id).map { AX.value($0, kAXSubroleAttribute) as? String != "AXStandardWindow" } != false
         }
-        var hits = AX.search(pid: w.pid, windows: Set([w.id] + over.map(\.id)), query: sp.text, role: sp.role, limit: limit)
+        return AX.search(pid: w.pid, windows: Set([w.id] + over.map(\.id)), query: sp.text, role: sp.role, limit: limit)
+    }
+
+    /// Whole-label matches if there are any, and controls before bare labels saying the same thing.
+    static func narrowed(_ all: [AX.Match], _ sp: Spec) -> [AX.Match] {
+        var hits = all
         let exact = hits.filter(\.exact)
         if !exact.isEmpty { hits = exact }
         if sp.role == nil {
@@ -82,11 +92,19 @@ extension Handlers {
         return (id, try AX.node(w.id, id))
     }
 
+    /// The element numbered `idx` in `w`. When it's gone, the error lists the elements like it now
+    /// there, with their numbers and where they are (none is picked: it could be another row's).
+    static func numbered(_ w: WinInfo, _ idx: Int, _ t: Target) throws -> AX.Node {
+        do { return try AX.node(w.id, idx) } catch let gone as AX.Gone {
+            throw HelperError(gone.text { r in toPixels(t, CGPoint(x: r.midX, y: r.midY)).map { "(\($0[0]),\($0[1]))" } })
+        }
+    }
+
     /// The element an action names: `element` (a number) or `target` (what it says), or nil if neither.
     static func elementNode(_ a: [String: Any], _ t: Target) throws -> AX.Node? {
         if let idx = num(a["element"]) {
             guard case .window(let w) = t else { throw HelperError("element needs a window target") }
-            let n = try AX.node(w.id, Int(idx))
+            let n = try numbered(w, Int(idx), t)
             try reachable(n.element, "element \(Int(idx))")
             return n
         }
@@ -103,7 +121,7 @@ extension Handlers {
                     if let (_, n) = try Macros.spot(v, t, at: try toGlobal(t, x, y, a)) { return n }
                     throw HelperError("\(error) (a macro step: what it acted on isn't where it was, so nothing was done)")
                 }
-                if let e = error as? NotFound { throw HelperError("\(e)") }
+                if let e = error as? NotFound { throw HelperError(menuHint(try spec(v), t) ?? "\(e)") }
                 throw error
             }
         }
@@ -114,12 +132,12 @@ extension Handlers {
     static func readOffScreen(_ v: Any, _ t: Target) async throws -> CGPoint {
         let sp = try spec(v)
         // The screen shows text, not what kind of element it is.
-        if sp.role != nil { throw HelperError("nothing shows \(sp.description) in the window") }
+        if sp.role != nil { throw HelperError(menuHint(sp, t) ?? "nothing shows \(sp.description) in the window") }
         let hits = try await ocrFind(sp.text, t)
         var pick = hits.filter(\.exact)
         if pick.isEmpty { pick = hits }
         if let nth = sp.nth, nth >= 1, nth <= pick.count { pick = [pick[nth - 1]] }
-        guard !pick.isEmpty else { throw HelperError("nothing shows \(sp.description) (accessibility or on screen)") }
+        guard !pick.isEmpty else { throw HelperError(menuHint(sp, t) ?? "nothing shows \(sp.description) (accessibility or on screen)") }
         guard pick.count == 1 else {
             let list = pick.prefix(6).map { h -> String in
                 let px = toPixels(t, CGPoint(x: h.rect.midX, y: h.rect.midY)).map { " at (\($0[0]),\($0[1]))" } ?? ""
@@ -129,6 +147,19 @@ extension Handlers {
         }
         notes.append("\(sp.description) found by reading the screen (no accessibility element)")
         return CGPoint(x: pick[0].rect.midX, y: pick[0].rect.midY)
+    }
+
+    /// For text that isn't there but was in a menu of this window closed in this call or the last one: say
+    /// so, and how to choose from it.
+    static func menuHint(_ sp: Spec, _ t: Target) -> String? {
+        let s = Session.current
+        guard case .window(let w) = t, let last = s.lastClosedMenu, last.wid == w.id, s.acts - last.act <= 1 else { return nil }
+        let k = AX.menuKey(sp.text)
+        guard let item = last.titles.first(where: { AX.menuKey($0) == k || AX.menuKey($0) == k + " >" }) else { return nil }
+        let name = item.hasSuffix(" >") ? String(item.dropLast(2)) : item
+        let when = last.act == s.acts ? "earlier in this call" : "in your last call"
+        return "nothing shows \(sp.description): \"\(name)\" was in a menu closed \(when) (an open menu takes the user's "
+            + "typing). Open it again and choose in the same click, with item: \"\(name)\""
     }
 
     /// OCR of the whole window at a resolution good for small text.
@@ -162,8 +193,19 @@ extension Handlers {
         guard !q.isEmpty || sp.role != nil else { throw HelperError("find needs a query (and/or role)") }
         if meta[t.key] == nil, let shot = try? await plan(t, region: nil, Opts(p)).run() { remember(t, shot, Signature(shot.image)) }
         let limit = max(1, min(int(p["limit"], 20), 100))
-        let hits = matches(sp, w, limit: limit)
+        let all = candidates(sp, w, limit: limit + 5)
+        let hits = Array(narrowed(all, sp).prefix(limit))
         var lines = hits.map { describe($0, id: number($0, w.id), t) }
+        // A target takes whole-label matches only, but find also shows a few that contain the text
+        // ("Sign in" is also in "Sign in with Google"), controls first.
+        if !q.isEmpty, hits.contains(where: \.exact) {
+            let rest = all.filter { m in !m.exact && !hits.contains { CFEqual($0.element, m.element) } }
+            let more = (sp.role == nil ? rest.filter { $0.role != "text" } + rest.filter { $0.role == "text" } : rest).prefix(5)
+            if !more.isEmpty {
+                lines.append("also containing \"\(AX.clip(q, 40))\" (as a target, give the whole text, or use the number):")
+                lines += more.map { describe($0, id: number($0, w.id), t) }
+            }
+        }
         if hits.isEmpty, !q.isEmpty, sp.role == nil {
             let seen = try await ocrFind(q, t)
             lines = seen.prefix(limit).map { h in

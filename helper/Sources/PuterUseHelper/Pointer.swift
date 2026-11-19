@@ -230,6 +230,7 @@ final class Pointer {
         let flags: CGEventFlags  // including keys the session holds down
         let group: Int64  // the session's click group, for drags
         let id: Int
+        let conn: Connection?  // the request it's part of: it stops when that client hangs up
         var sent: CGPoint?
     }
 
@@ -238,7 +239,7 @@ final class Pointer {
     private(set) var tip: CGPoint?  // global, top-left origin: where the app last saw the pointer
     private var motion: Motion?
     private var motions = 0
-    private var arrivals: [CheckedContinuation<Void, Never>] = []
+    private var arrivals: [CheckedContinuation<Bool, Never>] = []
     private var timer: Timer?
     private var lastTick: CFTimeInterval = 0
     private var lastDraw: CFTimeInterval = 0
@@ -291,33 +292,40 @@ final class Pointer {
     /// drawn; returns on arrival. `button` (held down) turns the moves into drags.
     /// `follow` gives the window under each point, for a path that crosses from one window to another
     /// (into a submenu): a real mouse's events go to whichever window it's over.
+    /// Returns false if it stopped short because the client hung up.
+    @discardableResult
     func move(to p: CGPoint, _ route: Route?, button: String? = nil, flags: CGEventFlags = [], lane: CGRect? = nil,
-              follow: ((CGPoint) -> Route?)? = nil) async {
+              follow: ((CGPoint) -> Route?)? = nil) async -> Bool {
         let start = tip ?? resume(route) ?? entry(near: p, route?.frame)
         show(above: route?.wid ?? 0, at: start)
         let path: Path? = speed <= 0 || hypot(p.x - start.x, p.y - start.y) < 1 ? nil
             : .reach(CursorMotion.plan(from: start, to: p, within: lane ?? route?.frame, speed: speed, lane: lane != nil))
-        await run(path, from: start, to: p, route, button: button, flags: flags, follow: follow)
+        return await run(path, from: start, to: p, route, button: button, flags: flags, follow: follow)
     }
 
     /// Drag along `pts` (the button is already down at `pts[0]`), sending each frame as a dragged event.
-    func stroke(_ pts: [CGPoint], _ route: Route, button: String, flags: CGEventFlags = []) async {
-        guard let last = pts.last else { return }
+    @discardableResult
+    func stroke(_ pts: [CGPoint], _ route: Route, button: String, flags: CGEventFlags = []) async -> Bool {
+        guard let last = pts.last else { return true }
         show(above: route.wid, at: tip ?? pts[0])
-        await run(speed <= 0 || pts.count < 2 ? nil : .stroke(StrokeMotion(pts, speed: speed)), from: pts[0], to: last,
-                  route, button: button, flags: flags)
+        return await run(speed <= 0 || pts.count < 2 ? nil : .stroke(StrokeMotion(pts, speed: speed)), from: pts[0], to: last,
+                         route, button: button, flags: flags)
     }
 
     /// Keep the button down for `seconds` where the pointer is, with a hand's faint tremor sent as drags.
-    func hold(_ seconds: Double, _ route: Route, button: String, flags: CGEventFlags = []) async {
-        guard !Task.isCancelled else { return }
-        guard let p = tip, speed > 0, seconds > 0 else { return await Input.sleep(seconds) }
+    @discardableResult
+    func hold(_ seconds: Double, _ route: Route, button: String, flags: CGEventFlags = []) async -> Bool {
+        guard !Task.isCancelled else { return true }
+        guard let p = tip, speed > 0, seconds > 0 else {
+            do { try await Run.pause(seconds) } catch { return false }
+            return true
+        }
         show(above: route.wid, at: p)
-        await run(.hold(HoldMotion(at: p, duration: seconds)), from: p, to: p, route, button: button, flags: flags)
+        return await run(.hold(HoldMotion(at: p, duration: seconds)), from: p, to: p, route, button: button, flags: flags)
     }
 
     private func run(_ path: Path?, from start: CGPoint, to p: CGPoint, _ route: Route?, button: String?,
-                     flags: CGEventFlags, follow: ((CGPoint) -> Route?)? = nil) async {
+                     flags: CGEventFlags, follow: ((CGPoint) -> Route?)? = nil) async -> Bool {
         if motion != nil { land() }  // never two at once
         let (_, _, dragged, btn) = Input.buttonTypes(button ?? "left")
         Pointer.motionCount += 1
@@ -325,15 +333,16 @@ final class Pointer {
         let s = Session.current
         var m = Motion(path: path ?? .stroke(StrokeMotion([p], speed: 1)), start: CACurrentMediaTime(), route: route, follow: follow,
                        type: button == nil ? .mouseMoved : dragged, button: btn, flags: flags.union(s.held),
-                       group: s.clickGroup, id: Pointer.motionCount)
+                       group: s.clickGroup, id: Pointer.motionCount, conn: Connection.current)
         guard let path else {  // jump
+            if m.conn?.hungUp() == true { return false }
             emit(p, &m)
-            return
+            return true
         }
         Trace.plan(m.id, path: path.trace, from: start, to: p, duration: path.duration, speed: speed)
         motion = m
         startTicking()
-        await withCheckedContinuation { arrivals.append($0) }
+        return await withCheckedContinuation { arrivals.append($0) }
     }
 
     /// Back on a window after the pointer was hidden: where it was left (the app last saw it there).
@@ -396,7 +405,13 @@ final class Pointer {
         guard var m = motion else { return }
         motion = nil
         emit(m.path.end, &m)
-        finishArrivals()
+        finishArrivals(true)
+    }
+
+    /// The client hung up: stop where it is (nothing more is sent), and say so to whoever waits.
+    private func abort() {
+        motion = nil
+        finishArrivals(false)
     }
 
     /// Press feedback, as the button goes down: the pointer dips and a ring ripples out from the tip.
@@ -449,7 +464,9 @@ final class Pointer {
             // Sample by wall-clock time, so a busy frame doesn't stretch the movement.
             let elapsed = now - m.start
             let before = tip ?? m.path.point(0)
-            if elapsed >= m.path.duration {
+            if m.conn?.hungUp() == true {
+                abort()
+            } else if elapsed >= m.path.duration {
                 land()
             } else {
                 let p = m.path.point(elapsed)
@@ -480,10 +497,10 @@ final class Pointer {
         CATransaction.commit()
     }
 
-    private func finishArrivals() {
+    private func finishArrivals(_ arrived: Bool) {
         let waiting = arrivals
         arrivals = []
-        for c in waiting { c.resume() }
+        for c in waiting { c.resume(returning: arrived) }
     }
 
     private func scheduleHide() {

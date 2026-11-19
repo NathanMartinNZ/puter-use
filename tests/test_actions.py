@@ -177,8 +177,8 @@ def test_requests_name_their_session():
             return False
 
     class Reader:
-        async def readline(self):
-            return b'{"ok": true, "result": {"x": 1}}\n'
+        async def readline(self):  # the reply to the last request
+            return json.dumps({"id": sent[-1]["id"], "ok": True, "result": {"x": 1}}).encode() + b"\n"
 
         def at_eof(self):
             return False

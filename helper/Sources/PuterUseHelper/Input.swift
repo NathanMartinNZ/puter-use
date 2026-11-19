@@ -38,11 +38,16 @@ enum Input {
         }
     }
 
+    /// Once the client has hung up, no button goes down (and no key, see `key`): ups always go out, so
+    /// nothing is left held. Cleanup runs with no connection (`Connection.ungated`), so it's never stopped.
+    /// Returns whether it was sent.
+    @discardableResult
     static func mouse(_ type: CGEventType, _ p: CGPoint, _ route: Route, button: CGMouseButton = .left,
-                      clickState: Int = 1, flags: CGEventFlags = [], group: Int64? = nil, withHeld: Bool = true)
+                      clickState: Int = 1, flags: CGEventFlags = [], group: Int64? = nil, withHeld: Bool = true) -> Bool
     {
+        if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type), Connection.hungUp { return false }
         guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button)
-        else { return }
+        else { return false }
         e.flags = withHeld ? flags.union(held) : flags
         e.setIntegerValueField(.mouseEventButtonNumber, value: Int64(button.rawValue))
         e.setIntegerValueField(.mouseEventSubtype, value: 3)
@@ -51,6 +56,7 @@ enum Input {
             e.setIntegerValueField(fieldClickGroup, value: group ?? clickGroup)
         }
         post(e, at: p, route)
+        return true
     }
 
     /// Deliver to the target process only, stamped with its window so AppKit routes it without raising.
@@ -74,19 +80,27 @@ enum Input {
     /// (unless the view accepts first mouse). Spend that click just outside the content, at (-1, -1).
     /// Never twice within a double-click interval: that spot is the window's resize corner, and a
     /// double-click there makes macOS expand the window to the screen edge.
-    static func primer(_ route: Route) async {
+    /// `force`: spend it even on a key window (to make this one the key window instead).
+    static func primer(_ route: Route, force: Bool = false) async {
         guard !route.foreground, route.primer, route.wid != 0 else { return }
         // The key window of an app held active takes clicks as they come: there's no activation click to spend.
-        if await MainActor.run(body: { Hold.held[route.pid] != nil }), AX.focusedWindow(pid: route.pid) == route.wid { return }
+        // (Unless it was only just held: see Hold.fresh.)
+        if !force, await MainActor.run(body: { Hold.held[route.pid] != nil && !Hold.fresh.contains(route.pid) }),
+           AX.focusedWindow(pid: route.pid) == route.wid { return }
         let now = ProcessInfo.processInfo.systemUptime
-        if let last = primed[route.wid], now - last < NSEvent.doubleClickInterval + 0.15 { return }
-        primed[route.wid] = now
+        if let last = primed[route.wid], now - last < NSEvent.doubleClickInterval + 0.15 {
+            guard force else { return }
+            await ms(UInt64(((NSEvent.doubleClickInterval + 0.15 - (now - last)) * 1000).rounded(.up)))
+        }
+        primed[route.wid] = ProcessInfo.processInfo.systemUptime
         let p = CGPoint(x: route.frame.minX - 1, y: route.frame.minY - 1)
         newClickGroup()
         Trace.label = "primer"
-        mouse(.leftMouseDown, p, route)
-        await ms(2)
-        mouse(.leftMouseUp, p, route)
+        if mouse(.leftMouseDown, p, route) {
+            await MainActor.run { _ = Hold.fresh.remove(route.pid) }
+            await ms(2)
+            mouse(.leftMouseUp, p, route)
+        }
         Trace.label = nil
         await ms(60)
     }
@@ -105,7 +119,7 @@ enum Input {
         let (down, up, _, btn) = buttonTypes(button)
         newClickGroup()
         for i in 1...max(1, count) {
-            mouse(down, p, route, button: btn, clickState: i, flags: flags)
+            guard mouse(down, p, route, button: btn, clickState: i, flags: flags) else { return }  // cancelled
             await sleep(typist.clickHold())
             mouse(up, p, route, button: btn, clickState: i, flags: flags)
             if i < count { await sleep(typist.clickGap()) }
@@ -145,10 +159,12 @@ enum Input {
     }
 
     /// One key going down or up. Modifier keys are sent as flags-changed events, as the keyboard does.
-    static func key(_ code: CGKeyCode, down: Bool, flags: CGEventFlags, _ route: Route, text: String? = nil) {
+    static func key(_ code: CGKeyCode, down: Bool, flags: CGEventFlags, _ route: Route, text: String? = nil,
+                    withHeld: Bool = true) {
+        if down, Connection.hungUp { return }  // cancelled: nothing more goes down (see `mouse`)
         guard let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
         if Keys.modifierCodes.values.contains(code) { e.type = .flagsChanged }
-        e.flags = flags.union(held)
+        e.flags = withHeld ? flags.union(held) : flags
         if let text {
             let utf16 = Array(text.utf16)
             e.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
@@ -202,7 +218,8 @@ enum Input {
     /// symbols. Newlines and tabs are the Return and Tab keys.
     ///
     /// `stillSafe` is asked before every key: false stops right there (letting go of the keys still down)
-    /// and is returned. A key goes to the app's key window, which may have become the user's.
+    /// and is returned. A key goes to the app's key window, which may have become the user's. A client
+    /// hanging up stops it the same way. The characters that went out are counted in the request's `Work`.
     @discardableResult
     static func type(_ text: String, _ route: Route, typist: Typist, stillSafe: (() -> Bool)? = nil) async -> Bool {
         struct Stroke {
@@ -210,11 +227,12 @@ enum Input {
             let order: Int
             let down: CGKeyCode?  // the key it holds down, if any
             let up: CGKeyCode?
+            let char: Bool  // a character going down (not Shift, Return or Tab)
             let fire: () -> Void
         }
         var strokes: [Stroke] = []
-        func at(_ t: Double, down: CGKeyCode? = nil, up: CGKeyCode? = nil, _ fire: @escaping () -> Void) {
-            strokes.append(Stroke(t: t, order: strokes.count, down: down, up: up, fire: fire))
+        func at(_ t: Double, down: CGKeyCode? = nil, up: CGKeyCode? = nil, char: Bool = false, _ fire: @escaping () -> Void) {
+            strokes.append(Stroke(t: t, order: strokes.count, down: down, up: up, char: char, fire: fire))
         }
         let shiftCode = Keys.modifierCodes["shift"]!
         var t = 0.0, prev: Character?, prevShift = false, lastDown = -1.0
@@ -247,7 +265,7 @@ enum Input {
             }
             let flags: CGEventFlags = shift ? .maskShift : []
             let dwell = typist.dwell()
-            at(t, down: code) { key(code, down: true, flags: flags, route, text: payload) }
+            at(t, down: code, char: payload != nil) { key(code, down: true, flags: flags, route, text: payload) }
             at(t + dwell, up: code) { key(code, down: false, flags: flags, route, text: payload) }
             upAt[code] = t + dwell
             if shift { shiftUpAt = t + dwell + typist.modifierTrail() }
@@ -261,11 +279,12 @@ enum Input {
         var pressed = Set<CGKeyCode>()
         for s in strokes.sorted(by: { ($0.t, $0.order) < ($1.t, $1.order) }) {
             await sleep(s.t - (ProcessInfo.processInfo.systemUptime - start))
-            if let stillSafe, !stillSafe() {
+            if Connection.hungUp || stillSafe?() == false {
                 for code in pressed { key(code, down: false, flags: [], route) }  // leave nothing held
                 return false
             }
             s.fire()
+            if s.char { Connection.current?.work.typed += 1 }
             if let d = s.down { pressed.insert(d) }
             if let u = s.up { pressed.remove(u) }
         }

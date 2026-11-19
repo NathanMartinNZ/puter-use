@@ -72,6 +72,7 @@ extension Handlers {
                 await Input.sleep(typist.between())
                 try await press(["BackSpace"], r)
             }
+            if Connection.current?.work.fields == nil { Connection.current?.work.did.append("emptied the field") }
             await Input.sleep(typist.between())
         } else if let field, let length {
             // Keep a selection the app made itself (a click in one selects all): typing replaces it, as
@@ -81,10 +82,46 @@ extension Handlers {
             }
         }
         try await typeText(text, r)
+        if let field, !text.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\r\n" || $0 == "\t" }),
+           AX.value(field.element, kAXSubroleAttribute) as? String != "AXSecureTextField" {
+            try await readBack(field, text, whole: replace, r)
+        }
         if a["submit"] as? Bool == true {
             await Input.sleep(typist.between())
+            await closeSuggestions(r.pid, before: "pressing Return", route: r)
             try await press(["Return"], r)
+            Connection.current?.work.did.append("pressed Return")
         }
+    }
+
+    /// Typed text that didn't land as typed (an autocomplete took over, a mask reformatted it, a key was
+    /// lost) gets a note; only letters and digits are compared, as fields format the rest. Typing that
+    /// went to another window or a pop-up instead is an error: the batch stops before a Return.
+    static func readBack(_ field: AX.Node, _ text: String, whole: Bool, _ r: Route) async throws {
+        func plain(_ s: String) -> String {
+            String(String.UnicodeScalarView(s.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }))
+        }
+        let want = plain(text)
+        guard !want.isEmpty else { return }
+        var shows = ""
+        for i in 0..<7 {  // a web page updates its fields a moment later
+            if i > 0 { try await Run.pause(0.05) }
+            shows = AX.value(field.element, kAXValueAttribute) as? String ?? ""
+            if whole ? plain(shows) == want : plain(shows).contains(want) { return }
+        }
+        let typed = "\"\(AX.clip(text, 60))\""
+        if let f = AX.focusedElement(pid: r.pid), !AX.isInside(f, field.element) {
+            if !AX.isInWindow(f, r.wid) {
+                throw HelperError("the typing went to \(AX.describe(f)), which took the focus from the field: look before going on")
+            }
+            if AX.isTextInput(f) {  // the page moves it on (a code box per digit)
+                notes.append("the focus moved on to \(AX.describe(f)) while typing \(typed): look before typing more")
+                return
+            }
+        }
+        notes.append(plain(shows).isEmpty
+            ? "the field shows nothing after typing \(typed); some editors keep their text elsewhere, so look before typing it again"
+            : "the field shows \"\(AX.clip(shows, 60))\" after typing \(typed): look before typing it again")
     }
 
     /// fill {fields: [{element|x,y, text} | {element, option} | {element, checked}], submit}
@@ -140,8 +177,13 @@ extension Handlers {
             filled == 0 ? stop : HelperError("\(what): \(stop); fields 1-\(filled) were filled in already. Ask the user; "
                 + "if they agree, repeat the fill with \"confirm\": true")
         }
+        Connection.current?.work.fields = (0, fields.count)
         for (i, f) in fields.enumerated() {
-            if i > 0 { await Input.sleep(typist.between()) }
+            if i > 0 {
+                await Input.sleep(typist.between())
+                await closeSuggestions(app, before: "field \(i + 1)", route: try? route(run.target, at: nil, foreground: run.foreground))
+            }
+            Connection.current?.work.typed = 0
             do {
                 if let option = f["option"] ?? f["select"] {
                     var s = confirmed(f)
@@ -159,18 +201,24 @@ extension Handlers {
                 }
             } catch let stop as Policy.NeedsOK {
                 throw partway(stop, "field \(i + 1)", filled: i)
+            } catch is Cancelled {
+                throw Cancelled()
             } catch {
                 throw HelperError("field \(i + 1): \(error)")
             }
+            Connection.current?.work.fields = (i + 1, fields.count)
+            Connection.current?.work.typed = 0
         }
         guard a["submit"] != nil else { return }
         await Input.sleep(typist.between())
+        await closeSuggestions(app, before: "submitting", route: try? route(run.target, at: nil, foreground: run.foreground))
         do {
             if let click = submitClick {
                 try await perform(confirmed(click), run)
             } else if a["submit"] as? Bool == true {
                 try await press(["Return"], try route(run.target, at: nil, foreground: run.foreground))
             }
+            Connection.current?.work.did.append("submitted")
         } catch let stop as Policy.NeedsOK {
             throw partway(stop, "submit", filled: fields.count)
         }
@@ -232,7 +280,7 @@ extension Handlers {
         var r = try route(run.target, at: nil, foreground: run.foreground)
         if a["new_window"] as? Bool ?? !agentWindows.contains(w.id) {
             try await press(["cmd", "n"], r)
-            guard let nw = await run.newWindow(pid: w.pid, timeout: 4) else { throw HelperError("cmd+n opened no new window") }
+            guard let nw = try await run.newWindow(pid: w.pid, timeout: 4) else { throw HelperError("cmd+n opened no new window") }
             agentWindows.insert(nw.id)
             try await run.moveTo(nw, note: "opened its own window #\(nw.id)")
             r = try route(run.target, at: nil, foreground: run.foreground)
@@ -242,11 +290,41 @@ extension Handlers {
         await Input.sleep(typist.between())
         try await typeText(url, r)
         await Input.sleep(typist.between())
+        func page() -> [String?]? {  // what the window shows: its page's address and its title
+            guard case .window(let now) = run.target else { return nil }
+            let s = [AX.pageURL(pid: now.pid, wid: now.id), Windows.info(now.id)?.title]
+            return s.allSatisfy { $0 == nil } ? nil : s
+        }
+        let before = page()
         try await press(["Return"], r)
         let timeout = min(max(num(a["timeout_ms"]) ?? 10000, 0), 30000) / 1000
-        if case .window(let now) = run.target, !(await AX.waitForPage(pid: now.pid, wid: now.id, timeout: timeout)) {
+        if case .window(let now) = run.target, !(try await AX.waitForPage(pid: now.pid, wid: now.id, timeout: timeout)) {
             notes.append("the page was still loading after \(Int(timeout)) s")
+        } else if let before, !sameAddress(before[0], url), case .window(let now) = run.target {
+            // "Loaded" may be the old page: Firefox keeps it, loaded and idle, until the new one answers.
+            let until = Date().addingTimeInterval(timeout)
+            while page().map({ $0 == before }) == true, Date() < until { try await Run.pause(0.2) }
+            if page().map({ $0 == before }) == true {
+                notes.append("the window still shows \"\(AX.clip((before[0] ?? before[1]) ?? "", 60))\" \(Int(timeout)) s after "
+                    + "Return: the page may still be loading, or Return didn't reach the address bar. Look before navigating again")
+            } else if until.timeIntervalSinceNow > 0.5,
+                      !(try await AX.waitForPage(pid: now.pid, wid: now.id, timeout: until.timeIntervalSinceNow)) {
+                notes.append("the page was still loading after \(Int(timeout)) s")
+            }
         }
+    }
+
+    /// Whether a page's address is the one typed (so it's not expected to change): scheme, "www." and a
+    /// trailing slash aside.
+    static func sameAddress(_ shown: String?, _ typed: String) -> Bool {
+        func bare(_ s: String) -> String {
+            var s = s.lowercased()
+            for p in ["https://", "http://"] where s.hasPrefix(p) { s.removeFirst(p.count) }
+            if s.hasPrefix("www.") { s.removeFirst(4) }
+            while s.hasSuffix("/") { s.removeLast() }
+            return s
+        }
+        return shown.map { bare($0) == bare(typed) } ?? false
     }
 
     /// open {url | path, app}: open a web address, file or app the way a double-click would, without
@@ -270,6 +348,7 @@ extension Handlers {
                 throw HelperError("won't open \(u.lastPathComponent) with \(appURL.deletingPathExtension().lastPathComponent): it could run it")
             }
             what = u.isFileURL ? u.lastPathComponent : u.absoluteString
+            try Connection.check()
             if let appURL {
                 opened = try await NSWorkspace.shared.open([u], withApplicationAt: appURL, configuration: cfg)
             } else {
@@ -277,6 +356,7 @@ extension Handlers {
             }
         } else if let appURL {
             what = appURL.deletingPathExtension().lastPathComponent
+            try Connection.check()
             opened = try await NSWorkspace.shared.openApplication(at: appURL, configuration: cfg)
         } else {
             throw HelperError("open needs url, path or app")
@@ -284,7 +364,7 @@ extension Handlers {
         let name = opened.localizedName ?? "the app"
         let did = what == name || appURL != nil && a["url"] == nil && a["path"] == nil && a["file"] == nil
             ? "opened \(name)" : "opened \(what) in \(name)"
-        if let nw = await run.newWindow(pid: opened.processIdentifier, timeout: 6) {
+        if let nw = try await run.newWindow(pid: opened.processIdentifier, timeout: 6) {
             agentWindows.insert(nw.id)
             try await run.moveTo(nw, note: "\(did): now on its window #\(nw.id)")
         } else {
@@ -358,7 +438,7 @@ extension Handlers {
             if waited >= timeout {
                 throw HelperError("wait_for: \(gone ? "still showing" : "no") \(what) after \(String(format: "%.1f", timeout)) s")
             }
-            await Input.ms(150)
+            try await Run.pause(0.15)
         }
     }
 }
@@ -392,7 +472,7 @@ extension AX {
                 throw Policy.refusal(pid, .click, doing: "setting a combo box's text")
             }
             try check(pick)
-            guard AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, pick as CFString) == .success else {
+            guard write(el, kAXValueAttribute, pick as CFString) == .success else {
                 throw HelperError("it didn't take the value \"\(pick)\"")
             }
             // Confirm, as Return would, so the app acts on the new value. Not in browsers: there a combo
@@ -400,7 +480,7 @@ extension AX {
             var names: CFArray?
             AXUIElementCopyActionNames(el, &names)
             if let pid = pidOf(el), !Handlers.isBrowser(pid), (names as? [String] ?? []).contains(kAXConfirmAction) {
-                AXUIElementPerformAction(el, kAXConfirmAction as CFString)
+                act(el, kAXConfirmAction)
             }
             if options.isEmpty { Handlers.notes.append("couldn't read its options: set its text to \"\(pick)\"") }
             return pick
@@ -426,7 +506,7 @@ extension AX {
             guard acts.isEmpty || acts.contains(open) else { throw HelperError("it has no menu to choose from (\(role.dropFirst(2)))") }
             // Some apps open the menu before replying and only reply once it closes: don't wait on that.
             AXUIElementSetMessagingTimeout(el, 0.6)
-            let err = AXUIElementPerformAction(el, open as CFString)
+            let err = act(el, open)
             AXUIElementSetMessagingTimeout(el, 0)
             guard err == .success || err == .cannotComplete else { throw HelperError("couldn't open its menu (\(err.rawValue))") }
             opened = true
@@ -437,7 +517,7 @@ extension AX {
             }
         }
         func close() {
-            if opened, let m = menu() { AXUIElementPerformAction(m, kAXCancelAction as CFString) }
+            if opened, let m = menu() { cleanup(m, kAXCancelAction) }
         }
         guard !list.isEmpty else {
             close()
@@ -455,7 +535,7 @@ extension AX {
             close()
             throw error
         }
-        guard AXUIElementPerformAction(hits[0].0, kAXPressAction as CFString) == .success else {
+        guard act(hits[0].0, kAXPressAction) == .success else {
             close()
             throw HelperError("couldn't pick \"\(hits[0].1)\" (disabled?)")
         }
@@ -507,28 +587,35 @@ extension AX {
         var found = read()
         if !found.isEmpty { return found }
         let expanded = value(el, kAXExpandedAttribute) as? Bool
-        guard expanded == false, AXUIElementSetAttributeValue(el, kAXExpandedAttribute as CFString, kCFBooleanTrue) == .success
+        guard expanded == false, write(el, kAXExpandedAttribute, kCFBooleanTrue) == .success
         else { return [] }
         for _ in 0..<10 {
             await Input.ms(40)
             found = read()
             if !found.isEmpty { break }
         }
-        AXUIElementSetAttributeValue(el, kAXExpandedAttribute as CFString, kCFBooleanFalse)
+        cleanup(el, set: kAXExpandedAttribute, kCFBooleanFalse)  // even after a cancel
         return found
     }
 
     /// After a navigation: true once the window's web page says it has loaded (false on timeout). Pages
     /// that don't say (no AXLoaded) count as loaded; the batch's end settle covers them.
-    @MainActor static func waitForPage(pid: pid_t, wid: CGWindowID, timeout: Double) async -> Bool {
-        await Input.sleep(min(0.4, timeout))
+    @MainActor static func waitForPage(pid: pid_t, wid: CGWindowID, timeout: Double) async throws -> Bool {
+        try await Run.pause(min(0.4, timeout))
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             guard let win = window(pid: pid, wid: wid), let page = webArea(win) else { return true }
             if (value(page, "AXLoaded") as? Bool) != false, (value(page, "AXBusy") as? Bool) != true { return true }
-            await Input.ms(200)
+            try await Run.pause(0.2)
         }
         return false
+    }
+
+    /// The address of the window's (first) web page, if it says.
+    static func pageURL(pid: pid_t, wid: CGWindowID) -> String? {
+        guard let win = window(pid: pid, wid: wid), let page = webArea(win), let u = value(page, kAXURLAttribute) else { return nil }
+        if CFGetTypeID(u) == CFURLGetTypeID() { return (u as! URL).absoluteString }
+        return u as? String
     }
 
     /// The window's (first) web page, looked for breadth-first a few levels down.

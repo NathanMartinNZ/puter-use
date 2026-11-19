@@ -98,7 +98,9 @@ class Computer:
     def __init__(self, window: int | str | None = None, *, session_id: str | None = None,
                  screenshot: str = "never", guard: bool = True):
         self._loop = asyncio.new_event_loop()
-        self._helper = Helper(session_id or session("default"))
+        # A script reads each reply as it comes (a Ctrl-C mid-call hangs up, which the helper sees), so a
+        # reply written counts as delivered: nothing to report afterwards.
+        self._helper = Helper(session_id or session("default"), reports=False)
         self.window = window
         self.screenshot_mode = screenshot  # what act returns: "never" (scripts rarely look), "auto", "always"
         self.guard = guard
@@ -106,7 +108,19 @@ class Computer:
     # -- plumbing
 
     def _call(self, cmd: str, **params) -> dict:
-        return self._loop.run_until_complete(self._helper.call(cmd, **params))
+        task = self._loop.create_task(self._helper.call(cmd, **params))
+        try:
+            return self._loop.run_until_complete(task)
+        except KeyboardInterrupt:
+            # Ctrl-C stops the loop but not the call: cancel it (closing the connection, which stops the
+            # helper's batch), or it would carry on, still holding the connection, at the next call.
+            task.cancel()
+            try:
+                self._loop.run_until_complete(task)
+            except BaseException:
+                pass
+            self._helper.drop()
+            raise
 
     def act(self, actions: list[dict] | dict, *, check: bool = True, screenshot: str | None = None,
             text: bool | str = False, save_as: str | dict | None = None) -> Result:

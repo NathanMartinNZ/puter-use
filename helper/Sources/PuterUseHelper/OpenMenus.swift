@@ -30,7 +30,8 @@ extension AX {
         children(menu).compactMap { item in
             guard let t = value(item, kAXTitleAttribute) as? String, !t.isEmpty,
                   value(item, kAXEnabledAttribute) as? Bool != false else { return nil }
-            return children(item).isEmpty ? t : t + " >"
+            let sub = children(item).contains { value($0, kAXRoleAttribute) as? String == "AXMenu" }
+            return sub ? t + " >" : t
         }
     }
 
@@ -44,7 +45,7 @@ extension AX {
     }
 
     static func closeMenu(_ menu: AXUIElement) {
-        AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+        cleanup(menu, kAXCancelAction)  // even after a cancel: an open menu takes the user's typing
     }
 
     /// The titled items of a menu level.
@@ -86,6 +87,7 @@ extension Handlers {
         for _ in 0..<15 {  // menus take a moment to come up
             menu = AX.openMenu(pid: r.pid)
             if menu != nil { break }
+            try Connection.check()
             await Input.ms(40)
         }
         guard let menu else { throw HelperError("no menu opened to choose \"\(wanted)\" from") }
@@ -95,7 +97,10 @@ extension Handlers {
             HelperError("the menu closed before \"\(wanted)\" was chosen (a click anywhere closes it, the user's too): "
                 + "nothing was chosen")
         }
-        func stillOpen() throws { if AX.openMenu(pid: r.pid) == nil { throw closed() } }
+        func stillOpen() throws {
+            try Connection.check()  // given up: the menu is closed on the way out
+            if AX.openMenu(pid: r.pid) == nil { throw closed() }
+        }
         /// Where a person would point at an item (over its title), with the route to its menu window; nil
         /// when it isn't showing (scrolled out of a long menu).
         func spot(_ el: AXUIElement) throws -> (CGPoint, Route)? {
@@ -239,8 +244,9 @@ extension Handlers {
     }
 
     /// At the end of a batch: close a menu left open, telling the agent what was in it. After a click
-    /// (`wait`), one may still be on its way up.
-    static func closeLeftOpenMenu(pid: pid_t, wait: Bool) async {
+    /// (`wait`), one may still be on its way up. After typing (`afterKeys`) it's a suggestions list.
+    static func closeLeftOpenMenu(pid: pid_t, wait: Bool, afterKeys: Bool = false, route r: Route? = nil,
+                                  remember: Bool = true) async {
         var menu = AX.openMenu(pid: pid)
         for _ in 0..<(wait && menu == nil ? 8 : 0) {
             await Input.ms(50)
@@ -251,10 +257,58 @@ extension Handlers {
         Trace.log(["k": "menu", "open": true])  // what went into it was the menu's (scripts/check_motion.py)
         await Input.ms(120)  // let it finish appearing before it's told to close
         let titles = AX.menuTitles(menu).filter { AX.menuKey($0) != "services >" && AX.menuKey($0) != "services" }
+        let closed = await dismiss(menu, pid: pid, r)
+        Trace.log(["k": "menu", "open": !closed])
+        let list = titles.prefix(25).joined(separator: " · ") + (titles.count > 25 ? " · …" : "")
+        if afterKeys {
+            notes.append("a suggestions list opened as you typed (\(list)); "
+                + (closed ? "it's closed again, so your keys stay in the field" : "it's still open: Down or Return may pick from it"))
+            return
+        }
+        if !closed {
+            notes.append("a menu opened (\(list)) and couldn't be closed: it takes the keyboard until it is (Escape)")
+            return
+        }
+        if remember, let wid = r?.wid ?? current {
+            Session.current.lastClosedMenu = (titles, wid, Session.current.acts)
+        }
+        notes.append("a menu opened (\(list)); it's closed again, as an open menu takes the user's typing. Open it and "
+            + "choose in one step: the same click with item: \"…\" (\"Font > Bold\" for a submenu)")
+    }
+
+    /// Close `menu`. Firefox's suggestions list ignores the accessibility cancel: then Escape, when keys
+    /// reach the agent's window (`r`), closes it (Firefox keeps that keydown from the page). Whether it's
+    /// closed now.
+    static func dismiss(_ menu: AXUIElement, pid: pid_t, _ r: Route?) async -> Bool {
         AX.closeMenu(menu)
-        Trace.log(["k": "menu", "open": false])
-        notes.append("a menu opened (" + titles.prefix(25).joined(separator: " · ") + (titles.count > 25 ? " · …" : "")
-            + "); it's closed again, as an open menu takes the user's typing. Open it and choose in one step: "
-            + "the same click with item: \"…\" (\"Font > Bold\" for a submenu)")
+        for _ in 0..<4 {
+            await Input.ms(50)
+            if AX.openMenu(pid: pid) == nil { return true }
+        }
+        // Only into the agent's own window (not a screen target, which is the user's front app), and not
+        // with keys held by key_down: a bare Escape.
+        guard let r, r.pid == pid, r.wid != 0, !Connection.hungUp, keysReachTarget(r),
+              let (code, _) = try? Keys.parseCombo(["Escape"]) else { return false }
+        Input.key(code, down: true, flags: [], r, withHeld: false)
+        await Input.ms(30)
+        Input.key(code, down: false, flags: [], r, withHeld: false)
+        for _ in 0..<4 {
+            await Input.ms(50)
+            if AX.openMenu(pid: pid) == nil { return true }
+        }
+        return false
+    }
+
+    /// Before a Return or a click into the next field: a suggestions list the typing opened would take
+    /// it (Return picks the highlighted suggestion; a click over the list lands in it). Closed, with a note.
+    static func closeSuggestions(_ pid: pid_t, before what: String, route r: Route?) async {
+        guard let menu = AX.openMenu(pid: pid) else { return }
+        let titles = AX.menuTitles(menu)
+        let list = titles.prefix(8).joined(separator: " · ") + (titles.count > 8 ? " · …" : "")
+        if await dismiss(menu, pid: pid, r) {
+            notes.append("closed a suggestions list (\(list)) before \(what), so it didn't take it")
+        } else {
+            notes.append("a suggestions list (\(list)) was open before \(what) and couldn't be closed: it may have taken it")
+        }
     }
 }

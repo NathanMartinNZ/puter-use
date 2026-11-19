@@ -6,16 +6,28 @@ import AppKit
 final class Session: @unchecked Sendable {  // only touched on the main thread
     let id: String
     let ordinal: Int
-    var current: CGWindowID?  // 0 = whole screen
-    var meta: [CGWindowID: Meta] = [:]  // coordinate mapping from the last full screenshot of each window
-    var seen: [CGWindowID: WindowSet] = [:]  // what was over each window then (`Run.staleCoordinates`)
-    var outlines: [CGWindowID: (interactive: Bool, lines: [(Int, String)])] = [:]  // the last outline it was sent
+    let view = View()  // what it has shown its agent (each entry knows the request that wrote it)
+    var current: CGWindowID? {  // the window it's on; 0 = whole screen
+        get { view.current[0] }
+        set { view.current[0] = newValue }
+    }
+    var meta: Store<CGWindowID, Meta> { view.meta }
+    var seen: Store<CGWindowID, WindowSet> { view.seen }
+    var outlines: Store<CGWindowID, (interactive: Bool, lines: [(Int, String)])> { view.outlines }
+    var carded: Store<String, Bool> { view.carded }
+    let turns = Turns()  // its requests run one at a time
+    var ledger: [(key: RequestKey, work: Work)] = []  // requests whose delivery isn't known yet, oldest first
+    // Notes about lost calls, until a reply carrying them is delivered.
+    var pending: [(id: Int, client: String, work: Work, note: String, carriers: Set<RequestKey>)] = []
+    var notesSeq = 0
     var notes: [String] = []  // remarks for the agent, per request
     var remarks: [String] = []  // from accessibility lookups, folded into notes
     var typist = Typist(wpm: 140)
     var pasteOver = 100
     var agentWindows = Set<CGWindowID>()  // windows this agent opened (navigate uses them)
-    var carded = Set<String>()  // apps it has had an app card for
+    var windowApps: [CGWindowID: (app: String, pid: pid_t)] = [:]  // each window it used: "not found" lists its app's others
+    var acts = 0  // act requests so far
+    var lastClosedMenu: (titles: [String], wid: CGWindowID, act: Int)?  // the last menu it closed, where, and in which act
     var cards = true
     var held: CGEventFlags = []  // modifiers held by key_down: its events carry them
     var clickGroup: Int64 = 0
@@ -81,8 +93,9 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
 /// sessions that each hold the app the other wants can't stall for ever.
 @MainActor
 enum AppLocks {
+    private enum Wake { case got, timedOut, cancelled }
     private static var owner: [pid_t: String] = [:]
-    private static var queue: [pid_t: [(id: Int, session: String, wake: CheckedContinuation<Bool, Never>)]] = [:]
+    private static var queue: [pid_t: [(id: Int, session: String, wake: CheckedContinuation<Wake, Never>)]] = [:]
     private static var tickets = 0
     static var patience: TimeInterval = 60
 
@@ -95,21 +108,41 @@ enum AppLocks {
         let holder = owner[pid] ?? "?"
         tickets += 1
         let ticket = tickets
-        let got = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+        let conn = Connection.current
+        let wake = await withCheckedContinuation { (c: CheckedContinuation<Wake, Never>) in
             queue[pid, default: []].append((ticket, me, c))
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: UInt64(patience * 1e9))
-                if let i = queue[pid]?.firstIndex(where: { $0.id == ticket }) {  // still waiting: give up
-                    queue[pid]!.remove(at: i).wake.resume(returning: false)
+            Task { @MainActor in  // gives up when the client hangs up, or after `patience`
+                let start = Date()
+                while let i = queue[pid]?.firstIndex(where: { $0.id == ticket }) {
+                    if conn?.hungUp() == true {
+                        queue[pid]!.remove(at: i).wake.resume(returning: .cancelled)
+                    } else if Date().timeIntervalSince(start) >= patience {
+                        queue[pid]!.remove(at: i).wake.resume(returning: .timedOut)
+                    } else {
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                    }
                 }
             }
         }
-        if !got {
+        switch wake {
+        case .got:
+            // Handed over (`release`), but the client may have hung up meanwhile: pass it straight on, as
+            // the caller won't hold it.
+            if conn?.hungUp() == true {
+                release(pid)
+                throw Cancelled()
+            }
+        case .cancelled:
+            throw Cancelled()
+        case .timedOut:
             let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
             throw HelperError("\(name) is being driven by another agent (session \(holder)) and stayed busy for "
                 + "\(Int(patience)) s; try again later")
         }
     }
+
+    /// The session driving `pid`, if any.
+    static func holder(_ pid: pid_t) -> String? { owner[pid] }
 
     static func release(_ pid: pid_t) {
         guard owner[pid] == Session.current.id else { return }
@@ -117,7 +150,7 @@ enum AppLocks {
             let next = waiting.removeFirst()
             queue[pid] = waiting
             owner[pid] = next.session  // handed over before it runs, so no one slips in between
-            next.wake.resume(returning: true)
+            next.wake.resume(returning: .got)
         } else {
             owner[pid] = nil
         }
