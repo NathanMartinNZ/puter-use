@@ -22,6 +22,15 @@ func record(_ obj: [String: Any]) {
 }
 
 /// Global top-left-origin frame, as the helper and CGWindowList report it.
+/// Move a window that's just been shown to where the environment says (its bottom-left, Cocoa "x,y"):
+/// PROBE_AT for the main window, PROBE_CHILD_AT for New Window's. Tests use them to put windows partly off
+/// screen, as an app's own placement can (a window created there is pulled back on screen).
+func moveAsTold(_ w: NSWindow, from key: String) {
+    let n = (ProcessInfo.processInfo.environment[key] ?? "").split(separator: ",")
+        .compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+    if n.count == 2 { w.setFrameOrigin(NSPoint(x: n[0], y: n[1])) }
+}
+
 func globalFrame(_ w: NSWindow) -> [Double] {
     let h = NSScreen.screens.first?.frame.height ?? 0
     return [w.frame.minX, h - w.frame.maxY, w.frame.width, w.frame.height]
@@ -168,6 +177,7 @@ final class Probe: NSObject, NSApplicationDelegate, NSWindowDelegate {
         place(canvas, 16, 280, 688, 264)
 
         window.orderFront(nil)  // not activated: it starts in the background like any other app
+        moveAsTold(window, from: "PROBE_AT")
         record(["k": "start", "pid": Int(ProcessInfo.processInfo.processIdentifier), "window": window.windowNumber,
                 "frame": globalFrame(window)])
         print("probe pid \(ProcessInfo.processInfo.processIdentifier) window \(window.windowNumber) log \(logPath)")
@@ -218,6 +228,7 @@ final class Probe: NSObject, NSApplicationDelegate, NSWindowDelegate {
         label.frame = NSRect(x: 20, y: 260, width: 300, height: 20)
         w.contentView?.addSubview(label)
         w.orderFront(nil)
+        moveAsTold(w, from: "PROBE_CHILD_AT")
         children.append(w)
         set("new window \(w.windowNumber)")
     }

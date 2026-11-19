@@ -194,9 +194,14 @@ class Computer:
     def menus(self, query: str | None = None) -> str:
         return self._call("menus", window=self.window, query=query).get("text", "")
 
-    def clipboard(self, text: str | None = None) -> str | None:
-        """The clipboard's text; or, given text, put it there."""
-        res = self.act({"type": "clipboard", **({"text": text} if text is not None else {})})
+    def clipboard(self, text: str | None = None, *, offset: int = 0, limit: int | None = None) -> str | None:
+        """The clipboard's text: `limit` characters (default 10000, at most 50000) from `offset`. When
+        there's more, read on with offset; act({"type": "clipboard"}) also gives the note saying how much
+        there is. Given text, put it there instead."""
+        if text is not None:
+            return self.act({"type": "clipboard", "text": text}).clipboard
+        res = self.act({"type": "clipboard", **({"offset": offset} if offset else {}),
+                        **({"limit": limit} if limit is not None else {})})
         return res.clipboard
 
     # -- acting (each is one act call; batch with act([...]) when speed matters)

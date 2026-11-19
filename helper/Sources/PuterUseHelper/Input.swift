@@ -107,6 +107,16 @@ enum Input {
 
     static func ms(_ n: UInt64) async { try? await Task.sleep(nanoseconds: n * 1_000_000) }
 
+    /// Whether the user has left the keyboard and mouse alone for `seconds`: their real keys, clicks, moves
+    /// and scrolls, through the HID system. What puter-use posts goes straight to an app, so it doesn't
+    /// count. (The HID state's "any event" time does move with puter-use's own work, activating an app's
+    /// window for one, so it isn't used.)
+    static func userQuiet(for seconds: Double = 2) -> Bool {
+        let input: [CGEventType] = [.keyDown, .flagsChanged, .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+                                    .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel]
+        return input.allSatisfy { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) >= seconds }
+    }
+
     static func sleep(_ seconds: Double) async {
         guard seconds > 0 else { return }
         try? await Task.sleep(nanoseconds: UInt64(min(seconds, 600) * 1e9))

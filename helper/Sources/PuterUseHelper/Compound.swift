@@ -81,8 +81,13 @@ extension Handlers {
                 AX.select(field.element, CFRange(location: length, length: 0))
             }
         }
+        // An address sent from the address bar is checked as navigate checks it: a Return that went nowhere
+        // (or a page that didn't load) gets a note, not a quiet success.
+        let newline: (Character) -> Bool = { $0 == "\n" || $0 == "\r" || $0 == "\r\n" }
+        let goes = addressBar && (a["submit"] as? Bool == true || text.contains(where: newline))
+        let shown = goes ? shownPage(run) : nil
         try await typeText(text, r)
-        if let field, !text.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\r\n" || $0 == "\t" }),
+        if let field, !text.contains(where: { newline($0) || $0 == "\t" }),
            AX.value(field.element, kAXSubroleAttribute) as? String != "AXSecureTextField" {
             try await readBack(field, text, whole: replace, r)
         }
@@ -91,6 +96,10 @@ extension Handlers {
             await closeSuggestions(r.pid, before: "pressing Return", route: r)
             try await press(["Return"], r)
             Connection.current?.work.did.append("pressed Return")
+        }
+        if goes {
+            let address = text.split(whereSeparator: newline).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+            try await awaitPage(address, before: shown, run, timeout: pageTimeout(a))
         }
     }
 
@@ -290,21 +299,31 @@ extension Handlers {
         await Input.sleep(typist.between())
         try await typeText(url, r)
         await Input.sleep(typist.between())
-        func page() -> [String?]? {  // what the window shows: its page's address and its title
-            guard case .window(let now) = run.target else { return nil }
-            let s = [AX.pageURL(pid: now.pid, wid: now.id), Windows.info(now.id)?.title]
-            return s.allSatisfy { $0 == nil } ? nil : s
-        }
-        let before = page()
+        let before = shownPage(run)
         try await press(["Return"], r)
-        let timeout = min(max(num(a["timeout_ms"]) ?? 10000, 0), 30000) / 1000
+        try await awaitPage(url, before: before, run, timeout: pageTimeout(a))
+    }
+
+    /// How long to wait for a page to load after a Return in the address bar (timeout_ms, ≤ 30 s).
+    static func pageTimeout(_ a: [String: Any]) -> Double { min(max(num(a["timeout_ms"]) ?? 10000, 0), 30000) / 1000 }
+
+    /// What a browser window shows: its page's address and its title (nil if neither can be read).
+    static func shownPage(_ run: Run) -> [String?]? {
+        guard case .window(let now) = run.target else { return nil }
+        let s = [AX.pageURL(pid: now.pid, wid: now.id), Windows.info(now.id)?.title]
+        return s.allSatisfy { $0 == nil } ? nil : s
+    }
+
+    /// After the Return that goes to `url` from the address bar: wait for the page to load, with a note when
+    /// it hasn't, or when the window still shows the page it showed `before` (Return didn't take).
+    static func awaitPage(_ url: String, before: [String?]?, _ run: Run, timeout: Double) async throws {
         if case .window(let now) = run.target, !(try await AX.waitForPage(pid: now.pid, wid: now.id, timeout: timeout)) {
             notes.append("the page was still loading after \(Int(timeout)) s")
         } else if let before, !sameAddress(before[0], url), case .window(let now) = run.target {
             // "Loaded" may be the old page: Firefox keeps it, loaded and idle, until the new one answers.
             let until = Date().addingTimeInterval(timeout)
-            while page().map({ $0 == before }) == true, Date() < until { try await Run.pause(0.2) }
-            if page().map({ $0 == before }) == true {
+            while shownPage(run).map({ $0 == before }) == true, Date() < until { try await Run.pause(0.2) }
+            if shownPage(run).map({ $0 == before }) == true {
                 notes.append("the window still shows \"\(AX.clip((before[0] ?? before[1]) ?? "", 60))\" \(Int(timeout)) s after "
                     + "Return: the page may still be loading, or Return didn't reach the address bar. Look before navigating again")
             } else if until.timeIntervalSinceNow > 0.5,

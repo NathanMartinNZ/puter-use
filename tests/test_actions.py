@@ -203,6 +203,11 @@ def test_mcp_tier2_schema():
     with pytest.raises(pydantic.ValidationError):
         Action(type="click", target={"text": "OK", "nth": 0})
     assert Action(type="clipboard").type == "clipboard" and Action(type="paste", text="x").text == "x"
+    assert Action(type="clipboard", offset=10000, limit=500).model_dump(exclude_none=True) == {
+        "type": "clipboard", "offset": 10000, "limit": 500}
+    for bad in ({"offset": -1}, {"limit": 0}, {"limit": 50001}):
+        with pytest.raises(pydantic.ValidationError):
+            Action(type="clipboard", **bad)
     tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
     assert "find" in tools
     assert {"marks", "text"} <= set(tools["screenshot"].input_schema["properties"])

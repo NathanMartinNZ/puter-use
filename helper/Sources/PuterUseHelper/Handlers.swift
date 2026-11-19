@@ -405,6 +405,7 @@ enum Handlers {
         }
         let shot = try await plan(t, region: region, o).run()
         var out = try await result(t, shot, o, zoom: region != nil, text: p["text"] as? Bool == true)
+        if region == nil, let note = partShown(t, shot) { out["notes"] = [note] }
         out["changed"] = true
         AppCards.enabled = p["app_cards"] as? Bool != false
         if case .window(let w) = t, let card = AppCards.card(pid: w.pid) { out["card"] = card }
@@ -944,7 +945,10 @@ enum Handlers {
                 Clipboard.set(text)
                 notes.append("clipboard set (\(text.count) characters; what was there is replaced)")
             } else {
-                run.clipboard = Clipboard.read()
+                let limit = min(max(1, int(a["limit"], Clipboard.readLimit)), Clipboard.maxRead)
+                let (text, note) = Clipboard.read(offset: max(0, int(a["offset"], 0)), limit: limit)
+                run.clipboard = text
+                if let note { notes.append(note) }
             }
         case "paste":
             guard let text = a["text"] as? String, !text.isEmpty else { throw HelperError("paste needs text") }
@@ -1052,11 +1056,17 @@ enum Handlers {
         if let key = AX.focusedWindow(pid: r.pid), let w = Windows.info(key) {
             let what = w.title.isEmpty ? "window #\(key)" : "window #\(key) \"\(AX.clip(w.title, 40))\""
             if agentWindows.contains(key) {
-                // Moving the keyboard between windows of the app the user is in would take it from them.
+                // In the user's front app, it's moved at the start of a call (act), and only while they leave the
+                // keyboard and mouse alone: they may be typing into that window.
                 if Hold.isFront(r.pid) {
-                    throw HelperError("your other \(what) has \(app)'s keyboard, and \(app) is the user's front app, so "
-                        + "puter-use won't move it (that would take it from them): the action didn't run. Work in #\(key), "
-                        + "or wait until the user leaves \(app)")
+                    if !Input.userQuiet() {
+                        throw HelperError("your other \(what) has \(app)'s keyboard, and \(app) is the user's front app: "
+                            + "they're using the keyboard or mouse, maybe typing there, so puter-use didn't move it. The "
+                            + "action didn't run. Try again in a few seconds, or work in #\(key)")
+                    }
+                    throw HelperError("your other \(what) has \(app)'s keyboard, and it wasn't moved to #\(r.wid): the "
+                        + "action didn't run. Run it again in a new call (that moves it when it can), or click inside "
+                        + "#\(r.wid) first; or work in #\(key)")
                 }
                 throw HelperError("your other \(what) has \(app)'s keyboard, and it couldn't be moved to #\(r.wid): the "
                     + "action didn't run. Work in #\(key), or close it if you're done with it")
@@ -1351,6 +1361,18 @@ enum Handlers {
             }
         } else {
             Hold.release(for: Session.current)
+            // The app is the user's front app, but its keyboard is on another of the agent's own windows, so
+            // what they'd type goes there already, not to a window of theirs. It's moved here the same way
+            // (as a click here would), only while they're leaving the keyboard and mouse alone: they may be
+            // typing into that window.
+            if !foreground, case .window(let w) = t, actions.contains(where: { actsOnKeyboardFocus($0) }),
+               let key = AX.focusedWindow(pid: w.pid), key != w.id, agentWindows.contains(key), Input.userQuiet() {
+                await Input.primer(try route(t, at: nil, foreground: false), force: true)
+                try await Run.pause(0.1)
+                if AX.focusedWindow(pid: w.pid) == w.id {
+                    notes.append("moved \(Policy.appName(w.pid))'s keyboard here from your other window #\(key)")
+                }
+            }
         }
         var stopped: String?
         var confirm: [String: Any]?
@@ -1552,12 +1574,24 @@ enum Handlers {
         let res = try await result(target, shot, o, zoom: false, text: p["text"] as? Bool == true, diff: true)
         if firstLook, target.key != t.key { meta[t.key] = nil }  // it was shown the window it moved to instead
         out.merge(res) { _, new in new }
+        if let note = partShown(target, shot) { out["notes"] = (out["notes"] as? [String] ?? []) + [note] }
         out["changed"] = change != nil
         if let c = change {
             out["change_box"] = [Int(c.box.minX), Int(c.box.minY), Int(c.box.maxX), Int(c.box.maxY)]
             out["change_fraction"] = c.fraction
         }
         return out
+    }
+
+    /// A window partly off screen (or across two displays) is captured only where it's on the display
+    /// it's mostly on: the screenshot says so, or the agent reads a nearly blank picture as the page.
+    static func partShown(_ t: Target, _ shot: Shot) -> String? {
+        guard case .window(let w) = t, let f = Windows.info(w.id)?.frame, f.width > 0, f.height > 0 else { return nil }
+        let shown = f.intersection(shot.rect)
+        let part = shown.isNull ? 0 : shown.width * shown.height / (f.width * f.height)
+        guard part < 0.9 else { return nil }
+        return "only \(Int(part * 100))% of window #\(w.id) is in the screenshot: the rest is off screen (or on "
+            + "another display). Elements there can still be reached by number or target"
     }
 
     /// Capture `t` once the UI has settled: re-capture until two consecutive frames match (ignoring tiny
@@ -1606,6 +1640,9 @@ enum Handlers {
             if let f = Windows.info(nw.id)?.frame { note += ", sized to \(Int(f.width))x\(Int(f.height)) pt" }
         }
         notes.append(note)
+        if !existedBefore.contains(nw.id), Run.placeOnScreen(nw) {
+            try? await Task.sleep(nanoseconds: 150_000_000)  // let it lay out where it is now
+        }
         return Windows.info(nw.id) ?? nw
     }
 }

@@ -53,8 +53,9 @@ number from an outline, `find` or marks) or `target` (the text it shows, see [Na
   and documents given to a terminal or script runner (`app: "Terminal"`) are refused
 - `wait_for {text, role?, gone?, timeout_ms?}`: until an element showing that text (and role) is in
   any of the app's windows, or with `gone` until none is. Default 5 s, at most 30 s
-- `clipboard {}` reads the clipboard into the result (after a copy); `clipboard {text}` puts text on it
-  to stay. `paste {text}` pastes at the focus and puts back what was on the clipboard
+- `clipboard {offset?, limit?}` reads the clipboard into the result (after a copy): 10,000 characters
+  from `offset` (default 0; `limit` up to 50,000), with a note saying where to read on when there's more.
+  `clipboard {text}` puts text on it to stay. `paste {text}` pastes at the focus and puts back what was on the clipboard
 - `set_value {element,text}`, `focus {element}`, `activate {}`, `close_window {}`
 - `perform {element, name}`: an accessibility action with no pointer needed: `expand`, `collapse`,
   `increment`, `decrement`, `showmenu`, `scroll_to_visible`, `confirm`, `cancel`, `raise`, or any AX
@@ -70,6 +71,15 @@ yours; the check repeats before each keystroke, so taking the keyboard mid-text 
 and accessibility actions still go to the agent's window. Switch away (or focus its window) and
 retry; `foreground=true` is the explicit fallback that raises the app and uses the real keyboard,
 interrupting you.
+
+When the keyboard is on another of the agent's *own* windows (two browser windows it opened), `act`
+moves it to the target at the start of the call. If the app is your front app, it does that only once
+you've left the keyboard and mouse alone for 2 seconds, since you may be typing into that window;
+otherwise the action stops and says to try again.
+
+A window the agent opens (with `navigate`, `open`, or an action that opens one) that lands partly off
+screen is moved onto it, since what's off screen can't be captured or clicked. Your own windows stay
+where you put them: a screenshot of one that's partly off screen says how much of it is shown.
 
 An element behind an open sheet or modal dialog can't be pressed, set or focused, just as a person
 couldn't click it: the action fails and names the sheet's buttons.

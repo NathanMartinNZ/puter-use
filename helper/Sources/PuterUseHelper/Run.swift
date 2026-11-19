@@ -146,11 +146,24 @@ final class Run {
             locked.insert(w.pid)
         }
         try Connection.check()
+        if !foreground, Run.placeOnScreen(w) {
+            try await Run.pause(0.15)  // let it lay out where it is now
+            target = .window(Windows.info(w.id) ?? w)
+        }
         if !foreground, !Hold.isFront(w.pid) {
             _ = Hold.activate(pid: w.pid, wid: w.id)
             SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
             await Input.ms(40)
         }
+    }
+
+    /// A window the batch opened, moved wholly on screen if it opened partly off it (`AX.bringOnScreen`),
+    /// with a note. Whether it moved.
+    static func placeOnScreen(_ w: WinInfo) -> Bool {
+        guard let f = AX.bringOnScreen(pid: w.pid, wid: w.id) else { return false }
+        Handlers.notes.append("window #\(w.id) opened partly off screen, where it can't be captured or clicked: "
+            + "moved it onto the screen (\(Int(f.width))x\(Int(f.height)) pt)")
+        return true
     }
 
     /// A window of `pid` that wasn't there before, once it appears (up to `timeout` seconds).

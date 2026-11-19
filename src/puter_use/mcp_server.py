@@ -100,6 +100,8 @@ class Action(BaseModel):
     role: str | None = None
     gone: bool | None = None
     timeout_ms: Annotated[int, Field(ge=0, le=30000)] | None = None
+    offset: Annotated[int, Field(ge=0)] | None = None
+    limit: Annotated[int, Field(ge=1, le=50000)] | None = None
 
     @model_validator(mode="after")
     def _hold_limit(self) -> Action:
@@ -303,6 +305,8 @@ async def act(actions: list[Action], window: int | str | None = None, text: Outl
     - Keys and menu commands act on the app's key window. If another window of the same app has it (the
       user's), typing, shortcuts, modifier-clicks and menu commands stop with an error naming that
       window: nothing is done there. Clicks still go to this window. Wait until it's back, then retry.
+      If it's your own other window, act moves the keyboard here at its start (in the user's front app,
+      only while they aren't typing or using the mouse).
     - key_down/key_up {keys}: hold keys over later actions; hold_key {keys, ms ≤ 10000}. mouse_down {x,y|element},
       move (drags while down), mouse_up {x?,y?}. Anything still held is let go at the end.
     - menu {item: "File > Export as PDF…"}: a menu-bar command, no pointer needed (menus lists them)
@@ -311,7 +315,8 @@ async def act(actions: list[Action], window: int | str | None = None, text: Outl
     - navigate {url, new_window?}: in a browser; uses its own window unless this one is the agent's
     - open {url|path, app?}: a link, document or app, in the background (nothing that runs code)
     - wait_for {text, role?, gone?, timeout_ms ≤ 30000?}: until an element showing text appears (or goes)
-    - clipboard {}: read the clipboard (after a copy); clipboard {text}: put text on it to stay.
+    - clipboard {offset?, limit?}: read the clipboard (after a copy), 10000 characters from offset (limit
+      ≤ 50000); a note says where to read on. clipboard {text}: put text on it to stay.
       paste {text}: paste text at the focus (the clipboard is restored after)
     - set_value {element, text}; focus {element}; perform {element, name}: an accessibility action:
       expand, collapse, increment, decrement, showmenu, pick, scroll_to_visible, confirm, cancel, …

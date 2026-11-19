@@ -118,6 +118,39 @@ enum AX {
         return write(win, kAXSizeAttribute, v) == .success
     }
 
+    /// Put a window the agent just opened wholly on screen: an app may cascade a new window off an edge,
+    /// and what's off screen can't be captured or clicked. Moved, and shrunk if it's too big. Its new
+    /// frame, or nil if it was on screen already (or isn't a document window, or wouldn't move). Only for
+    /// the agent's own new windows: the user's stay where they put them.
+    @MainActor static func bringOnScreen(pid: pid_t, wid: CGWindowID) -> CGRect? {
+        guard let win = window(pid: pid, wid: wid), let f = frame(win),
+              (value(win, kAXSubroleAttribute) as? String) == "AXStandardWindow" else { return nil }
+        let top = NSScreen.screens.first?.frame.height ?? 0  // global points are measured down from its top
+        let screens = NSScreen.screens.map { s in
+            CGRect(x: s.visibleFrame.minX, y: top - s.visibleFrame.maxY, width: s.visibleFrame.width, height: s.visibleFrame.height)
+        }
+        guard let to = onScreen(f, screens: screens) else { return nil }
+        var size = to.size, origin = to.origin
+        if size != f.size, let v = AXValueCreate(.cgSize, &size) { write(win, kAXSizeAttribute, v) }
+        if let v = AXValueCreate(.cgPoint, &origin) { write(win, kAXPositionAttribute, v) }
+        guard let now = frame(win), now != f else { return nil }
+        return now
+    }
+
+    /// Where a window with frame `f` goes to be wholly on screen: inside the visible area (`screens`, in
+    /// global points) of the screen it's most on, or the first if it's on none, shrunk to fit if it's
+    /// bigger. nil if it's on screen already (a point of slack at the edges).
+    nonisolated static func onScreen(_ f: CGRect, screens: [CGRect]) -> CGRect? {
+        guard !screens.isEmpty, f.width > 0, f.height > 0 else { return nil }
+        func area(_ r: CGRect) -> CGFloat { r.isNull ? 0 : r.width * r.height }
+        let shown = screens.map { area(f.intersection($0)) }
+        if shown.reduce(0, +) >= f.width * f.height - (f.width + f.height) { return nil }
+        let best = shown.indices.max { shown[$0] < shown[$1] }!
+        let s = shown[best] > 0 ? screens[best] : screens[0]
+        let w = min(f.width, s.width), h = min(f.height, s.height)
+        return CGRect(x: min(max(f.minX, s.minX), s.maxX - w), y: min(max(f.minY, s.minY), s.maxY - h), width: w, height: h)
+    }
+
     static let roleNames: [String: String] = [
         "AXButton": "button", "AXCheckBox": "checkbox", "AXRadioButton": "radio", "AXTextField": "field",
         "AXTextArea": "textarea", "AXSearchField": "search", "AXComboBox": "combo", "AXPopUpButton": "popup",
