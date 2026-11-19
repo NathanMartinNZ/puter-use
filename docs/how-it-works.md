@@ -21,6 +21,7 @@ open-codex-computer-use and cua-driver, and verified here on macOS 27:
 | background apps ignore key equivalents and route keys to no window | an AppKit-only activation record, plus "make key window" records (`SLPSPostEventRecordTo`). Your frontmost app and keyboard focus don't change |
 | Chromium ignores background key equivalents | `cmd+…` is pressed as the matching menu item through accessibility |
 | WindowServer accelerates synthetic scrolls | scroll is sent as a paced trackpad gesture (began/changed/ended) |
+| a long scroll at the end would go on for seconds past it | every few steps it looks under the pointer: the scroll bar at the end, or the content no longer moving (after moving, or with its end in view), stops it with a note |
 | Firefox has no accessibility tree until asked | `AXEnhancedUserInterface` is set the first time an outline comes back empty |
 | menus and popovers close when the app deactivates | the target stays AppKit-active between calls. It's released on `release`, on switching apps, or after 2 idle minutes. If you bring the app forward yourself, the hold is simply dropped: an app that's really in front is never told it's inactive (Firefox would ignore your clicks until you switched apps) |
 | a primer click outside a menu dismisses it | clicks that land on the app's own menu, popover or sheet go to that window, without a primer |
@@ -87,13 +88,13 @@ modelled on human reaching, which is also what OpenAI's helper approximates:
 - **Life.** The pointer leans with its horizontal speed, sways slowly when idle, and dips and ripples
   when it clicks. With `PUTER_USE_CURSOR=0` the path is still followed, just not drawn.
 
-**Typing.** Text is typed like a fast, practised typist, at `PUTER_USE_TYPING_WPM` (default 140):
+**Typing.** Text is typed like a fast, practised typist, at `PUTER_USE_TYPING_WPM` (default 280):
 
 - **Rhythm.** Intervals between keys are skewed and vary with the pair of keys: hands alternating is
   quick, the same finger twice is slow, common pairs like "th" are quick, and digits, symbols and
   Shift take a longer reach. People pause after punctuation, at line ends, and now and then before a
   word.
-- **Keys** are held for a varying time (about 80 ms at 140 WPM), and at speed the next key often goes
+- **Keys** are held for a varying time (about 55 ms at 280 WPM), and at speed the next key often goes
   down before the last comes up (rollover).
 - **Modifiers are real key presses.** Shift goes down before a capital and comes up after it.
   Shortcuts press their modifiers one after another, then the key.

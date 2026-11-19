@@ -129,7 +129,10 @@ enum Input {
     /// Scroll by (dx, dy) points at `p` (the pointer is already there); positive dy scrolls content down
     /// (like pressing the down arrow). Sent as a trackpad-style gesture (began/changed/ended), which apps
     /// apply 1:1 without wheel acceleration.
-    static func scroll(_ p: CGPoint, dx: Double, dy: Double, _ route: Route) async {
+    /// Every few steps `watch` says whether to stop (the content there has stopped at its end). Returns the
+    /// points sent.
+    @discardableResult
+    static func scroll(_ p: CGPoint, dx: Double, dy: Double, _ route: Route, watch: ScrollWatch? = nil) async -> (x: Double, y: Double) {
         var steps: [(Double, Double)] = []
         var remX = dx, remY = dy
         while abs(remX) >= 1 || abs(remY) >= 1 {
@@ -150,12 +153,23 @@ enum Input {
             post(e, at: p, route)
         }
         send(0, 0, phase: 1)  // began
-        for (sx, sy) in steps {
+        var sent = (x: 0.0, y: 0.0)
+        var sinceLook = 0.0  // along the scroll, since the watch last looked
+        for (i, (sx, sy)) in steps.enumerated() {
+            if Connection.hungUp { break }  // cancelled: no more of it
+            if i % 5 == 0, let watch {
+                if watch.stop(sent: sinceLook) { break }
+                sinceLook = 0
+            }
             send(sx, sy, phase: 2)  // changed
+            sent.x += sx
+            sent.y += sy
+            sinceLook += abs(sy) >= abs(sx) ? abs(sy) : abs(sx)
             await ms(30)
         }
         send(0, 0, phase: 4)  // ended
         await ms(30)
+        return sent
     }
 
     /// One key going down or up. Modifier keys are sent as flags-changed events, as the keyboard does.

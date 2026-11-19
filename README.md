@@ -151,7 +151,7 @@ you're most likely to want:
 |---|---|---|
 | `PUTER_USE_WINDOW_SIZE` | `off` | e.g. `1280x860`: windows the agent opens are shrunk to fit, so screenshots stay sharp |
 | `PUTER_USE_CURSOR_SPEED` | `1` | pointer pace: `2` = twice as fast, `0` = jump instantly |
-| `PUTER_USE_TYPING_WPM` | `140` | typing speed; `0` = as fast as possible |
+| `PUTER_USE_TYPING_WPM` | `280` | typing speed; `0` = as fast as possible |
 | `PUTER_USE_CURSOR` | `1` | `0` hides the agent cursor |
 | `PUTER_USE_TILE` | `28` | image tile size: 28 for Claude, 32 for OpenAI models |
 
@@ -207,7 +207,8 @@ server or CLI. It starts on demand. Input goes to one app's process through priv
   and in-window drags work. Drags into another app (WindowServer drag-and-drop) don't.
 - **Open and Save panels** run in a separate macOS process, so keys sent to the app (Escape, Return)
   may not reach them. Press their buttons by element (`click` with `element`) instead.
-- **Scroll distance** is approximate (±20%). Scroll, then look.
+- **Scroll distance** is approximate (±20%). Scroll, then look. A scroll that reaches the end stops there
+  (with a note), rather than going on past it.
 - **Captures.** A minimized window can't be captured until restored. Windows on another Space are
   captured from their backing store.
 - **Shortcuts in Chromium/Electron** must exist in the app's menus to work in the background.

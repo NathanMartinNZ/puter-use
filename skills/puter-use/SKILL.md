@@ -71,7 +71,7 @@ Commands after the first apply to the last window used. Pass `-w <id|app>` to sw
 - `--screenshot never` skips the image when you'll look later anyway; the next image then shows
   everything that changed since the last one you saw.
 - Input is human-paced: the pointer travels to each target (0.14-0.85 s) and text is typed at about
-  140 WPM (longer than a sentence is pasted). Batch steps into one `act` rather than making more calls.
+  280 WPM (longer than a sentence, or an address in a browser's address bar, is pasted). Batch steps into one `act` rather than making more calls.
 - Prefer naming elements by their text (`-e Save`, `"target": "Save"` in act JSON) over coordinates.
 - Only when you need it (dense forms, or a click that keeps missing), `--text` adds a numbered
   accessibility outline (`[12] button "Save"`, up to ~2k tokens); `--interactive` lists only controls.

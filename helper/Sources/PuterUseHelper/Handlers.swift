@@ -819,7 +819,11 @@ enum Handlers {
             }
         case "scroll":
             var p: CGPoint
-            if let (q, _) = try await actionPoint(a, t, required: false) { p = q } else if case .window(let w) = t,
+            if let (q, n) = try await actionPoint(a, t, required: false) {
+                // Over what's shown of it: a text view's centre can be far below the window.
+                let win: CGRect? = { if case .window(let w) = t { return Windows.info(w.id)?.frame ?? w.frame } else { return nil } }()
+                p = n.flatMap { AX.shownPart($0.element, in: win) }.map { CGPoint(x: $0.midX, y: $0.midY) } ?? q
+            } else if case .window(let w) = t,
                 meta[t.key] == nil || a["units"] as? String == "pt" {  // the middle of the window
                 let f = Windows.info(w.id)?.frame ?? w.frame
                 p = CGPoint(x: f.midX, y: f.midY)
@@ -836,7 +840,14 @@ enum Handlers {
             }
             let r = try route(t, at: p, foreground: foreground)
             await pointer.move(to: p, r)
-            await Input.scroll(p, dx: dx * ptPerPx, dy: dy * ptPerPx, r)
+            // A scroll that runs into the end stops there (see ScrollWatch), and says so.
+            let watch = ScrollWatch(pid: r.pid, at: p, within: r.frame, dx: dx * ptPerPx, dy: dy * ptPerPx)
+            let sent = await Input.scroll(p, dx: dx * ptPerPx, dy: dy * ptPerPx, r, watch: watch)
+            if watch.stopped {
+                let (asked, went) = watch.vertical ? (abs(dy), abs(sent.y) / ptPerPx) : (abs(dx), abs(sent.x) / ptPerPx)
+                notes.append("the scroll reached the end after about \(Int(went.rounded())) of \(Int(asked.rounded())); "
+                    + "the rest wasn't sent")
+            }
         case "type", "type_text":
             guard let text = a["text"] as? String ?? a["value"] as? String else { throw HelperError("type needs text") }
             if a["element"] != nil || a["target"] != nil || a["x"] != nil || a["coordinate"] != nil || a["clear"] != nil
@@ -1089,7 +1100,10 @@ enum Handlers {
         let focusedHere = focused.map { f in
             r.wid == 0 || (AX.windowID(f).map { $0 == r.wid } ?? keysReachTarget(r))
         } ?? false
-        if let f = focused, focusedHere, AX.isBrowserAddressBar(f, pid: r.pid),
+        // An address goes into the address bar at once (pasted, as people do with a link): typed, its
+        // suggestions chase each letter, and it takes a while.
+        let addressBar = focused.map { focusedHere && AX.isBrowserAddressBar($0, pid: r.pid) } ?? false
+        if let f = focused, addressBar,
            let current = AX.value(f, kAXValueAttribute) as? String, !current.isEmpty,
            (AX.selectedRange(f)?.length ?? 0) == 0,
            !AX.select(f, CFRange(location: 0, length: (current as NSString).length)) {
@@ -1123,8 +1137,9 @@ enum Handlers {
             try guardKeyboard(r)
             if i > 0 { await Input.sleep(typist.between()) }
             let end = s.end.map { String($0) } ?? ""
-            if pasteOver > 0, s.text.count > pasteOver {
-                await Input.sleep(typist.instant ? 0 : Double.random(in: 0.15...0.35))  // reach for the shortcut
+            let quick = addressBar && i == 0  // (a Return after it leaves the address bar)
+            if pasteOver > 0, s.text.count > pasteOver || (quick && !s.text.isEmpty) {
+                await Input.sleep(typist.instant || quick ? 0 : Double.random(in: 0.15...0.35))  // reach for the shortcut
                 try Connection.check()
                 Clipboard.borrow(s.text)
                 do { try await press(["cmd", "v"], r) } catch {
@@ -1134,7 +1149,7 @@ enum Handlers {
                 Clipboard.giveBack()
                 try Connection.check()
                 Connection.current?.work.typed += s.text.count
-                await Input.sleep(typist.instant ? 0.03 : Double.random(in: 0.12...0.25))
+                await Input.sleep(typist.instant || quick ? 0.03 : Double.random(in: 0.12...0.25))
                 if !end.isEmpty,
                    !(await Input.type(end, r, typist: typist, stillSafe: { keysReachTarget(r) })) {
                     throw try interruption(sent, r)
@@ -1305,7 +1320,7 @@ enum Handlers {
         defer { for pid in run.locked { AppLocks.release(pid) } }
         pointer.enabled = p["cursor"] as? Bool != false
         pointer.speed = num(p["cursor_speed"]) ?? 1
-        typist = Typist(wpm: num(p["typing_wpm"]) ?? 140)
+        typist = Typist(wpm: num(p["typing_wpm"]) ?? 280)
         pasteOver = max(0, int(p["paste_over"], 100))
         Trace.configure(p["trace"] as? String)
         AppCards.enabled = p["app_cards"] as? Bool != false

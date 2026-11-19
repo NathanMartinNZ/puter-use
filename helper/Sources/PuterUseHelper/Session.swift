@@ -22,7 +22,7 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
     var notesSeq = 0
     var notes: [String] = []  // remarks for the agent, per request
     var remarks: [String] = []  // from accessibility lookups, folded into notes
-    var typist = Typist(wpm: 140)
+    var typist = Typist(wpm: 280)
     var pasteOver = 100
     var agentWindows = Set<CGWindowID>()  // windows this agent opened (navigate uses them)
     var windowApps: [CGWindowID: (app: String, pid: pid_t)] = [:]  // each window it used: "not found" lists its app's others

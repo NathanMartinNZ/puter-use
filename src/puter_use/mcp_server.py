@@ -292,11 +292,12 @@ async def act(actions: list[Action], window: int | str | None = None, text: Outl
       right_click, middle_click; move {x,y}; drag {path: [[x,y],[x,y],...]}. item: what to choose from the
       menu the click opens (pop-up, context menu), "Red" or "Font > Bold". Menus never stay open after
       act (they'd take the user's typing): one left open is closed and its items are listed.
-    - scroll {x?,y?, scroll_x?, scroll_y?}: pixels, positive = right/down (e.g. scroll_y: 600)
+    - scroll {x?,y?, scroll_x?, scroll_y?}: pixels, positive = right/down (e.g. scroll_y: 600); one that
+      reaches the end stops there and says so
     - type {text, element|x,y?, clear?, submit?}: into the focused field, or click the given one first;
-      in a browser's address bar the new address replaces the old (never added to it); clear empties
-      it, submit presses Return. Long text is pasted (your clipboard is restored); "\n" is the Return
-      key, "\t" Tab.
+      in a browser's address bar the new address replaces the old (never added to it) and goes in at
+      once; clear empties it, submit presses Return. Long text is pasted (your clipboard is restored);
+      "\n" is the Return key, "\t" Tab.
     - keypress {keys, repeat?}: "cmd+t", ["ctrl","a"], or a sequence "Tab Tab Return" /
       ["cmd+a","BackSpace"]; repeat 1-100. Names: Return, Tab, Escape, BackSpace, Delete, Up, PageDown, F5
     - Keys and menu commands act on the app's key window. If another window of the same app has it (the

@@ -31,7 +31,7 @@ def test_human_input_settings(monkeypatch):
     monkeypatch.delenv("PUTER_USE_TYPING_WPM", raising=False)
     monkeypatch.delenv("PUTER_USE_TRACE", raising=False)
     p = capture_params()
-    assert p["typing_wpm"] == 140 and "trace" not in p and "cursor_wait" not in p
+    assert p["typing_wpm"] == 280 and "trace" not in p and "cursor_wait" not in p
     monkeypatch.setenv("PUTER_USE_TYPING_WPM", "0")
     monkeypatch.setenv("PUTER_USE_TRACE", "/tmp/t.jsonl")
     p = capture_params()

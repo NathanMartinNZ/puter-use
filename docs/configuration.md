@@ -16,8 +16,8 @@ for the CLI, in your shell.
 | `PUTER_USE_MAX_BYTES` | 72000 | byte budget. Claude Code caps MCP output at ~25k tokens |
 | `PUTER_USE_CURSOR` | `1` | `0` hides the agent cursor (the pointer still follows its human path) |
 | `PUTER_USE_CURSOR_SPEED` | `1` | pointer pace: `2` = twice as fast, `0` = jump instantly |
-| `PUTER_USE_TYPING_WPM` | `140` | typing speed, with a human rhythm; `0` = as fast as possible |
-| `PUTER_USE_PASTE_OVER` | `100` | text longer than this many characters (per line) is pasted instead of typed; `0` = always type |
+| `PUTER_USE_TYPING_WPM` | `280` | typing speed, with a human rhythm; `0` = as fast as possible |
+| `PUTER_USE_PASTE_OVER` | `100` | text longer than this many characters (per line) is pasted instead of typed, and so is an address in a browser's address bar; `0` = always type |
 | `PUTER_USE_SESSION` | `mcp-<pid>` / `default` | the session requests belong to (see [Sessions](tools.md#sessions)) |
 | `PUTER_USE_APP_CARDS` | `1` | `0` turns off the line about an app on the first look at it |
 | `PUTER_USE_OUTLINE_CHARS` | `8000` | longest accessibility outline sent (500-40000) |

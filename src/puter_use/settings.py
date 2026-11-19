@@ -24,7 +24,7 @@ def capture_params() -> dict:
         "cursor": env("PUTER_USE_CURSOR", "1") != "0",
         "cursor_speed": float(env("PUTER_USE_CURSOR_SPEED", "1")),
         # Typing pace of a fast human typist, with a human rhythm; 0 = as fast as possible.
-        "typing_wpm": float(env("PUTER_USE_TYPING_WPM", "140")),
+        "typing_wpm": float(env("PUTER_USE_TYPING_WPM", "280")),
         # Text longer than this (per line, in characters) is pasted instead, as people do; 0 = always type.
         "paste_over": int(env("PUTER_USE_PASTE_OVER", "100")),
         # The first look at an app adds a few lines about it: its scripting support, its shortcuts, quirks.
