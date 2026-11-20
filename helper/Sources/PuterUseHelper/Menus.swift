@@ -23,33 +23,54 @@ extension AX {
         }
     }
 
-    /// Every item, in menu order, up to 3 levels deep (top menu > item > submenu item > …).
-    static func menuItems(pid: pid_t, budget: TimeInterval = 3) -> [MenuItem] {
+    /// Every item, in menu order, up to 3 levels deep (top menu > item > submenu item > …). `until` sees each
+    /// item as it's listed and can end the walk there (true): the app card stops at its 12th shortcut rather
+    /// than reading a browser's History and Bookmarks too. `tops`: just these top-level menus (default all).
+    static func menuItems(pid: pid_t, budget: TimeInterval = 3, tops: [(AXUIElement, String)]? = nil,
+                          until done: ((MenuItem) -> Bool)? = nil) -> [MenuItem] {
         let start = Date()
         let fields = [kAXTitleAttribute, "AXMenuItemCmdChar", "AXMenuItemCmdModifiers", "AXMenuItemCmdVirtualKey",
                       "AXMenuItemCmdGlyph", kAXChildrenAttribute] as CFArray
         var out: [MenuItem] = []
-        func walk(_ menu: AXUIElement, _ path: [String], _ depth: Int) {
+        walkMenus(tops ?? menuBar(pid: pid), children: children,
+                  more: { out.count < 3000 && Date().timeIntervalSince(start) < budget },
+                  read: { item in
+                      var raw: CFArray?
+                      guard AXUIElementCopyMultipleAttributeValues(item, fields, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
+                            let v = raw as? [AnyObject], v.count == 6, let title = v[0] as? String, !title.isEmpty
+                      else { return nil }  // separators have no title
+                      return (title, shortcutText(char: v[1] as? String, mods: (v[2] as? Int) ?? 0,
+                                                  virtualKey: v[3] as? Int, glyph: v[4] as? Int),
+                              (v[5] as? [AXUIElement])?.first)
+                  },
+                  visit: { path, shortcut, item, hasSubmenu in
+                      out.append(MenuItem(path: path, shortcut: shortcut, element: item, hasSubmenu: hasSubmenu))
+                      return done?(out[out.count - 1]) == true
+                  })
+        return out
+    }
+
+    /// The walk behind `menuItems`, apart from accessibility so tests can run it on a made-up menu bar:
+    /// depth-first in menu order, up to 3 levels. `more` is asked before each item is read (the budget);
+    /// `read` gives its title, shortcut and submenu, or nil for a separator; `visit` gets each listed item
+    /// and ends the whole walk by returning true.
+    static func walkMenus<Node>(_ tops: [(Node, String)], children: (Node) -> [Node], more: () -> Bool,
+                                read: (Node) -> (title: String, shortcut: String?, submenu: Node?)?,
+                                visit: (_ path: [String], _ shortcut: String?, _ item: Node, _ hasSubmenu: Bool) -> Bool) {
+        var stopped = false
+        func walk(_ menu: Node, _ path: [String], _ depth: Int) {
             for item in children(menu) {
-                guard out.count < 3000, Date().timeIntervalSince(start) < budget else { return }
-                var raw: CFArray?
-                guard AXUIElementCopyMultipleAttributeValues(item, fields, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
-                      let v = raw as? [AnyObject], v.count == 6, let title = v[0] as? String, !title.isEmpty
-                else { continue }  // separators have no title
+                guard !stopped, more() else { return }
+                guard let (title, shortcut, sub) = read(item) else { continue }
                 // Services hand what's selected to other apps, and `menu` refuses them: not listed.
                 if depth == 1, menuKey(title) == "services" { continue }
-                let sub = (v[5] as? [AXUIElement])?.first
-                out.append(MenuItem(path: path + [title],
-                                    shortcut: shortcutText(char: v[1] as? String, mods: (v[2] as? Int) ?? 0,
-                                                           virtualKey: v[3] as? Int, glyph: v[4] as? Int),
-                                    element: item, hasSubmenu: sub != nil))
+                if visit(path + [title], shortcut, item, sub != nil) { stopped = true; return }
                 if let sub, depth < 3 { walk(sub, path + [title], depth + 1) }
             }
         }
-        for (top, title) in menuBar(pid: pid) {
+        for (top, title) in tops where !stopped {
             if let menu = children(top).first { walk(menu, [title], 1) }
         }
-        return out
     }
 
     static let keyNames: [Int: String] = [
@@ -138,17 +159,117 @@ extension AX {
         return lines.joined(separator: "\n")
     }
 
-    /// Normalised for matching: case, "..." vs "…", and spacing don't matter.
+    /// Normalised for matching: case, "..." vs "…", and spacing don't matter. (Menu items, and targets' labels.)
     static func menuKey(_ s: String) -> String {
         s.lowercased().replacingOccurrences(of: "...", with: "…").split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
+    /// Whether lower-case `s` is its own `menuKey` for sure (plain ASCII, no dots, single spaces between words):
+    /// a quick test that spares the work for most labels.
+    static func ownKey(_ s: String) -> Bool {
+        var last: UInt8 = 0x20  // a leading space isn't
+        for b in s.utf8 {
+            if b >= 0x80 || b == 0x2E || b < 0x20 || (b == 0x20 && last == 0x20) { return false }
+            last = b
+        }
+        return last != 0x20 || s.isEmpty
+    }
+
+    /// A command's name as a name alone (`menu {item: "Export as PDF…"}`) matches it: as `menuKey`, and a
+    /// closing "…" doesn't matter either ("Export as PDF" is "Export as PDF…").
+    static func nameKey(_ s: String) -> String {
+        var k = menuKey(s)
+        while k.hasSuffix("…") { k.removeLast() }
+        return k.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Top-level menus that list the user's own things (pages, bookmarks, profiles, open windows) rather
+    /// than the app's commands. English titles.
+    static let userMenus: Set<String> = ["history", "bookmarks", "favorites", "favourites", "profiles", "people", "window"]
+
+    static func userMenu(_ title: String) -> Bool { userMenus.contains(menuKey(title)) }
+
+    /// An item in a menu of the user's own things: under one of `userMenus`, or in a submenu whose title
+    /// says "recent" (Open Recent, Recently Closed, Recent Folders, …) or is History, Bookmarks or Favorites.
+    /// A name alone never runs one, so a page, bookmark or document that shares a command's name can't
+    /// be opened by accident (its full path still runs it).
+    static func ownItem(_ path: [String]) -> Bool {
+        guard let top = path.first else { return false }
+        return userMenu(top) || path.dropFirst().dropLast().contains { title in
+            let k = menuKey(title)
+            return ["history", "bookmarks", "favorites", "favourites"].contains(k)
+                || k.split(separator: " ").contains { $0.hasPrefix("recent") }
+        }
+    }
+
+    /// The commands a name alone can mean: items without a submenu, named exactly that (`nameKey`),
+    /// outside the user's own menus (`ownItem`).
+    static func commandsNamed(_ name: String, in items: [MenuItem]) -> [MenuItem] {
+        let k = nameKey(name)
+        return items.filter { !$0.hasSubmenu && !ownItem($0.path) && nameKey($0.path.last ?? "") == k }
+    }
+
+    /// Why a name alone ran nothing, and what it could mean by full path (standing in for `menus(name)`):
+    /// commands with exactly that name, then the user's own items with it, then items containing it.
+    /// `whole`: false if the walk ran out of time or items before the end.
+    static func nameMiss(_ name: String, in items: [MenuItem], whole: Bool = true) -> String {
+        let k = nameKey(name), leaves = items.filter { !$0.hasSubmenu }
+        func named(_ i: MenuItem) -> Bool { nameKey(i.path.last ?? "") == k }
+        let commands = leaves.filter { named($0) && !ownItem($0.path) }, own = leaves.filter { named($0) && ownItem($0.path) }
+        let near = leaves.filter { i in
+            !named(i) && (menuKey(i.path.joined(separator: " > ")).contains(k)
+                || i.shortcut.map { comboKey($0) == comboKey(name) } == true)
+        }
+        var head: String
+        if commands.count > 1 {
+            head = "\"\(name)\" names \(commands.count) menu commands"
+        } else if commands.count == 1 {
+            head = "the menus are too long to check that \"\(name)\" is the only one"
+        } else if !own.isEmpty {
+            head = "\"\(name)\" is only in menus that list the user's own things (History, Bookmarks, recent items, "
+                + "Window), and a name alone never runs those"
+        } else if !near.isEmpty {
+            head = "no menu command is named exactly \"\(name)\""
+        } else {
+            return "nothing was run: no menu item matches \"\(name)\"" + (whole ? "" : " in the part of the menus read in time")
+                + " (menus lists them all)"
+        }
+        let list = commands + own + near.filter { !ownItem($0.path) } + near.filter { ownItem($0.path) }, cap = 12
+        let shown = list.prefix(cap)
+        if !commands.isEmpty || own.isEmpty, shown.contains(where: { ownItem($0.path) }) {
+            head += " (\"full path only\": in the user's own History, Bookmarks, recent items or Window menu)"
+        }
+        if !whole, commands.count != 1 { head += "; the menus were too long to read them all" }
+        let lines = shown.map { i in
+            "  " + i.path.joined(separator: " > ") + (i.shortcut.map { " · \($0)" } ?? "") + (ownItem(i.path) ? " (full path only)" : "")
+        } + (list.count > cap ? ["  … \(list.count - cap) more (menus \"\(name)\" lists them)"] : [])
+        return "nothing was run: \(head). Give the full path of the one you mean:\n" + lines.joined(separator: "\n")
+    }
+
+    /// The full path of the one command a name alone means (`commandsNamed`); anything else runs nothing
+    /// and fails saying what the name could mean (`nameMiss`). The commands are read first: the user's own
+    /// menus (a browser's History and Bookmarks: thousands of items) only to explain a miss.
+    static func commandPath(pid: pid_t, name: String) throws -> [String] {
+        guard !nameKey(name).isEmpty else { throw HelperError("menu needs an item: a path like \"File > Save\", or a command's name") }
+        let bar = menuBar(pid: pid)
+        guard !bar.isEmpty else { throw HelperError("the app exposes no menu bar") }
+        let start = Date(), budget: TimeInterval = 3
+        let commands = menuItems(pid: pid, budget: budget, tops: bar.filter { !userMenu($0.1) })
+        let whole = commands.count < 3000 && Date().timeIntervalSince(start) < budget
+        let named = commandsNamed(name, in: commands)
+        if whole, named.count == 1 { return named[0].path }
+        let own = menuItems(pid: pid, budget: 1, tops: bar.filter { userMenu($0.1) })
+        throw HelperError(nameMiss(name, in: commands + own, whole: whole))
+    }
+
     /// Press the item at `path` (["File", "Export as PDF…"]); each step matches exactly, else by a unique
-    /// prefix, else by a unique substring. Returns the full path pressed, and the item's shortcut if the
+    /// prefix, else by a unique substring. A name alone (["Export as PDF…"]) is the one command with that
+    /// name (`commandPath`). Returns the full path pressed, and the item's shortcut if the
     /// menu shows it disabled (then that's pressed instead: see the menu action).
     /// `check` sees the item's title before it's pressed, and can refuse it.
     static func pressMenu(pid: pid_t, path: [String], check: (String) throws -> Void = { _ in }) throws -> (String, String?) {
-        guard path.count >= 2 else { throw HelperError("menu needs a path like \"File > Save\" (a menu and an item)") }
+        let path = path.count == 1 ? try commandPath(pid: pid, name: path[0]) : path
+        guard path.count >= 2 else { throw HelperError("menu needs an item: a path like \"File > Save\", or a command's name") }
         var level: [(AXUIElement, String)] = menuBar(pid: pid)
         guard !level.isEmpty else { throw HelperError("the app exposes no menu bar") }
         var chosen: [String] = []

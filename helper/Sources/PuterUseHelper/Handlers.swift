@@ -21,6 +21,33 @@ struct Meta {
     var width: Int  // screenshot pixels
     var height: Int
     var sig: Signature
+    var caret: Caret? = nil  // the text cursor then: a later frame that differs only by its blinking hasn't changed
+}
+
+/// The text cursor in a window when an image was taken (`Handlers.caret`): the focused text field it's in
+/// and where accessibility puts the cursor (relative to the window, points: the edge of the character
+/// after or before it, or for an empty field the empty range's place, which AppKit reports a line high),
+/// its place in the text and how long the text is.
+struct Caret {
+    var field: CGRect
+    var point: CGRect?
+    var at: Int
+    var count: Int? = nil  // characters in the field: a forward delete leaves the cursor where it was
+
+    /// The cursor hasn't moved and the text is as long as it was: same field, same place in the text, same
+    /// reported position, same number of characters.
+    func same(as o: Caret) -> Bool {
+        guard at == o.at, count == o.count, Self.near(field, o.field) else { return false }
+        guard let p = point, let q = o.point else { return point == nil && o.point == nil }
+        return Self.near(p, q)
+    }
+
+    /// The cursor went elsewhere in the same field (`o` being where it was).
+    func moved(from o: Caret) -> Bool { at != o.at && Self.near(field, o.field) }
+
+    static func near(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.minX - b.minX) < 0.5 && abs(a.minY - b.minY) < 0.5 && abs(a.width - b.width) < 0.5 && abs(a.height - b.height) < 0.5
+    }
 }
 
 enum Target {
@@ -77,7 +104,9 @@ enum Handlers {
             let reply = await Connection.$current.withValue(conn) {
                 await Session.$current.withValue(session) { await handle(req, p) }
             }
-            return reply.map { Reply(data: encode($0)) }
+            var out = reply.map { Reply(data: encode($0)) }
+            if cmd == "quit" { out?.written = { NSApp.terminate(nil) } }
+            return out
         }
         return await Connection.$current.withValue(conn) {
             await Session.$current.withValue(session) { await take(turn: session, req, p, conn) }
@@ -133,7 +162,7 @@ enum Handlers {
         let id: Any = req["id"] ?? NSNull()
         do {
             Hold.touch()
-            let result: [String: Any]
+            var result: [String: Any]
             switch req["cmd"] as? String ?? "" {
             case "status":
                 result = ["version": version, "protocol": protocolVersion, "pid": Int(Windows.ownPID),
@@ -149,11 +178,18 @@ enum Handlers {
                 Session.current.end()
                 result = [:]
             case "quit":
+                await Run.stopAll(within: 1)  // other sessions' batches too: nothing left held down or open
                 Hold.releaseAll()
                 await Clipboard.finish()
+                // It stops as soon as the reply is written (dispatch); this is for a reply that can't be.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { NSApp.terminate(nil) }
-                result = [:]
+                Run.exitLater()
+                result = ["pid": Int(Windows.ownPID)]  // the client waits until it's gone
             case let other: throw HelperError("unknown command \(other)")
+            }
+            if let n = Connection.current?.windowNote {  // said once per pair of windows
+                result["notes"] = [n.text] + (result["notes"] as? [String] ?? [])
+                Session.current.pickNoted.insert(n.pair)
             }
             return ["id": id, "ok": true, "result": result]
         } catch {
@@ -216,8 +252,12 @@ enum Handlers {
             throw HelperError("bad window value")
         }
         if s.lowercased() == "screen" { return .screen }
-        if let w = Windows.targetable(app: s).first(where: { $0.onScreen }) ?? Windows.targetable(app: s).first {
-            return used(w)
+        let wins = Windows.targetable(app: s)
+        let system = { (w: WinInfo) in systemWindow(w, AX.window(pid: w.pid, wid: w.id)) }  // the dictation orb
+        if let hit = appWindow(wins, query: s, current: current, own: Session.current.ownRecent,
+                               noted: Session.current.pickNoted, system: system) {
+            if let note = hit.note { Connection.current?.windowNote = note }
+            return used(hit.window)
         }
         if Windows.runningApp(s) != nil { throw HelperError("\(s) is running but has no windows (use windows with launch=true)") }
         throw HelperError("no window for \"\(s)\" (not running? use windows with launch=true)")
@@ -229,9 +269,43 @@ enum Handlers {
         return AX.focusedElement(pid: pid).map(AX.isTextInput) ?? false
     }
 
+    enum Pick { case current, own, front }
+
+    /// The window app name `query` means (`pick`), with a note when that isn't the app's front window
+    /// (the one an app name used to mean) and the session hasn't been told about that pair yet (`noted`).
+    static func appWindow(_ wins: [WinInfo], query: String, current: CGWindowID?, own: [CGWindowID],
+                          noted: Set<[CGWindowID]>, system: (WinInfo) -> Bool = { _ in false })
+        -> (window: WinInfo, note: (text: String, pair: [CGWindowID])?)? {
+        guard case let (w, why)? = pick(wins, current: current, own: own, system: system) else { return nil }
+        guard let front = pick(wins, current: nil, own: [], system: system)?.0, front.id != w.id,
+              !noted.contains([w.id, front.id]) else { return (w, nil) }
+        let mine = why == .current ? "the window you're on, #\(w.id)" : "your own window #\(w.id)"
+        let title = front.title.isEmpty ? "" : " \"\(AX.clip(front.title, 40))\""
+        return (w, ("\"\(query)\" is \(mine); \(front.app)'s front window is #\(front.id)\(title)", [w.id, front.id]))
+    }
+
+    /// The window an app name means, of `wins` (the app's, front to back): the one the session is on, else
+    /// the one of its own it used last (`own`, oldest first), else the front one. Windows on screen come
+    /// before minimized or hidden ones. With no current and no own, the front one, as an app name always meant,
+    /// but never one of macOS's own bits shown in the app's name (`system`: the dictation orb) while
+    /// there's another.
+    nonisolated static func pick(_ wins: [WinInfo], current: CGWindowID?, own: [CGWindowID],
+                                 system: (WinInfo) -> Bool = { _ in false }) -> (WinInfo, Pick)? {
+        for tier in [wins.filter(\.onScreen), wins] {
+            if let c = current, let w = tier.first(where: { $0.id == c }) { return (w, .current) }
+            if let w = own.reversed().lazy.compactMap({ id in tier.first { $0.id == id } }).first { return (w, .own) }
+            if let w = tier.first(where: { !system($0) }) { return (w, .front) }
+        }
+        return (wins.first(where: \.onScreen) ?? wins.first).map { ($0, .front) }
+    }
+
     /// A window the session works on: its app is remembered, for when it's gone.
     static func used(_ w: WinInfo) -> Target {
         Session.current.windowApps[w.id] = (w.app, w.pid)
+        if Session.current.agentWindows.contains(w.id) {  // its own: the one an app name means next
+            Session.current.ownRecent.removeAll { $0 == w.id }
+            Session.current.ownRecent.append(w.id)
+        }
         return .window(w)
     }
 
@@ -239,7 +313,7 @@ enum Handlers {
     /// same process's only (another copy of the app is someone else's), the agent's own marked.
     static func appWindows(_ id: CGWindowID) -> String {
         guard let (app, pid) = Session.current.windowApps[id] else { return "" }
-        let now = Windows.targetable().filter { $0.pid == pid }.prefix(8).map { w in
+        let now = Windows.targetable().filter { $0.pid == pid && !systemWindow($0, AX.window(pid: pid, wid: $0.id)) }.prefix(8).map { w in
             "#\(w.id)" + (w.title.isEmpty ? "" : " \"\(AX.clip(w.title, 40))\"") + (agentWindows.contains(w.id) ? " (yours)" : "")
         }
         return now.isEmpty ? " (it was \(app)'s, which has no windows now)"
@@ -250,20 +324,10 @@ enum Handlers {
 
     static func windows(_ p: [String: Any]) async throws -> [String: Any] {
         let app = (p["app"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        var wins: [WinInfo]
+        let wins: [WinInfo]
         if let app, p["launch"] as? Bool == true {
-            let existed = Set(Windows.all().map(\.id))
+            // Not shrunk to the window box: an app may restore the user's last session as it launches.
             wins = try await Windows.launch(app)
-            if let box = Opts(p).windowBox {
-                var resized = false
-                for w in wins where w.onScreen && !existed.contains(w.id) {
-                    if AX.fit(pid: w.pid, wid: w.id, box: box) { resized = true }
-                }
-                if resized {
-                    try await Task.sleep(nanoseconds: 300_000_000)
-                    wins = Windows.targetable(app: app)
-                }
-            }
         } else {
             wins = Windows.targetable(app: app)
         }
@@ -276,6 +340,7 @@ enum Handlers {
                 if !kept.contains(w.app) { kept.append(w.app) }
                 return nil
             }
+            if systemWindow(w, AX.window(pid: w.pid, wid: w.id)) { return nil }  // macOS's dictation orb, not the app's
             if l != .full { j["policy"] = l.rawValue }
             return j
         }
@@ -291,8 +356,8 @@ enum Handlers {
         var sizing = Sizing()
         var format = "jpeg", quality = 0.75, maxBytes = 72_000
         /// If set, windows the agent opens are shrunk to fit this (points), so they stay sharp within the
-        /// token cap. Off by default: they keep the size the app gave them.
-        var windowBox: CGSize? = nil
+        /// token cap. 1440x900 by default (full 0.75 px/pt); "off" (nil) keeps the size the app gave them.
+        var windowBox: CGSize? = CGSize(width: 1440, height: 900)
         var interactive = false  // outline: only things to act on
         var maxChars = 8000  // outline length cap
         var marks = false  // number the interactive elements on the image
@@ -356,9 +421,73 @@ enum Handlers {
 
     static func remember(_ t: Target, _ shot: Shot, _ sig: Signature) {
         let o = origin(t)
+        let start = AX.uptime(), cursor = caret(t)
+        if Trace.on, case .window = t {
+            Trace.log(["k": "caret", "ms": ((AX.uptime() - start) * 10_000).rounded() / 10, "found": cursor != nil])
+        }
         meta[t.key] = Meta(offset: CGPoint(x: shot.rect.minX - o.x, y: shot.rect.minY - o.y), size: shot.rect.size,
-                           width: shot.image.width, height: shot.image.height, sig: sig)
+                           width: shot.image.width, height: shot.image.height, sig: sig, caret: cursor)
         Run.look(t)
+    }
+
+    /// How long one question about the cursor waits for the app: it's asked with every picture, and an app
+    /// too slow to answer only loses the blink rule (its cursor blinking counts as a change, as it used to).
+    static let caretTimeout: Float = 0.3
+
+    /// The text cursor in `t`'s window: the focused text field or text area there and the cursor in it,
+    /// relative to the window. Nil when no text element there has the focus, or text is selected (that's
+    /// no cursor). Not through `AX.appElement`: a picture mustn't switch on an app's accessibility tree
+    /// (Chromium's, Firefox's), and the app gets `caretTimeout` per question, giving up after a slow first.
+    static func caret(_ t: Target) -> Caret? {
+        guard case .window(let w) = t else { return nil }
+        let start = AX.uptime(), app = AXUIElementCreateApplication(w.pid)
+        AXUIElementSetMessagingTimeout(app, caretTimeout)
+        guard let f = AX.value(app, kAXFocusedUIElementAttribute), CFGetTypeID(f) == AXUIElementGetTypeID(),
+              AX.uptime() - start < 0.1 else { return nil }  // a busy app: not worth 8 more questions
+        let el = f as! AXUIElement
+        AXUIElementSetMessagingTimeout(el, caretTimeout)
+        guard AX.isTextInput(el), let win = AX.value(el, kAXWindowAttribute), CFGetTypeID(win) == AXUIElementGetTypeID() else { return nil }
+        AXUIElementSetMessagingTimeout(win as! AXUIElement, caretTimeout)
+        var id: CGWindowID = 0
+        guard _AXUIElementGetWindow(win as! AXUIElement, &id) == .success, id == w.id,
+              let r = AX.selectedRange(el), r.length == 0, let frame = AX.frame(el) else { return nil }
+        let o = origin(t)
+        return Caret(field: frame.offsetBy(dx: -o.x, dy: -o.y),
+                     point: AX.insertionPoint(el, at: r.location)?.offsetBy(dx: -o.x, dy: -o.y),
+                     at: r.location, count: AX.value(el, kAXNumberOfCharactersAttribute) as? Int)
+    }
+
+    /// The widest a text cursor is drawn (points).
+    nonisolated static let caretWidth = 3.0
+
+    /// Whether the cells that differ from the agent's last image (`box`, at the signature's own size) are
+    /// only the text cursor blinking: it hasn't moved since then and the text is as long, and they're a
+    /// sliver as wide as a cursor (`caretWidth`, plus a cell it may straddle) in its field, at its x, on or
+    /// next to its line and no taller than that. Typed or deleted text, a selection, a focus ring coming, a
+    /// cursor that moved or anything elsewhere in the field still count. `scale`: cells per point;
+    /// `offset`: where the capture starts in the window (points).
+    nonisolated static func onlyCaretBlinked(_ box: CGRect, now: Caret, then: Caret, scale: CGSize, offset: CGPoint) -> Bool {
+        guard now.same(as: then), box.width <= (caretWidth * scale.width).rounded(.up) + 1 else { return false }
+        func cells(_ r: CGRect) -> CGRect {
+            CGRect(x: (r.minX - offset.x) * scale.width, y: (r.minY - offset.y) * scale.height,
+                   width: r.width * scale.width, height: r.height * scale.height)
+        }
+        guard cells(now.field).insetBy(dx: -1, dy: -1).contains(box) else { return false }  // a cursor at its very edge, cells rounding out
+        guard let p = now.point else { return true }  // the app didn't say where: the field will do
+        // Its line, a line either way: an empty field's place is reported a line off.
+        let at = cells(p), line = at.insetBy(dx: 0, dy: -at.height - 1)
+        return box.minX - 1 <= at.minX && at.minX <= box.maxX + 1 && box.height <= at.height + 2
+            && box.maxY >= line.minY && box.minY <= line.maxY
+    }
+
+    /// `act`'s settled frame differs from the agent's last image (`before`, with the cursor `then`) only by
+    /// the text cursor (`now`) blinking.
+    static func blinked(_ sig: Signature, from before: Signature, then: Caret, now: Caret, _ shot: Shot, _ t: Target) -> Bool {
+        guard let box = sig.diff(before, outW: sig.w, outH: sig.h)?.box, shot.rect.width > 0, shot.rect.height > 0 else { return false }
+        let o = origin(t)
+        return onlyCaretBlinked(box, now: now, then: then,
+                                scale: CGSize(width: Double(sig.w) / shot.rect.width, height: Double(sig.h) / shot.rect.height),
+                                offset: CGPoint(x: shot.rect.minX - o.x, y: shot.rect.minY - o.y))
     }
 
     static func describe(_ t: Target) -> [String: Any] {
@@ -380,6 +509,7 @@ enum Handlers {
         let t = try resolve(p["window"])
         try Policy.checkLook(pid(t))
         current = t.key
+        if readRequested(p["read"]) { return try readText(t, p["read"]!, p) }  // one element's whole text: ReadText.swift
         let o = Opts(p)
         var region: CGRect?
         if let r = p["region"] as? [Any], r.count == 4, let x0 = num(r[0]), let y0 = num(r[1]),
@@ -421,7 +551,13 @@ enum Handlers {
         if kind(a) == "fill" { return (a["fields"] as? [[String: Any]] ?? []).contains(where: aimsByCoordinates) }
         // Window points (a macro step) don't come from a screenshot, so it can't be stale.
         guard a["element"] == nil, a["target"] == nil, a["units"] as? String != "pt" else { return false }
-        return ["x", "y", "coordinate", "path", "from", "to", "start", "end", "start_coordinate"].contains { a[$0] != nil }
+        return pointPath(a) != nil || ["x", "y", "coordinate", "from", "to", "start", "end", "start_coordinate"].contains { a[$0] != nil }
+    }
+
+    /// A drag's `path` ([[x,y], …]); nil for a menu's (["View", "Toggle Thing"]) or an open's (a file).
+    nonisolated static func pointPath(_ a: [String: Any]) -> [Any]? {
+        guard let path = a["path"] as? [Any], path.contains(where: { point($0) != nil }) else { return nil }
+        return path
     }
 
     nonisolated static func needsCoordinates(_ a: [String: Any]) -> Bool {
@@ -448,6 +584,72 @@ enum Handlers {
         }
     }
 
+    /// Whether the end of a batch gives a menu time to come up (`closeLeftOpenMenu`) after its last action
+    /// (`combo`: keys typed into a web page's search box, whose suggestions come a moment later). Not after
+    /// navigate: it has waited for its page, and its Return closed the address bar's suggestions (a
+    /// screenshot still waits as long as it did: the page may be drawing itself). Nor after a close_window
+    /// whose window is gone (`gone`): there's nothing left to open one over.
+    nonisolated static func menuWait(_ last: [String: Any]?, combo: Bool, gone: Bool = false) -> Bool {
+        guard let last else { return combo }
+        if gone, closes(last) { return false }
+        return combo || mayOpen(last) && !navigates(last)
+    }
+
+    nonisolated static func navigates(_ a: [String: Any]?) -> Bool { a.map { ["navigate", "goto", "go_to"].contains(kind($0)) } == true }
+
+    /// How long `act` sleeps before its first settle frame, from `now` (after the menu check; `quiet`: the
+    /// last input). Where it waits in full (`waitsInFull`): settle_ms, and after navigate, no sooner than
+    /// the skipped menu poll's 0.4 s plus settle_ms. Elsewhere settle_ms from the last input.
+    nonisolated static func firstFrameWait(full: Bool, navigated: Bool, settle: Double, quiet: Double, now: Double) -> Double {
+        full ? max(settle, navigated ? quiet + 0.4 + settle - now : 0) : quiet + settle - now
+    }
+
+    nonisolated static func closes(_ a: [String: Any]?) -> Bool { a.map { ["close_window", "close"].contains(kind($0)) } == true }
+
+    /// An action as `perform` runs it: the batch's last one is marked `_last` when the end of the batch looks
+    /// for a menu after it as long as `AX.choose` would (`menuWait`; `menuLook`: not in foreground mode,
+    /// which skips that look). A select, or a pop-up's click with item, then doesn't wait for its menu
+    /// itself. Mid-batch it does: the check between actions doesn't wait. Keys starting with "_" are
+    /// puter-use's own (`_last`, `_node`, `_pointer`): ones a client sent are dropped first (`external`).
+    nonisolated static func marked(_ a: [String: Any], last: Bool, menuLook: Bool) -> [String: Any] {
+        var m = external(a)
+        if last, menuLook, menuWait(a, combo: false) { m["_last"] = true }
+        return m
+    }
+
+    /// An action without the internal keys a client may have put in it (starting with "_"), in fill's
+    /// fields and submit too.
+    nonisolated static func external(_ a: [String: Any]) -> [String: Any] {
+        func clean(_ d: [String: Any]) -> [String: Any] { d.filter { !$0.key.hasPrefix("_") } }
+        var m = clean(a)
+        if let fields = m["fields"] as? [[String: Any]] { m["fields"] = fields.map(clean) }
+        if let submit = m["submit"] as? [String: Any] { m["submit"] = clean(submit) }
+        return m
+    }
+
+    /// How long an act with no screenshot waits before looking for a window its actions opened (`act`):
+    /// none if nothing ran (there's nothing to follow), 200 ms if something that ran may open one (or held
+    /// keys down: key_down cmd, then n, is a shortcut), else a short gap for the app to catch up before the
+    /// caller's next request. An action that failed partway counts as run: it may have pressed something.
+    nonisolated static func followWait(_ actions: [[String: Any]], done: Int, failed: Bool) -> Double {
+        guard done > 0 else { return 0 }
+        let ran = actions.prefix(failed ? done + 1 : done)
+        return ran.contains { mayOpen($0) || ["key_down", "keydown"].contains(kind($0)) } ? 0.2 : 0.05
+    }
+
+    enum Ending { case status, firstLook, settled }
+
+    /// What an act returns at its end: no image with screenshot "never", or when nothing ran (the error
+    /// alone; a stop shows the window, though). But on a first look whose first action failed, the window
+    /// it was going to be shown anyway, so the agent can aim from it. Else a settled screenshot if it changed,
+    /// as when the batch moved to a new window (`moved`, then failed): that one is the agent's now.
+    nonisolated static func ending(wantShot: Bool, always: Bool, done: Int, stopped: Bool, failed: Bool,
+                                   firstLook: Bool, moved: Bool = false) -> Ending {
+        guard wantShot else { return .status }
+        if done > 0 || always || stopped || moved { return .settled }
+        return firstLook && failed ? .firstLook : .status
+    }
+
     nonisolated static let keyboardActions: Set<String> = [
         "type", "type_text", "keypress", "key", "press_key", "hotkey", "key_down", "keydown", "key_up", "keyup",
         "hold_key", "hold", "fill", "navigate", "goto", "go_to", "paste",
@@ -455,6 +657,37 @@ enum Handlers {
 
     /// Actions that act on the app's keyboard focus: keys (including the modifiers a click or drag holds)
     /// and menu commands, which act on the focused window. That window has to be the app's key one first.
+    enum KeyPrimer: Equatable { case none, fromAgentWindow, freshHold }
+
+    /// Whether a keyboard act on a held background app spends a click on its window, given the window AX
+    /// says has the app's keyboard. Another of the agent's own windows: forced, at the start, to move it here.
+    /// None, or this one, on a new hold (`Hold.fresh`): AX still names the window, but AppKit has no key
+    /// window, so key equivalents go nowhere; that click waits for the first key (`primeKeys`). A window of
+    /// the user's: never (guardKeyboard stops the keys instead).
+    nonisolated static func keyPrimer(focused: CGWindowID?, wid: CGWindowID, fresh: Bool,
+                                      agentWindows: Set<CGWindowID>) -> KeyPrimer {
+        if let focused, focused != wid { return agentWindows.contains(focused) ? .fromAgentWindow : .none }
+        return fresh ? .freshHold : .none
+    }
+
+    /// Whether keys or a menu command going to `r` now need a new hold's click first (see `primeKeys`).
+    static func keysNeedPrimer(_ r: Route) -> Bool {
+        guard !r.foreground, r.primer, r.wid != 0, Hold.held[r.pid] == r.wid, Hold.fresh.contains(r.pid) else { return false }
+        return keyPrimer(focused: AX.focusedWindow(pid: r.pid), wid: r.wid, fresh: true, agentWindows: agentWindows) == .freshHold
+    }
+
+    /// On a new hold, the primer's click makes the window key, just before the first key or menu command
+    /// goes out: after that action's checks (policy, confirm, guardKeyboard), so a batch that stops before
+    /// any key clicks nothing. Once per hold: the click ends `Hold.fresh`.
+    static func primeKeys(_ r: Route) async {
+        guard keysNeedPrimer(r) else { return }
+        await Input.primer(r)
+        await Input.afterPrimer()
+    }
+
+    /// Thrown by a menu command's check on a new hold, so its click goes after the check and before the press.
+    struct PrimeFirst: Error {}
+
     nonisolated static func actsOnKeyboardFocus(_ a: [String: Any]) -> Bool {
         if keyboardActions.contains(kind(a)) || kind(a) == "menu" || kind(a) == "menu_item" { return true }
         guard a["keys"] != nil || a["modifiers"] != nil else { return false }
@@ -482,12 +715,18 @@ enum Handlers {
             out["text"] = full.map { $0.isEmpty ? (o.interactive
                 ? "(no interactive elements in this window; try text: true, or find)"
                 : "(no accessibility elements in this window)") : $0 } ?? "(no accessibility tree for this window)"
-            if full != nil, within == nil, let lines = AX.registries[w.id]?.lines {
-                let sent = Session.current.outlines[w.id]
-                if diff, let sent, sent.interactive == o.interactive, let changes = outlineChanges(sent.lines, lines) {
-                    out["text"] = changes
+            if full != nil, within == nil, let reg = AX.registries[w.id] {
+                if reg.cutShort {
+                    // Only part of the window: sent whole (a diff would list the rest as gone), and not kept to
+                    // diff the next one against (it would list the rest as new).
+                    Session.current.outlines[w.id] = nil
+                } else {
+                    if diff, let sent = Session.current.outlines[w.id], sent.interactive == o.interactive,
+                       let changes = outlineChanges(sent.lines, reg.lines) {
+                        out["text"] = changes
+                    }
+                    Session.current.outlines[w.id] = (o.interactive, reg.lines)
                 }
-                Session.current.outlines[w.id] = (o.interactive, lines)
             }
         }
         return out
@@ -515,7 +754,9 @@ enum Handlers {
         if text { acc = accessibility(t, o, within: zoom ? shot.rect : nil, diff: diff) }
         var image = shot.image
         if o.marks, case .window(let w) = t {
-            if !text || !o.interactive {  // number what can be acted on (this outline isn't sent)
+            // Number what can be acted on (this outline isn't sent). Not when the outline just sent ran out of
+            // time: this would too; its numbers are marked.
+            if !text || !o.interactive, !(text && AX.registry(w.id).cutShort) {
                 _ = AX.outline(pid: w.pid, wid: w.id, within: zoom ? shot.rect : nil, maxChars: 40_000, interactive: true)
             }
             let reg = AX.registry(w.id)
@@ -576,13 +817,20 @@ enum Handlers {
     }
 
     /// Resolve an action's target point: an element (by number or by what it says) or screenshot
-    /// coordinates. Text with no accessibility element is looked for on screen.
-    static func actionPoint(_ a: [String: Any], _ t: Target, required: Bool = true) async throws -> (CGPoint, AX.Node?)? {
+    /// coordinates. Text with no accessibility element is looked for on screen. `vet`: the policy's checks on
+    /// the element, run before it's scrolled into view (a stop for the user's OK leaves everything as it was).
+    static func actionPoint(_ a: [String: Any], _ t: Target, required: Bool = true,
+                            vet: ((AX.Node) throws -> Void)? = nil) async throws -> (CGPoint, AX.Node?)? {
+        // The element a compound action (type, fill) has just looked up and checked (internal `_node`): that
+        // one, not a second search that could find another on a page that re-rendered.
+        if let n = a["_node"] as? AX.Node {
+            try reachable(n.element, aimName(a))
+            return try await aimAt(n, aimName(a), vet: vet)
+        }
         if let idx = num(a["element"]), case .window(let w) = t {
             let n = try numbered(w, Int(idx), t)
             try reachable(n.element, "element \(Int(idx))")
-            guard let c = AX.center(n) else { throw HelperError("element \(Int(idx)) has no position") }
-            return (c, n)
+            return try await aimAt(n, "element \(Int(idx))", vet: vet)
         }
         if let v = a["target"] {
             // A macro step names what it pressed and where it was: see Macros.spot.
@@ -592,18 +840,23 @@ enum Handlers {
                 throw HelperError("\(try spec(v).description) isn't where it was when the macro was saved (others show the "
                     + "same), so nothing was pressed")
             }
+            if saved == nil, a["spot"] as? Bool == true { throw Macros.noSpot(v) }
+            let n: AX.Node
             do {
-                let (id, n) = try findOne(v, t)
-                guard let c = AX.center(n) else { throw HelperError("element \(id) has no position") }
-                return (c, n)
+                let (id, found) = try findOne(v, t)
+                guard AX.center(found) != nil else { throw HelperError("element \(id) has no position") }
+                n = found
             } catch {
                 if let (x, y) = saved, !(error is Behind) {
                     if let (p, n) = try Macros.spot(v, t, at: try toGlobal(t, x, y, a)) { return (p, n) }
                     throw HelperError("\(error) (a macro step: what it pressed isn't where it was, so nothing was pressed)")
                 }
-                guard error is NotFound else { throw error }
-                return (try await readOffScreen(v, t), nil)
+                guard let miss = error as? NotFound else { throw error }
+                do { return (try await readOffScreen(v, t), nil) } catch let e as HelperError where !miss.hint.isEmpty {
+                    throw HelperError("\(e)\(miss.hint)")  // with what's off screen showing it, and what's near it
+                }
             }
+            return try await aimAt(n, try spec(v).description, vet: vet)  // scrolled to first if it's out of view
         }
         if let x = num(a["x"]), let y = num(a["y"]) { return (try toGlobal(t, x, y, a), nil) }
         if let pt = point(a["coordinate"]) { return (try toGlobal(t, pt.x, pt.y, a), nil) }
@@ -628,7 +881,8 @@ enum Handlers {
             var count = int(a["count"] ?? a["clicks"], 1)
             if type == "double_click" { count = 2 }
             if type == "triple_click" { count = 3 }
-            guard let (aimed, node) = try await actionPoint(a, t) else { return }
+            let pressed = button
+            guard let (aimed, node) = try await actionPoint(a, t, vet: { try clickChecks(a, $0, button: pressed) }) else { return }
             var p = aimed
             var r = try route(t, at: p, foreground: foreground)
             if !flags.isEmpty { try guardKeyboard(r) }  // its modifiers go to whichever window has the keyboard
@@ -652,7 +906,7 @@ enum Handlers {
                 await pointer.move(to: p, r)
                 await Input.sleep(clickTiming.aim())
                 pointer.click()
-                let chose = try await AX.choose(popup, want) { try Policy.checkItem(a, $0) }
+                let chose = try await AX.choose(popup, want, menuLater: a["_last"] as? Bool == true) { try Policy.checkItem(a, $0) }
                 if AX.menuKey(chose) != AX.menuKey(want) { notes.append("chose \"\(chose)\"") }
                 return
             }
@@ -734,7 +988,10 @@ enum Handlers {
             let button = (a["button"] as? String)?.lowercased() ?? "left"
             var p: CGPoint
             var node: AX.Node?
-            if let (q, n) = try await actionPoint(a, t, required: false) { (p, node) = (q, n) } else {
+            let vet: (AX.Node) throws -> Void = { n in
+                if button == "left" { try Policy.checkPress(a, node: n, at: nil, pid: AX.pidOf(n.element) ?? 0) }
+            }
+            if let (q, n) = try await actionPoint(a, t, required: false, vet: vet) { (p, node) = (q, n) } else {
                 guard let tip = pointer.tip else { throw HelperError("mouse_down needs x,y or element") }
                 p = tip
             }
@@ -744,6 +1001,7 @@ enum Handlers {
             await Input.primer(r)
             await pointer.move(to: p, r)
             await Input.sleep(clickTiming.aim())
+            await Input.afterPrimer()  // its keys and button go down next
             // Its keys stay down with the button, as a hand holds shift through a shift-drag.
             if !Keys.splitCombo(a["keys"] ?? a["modifiers"]).isEmpty { try guardKeyboard(r) }
             for k in Keys.splitCombo(a["keys"] ?? a["modifiers"]) where !run.heldKeys.contains(where: { $0.name == Keys.normalize(k) }) {
@@ -798,6 +1056,7 @@ enum Handlers {
             let mods = await Input.pressModifiers(flags, r, typist: clickTiming)
             let there = await pointer.move(to: pts[0], r)
             await Input.sleep(clickTiming.aim())
+            await Input.afterPrimer()
             if !there || Connection.hungUp {  // given up before the button went down
                 await Connection.ungated { await Input.releaseModifiers(mods, r, typist: clickTiming) }
                 throw Cancelled()
@@ -903,6 +1162,7 @@ enum Handlers {
             if type.hasPrefix("hold"), !(0...10).contains(seconds) {
                 throw HelperError("hold_key holds for at most 10 s (ms 0-10000)")
             }
+            await primeKeys(r)
             for (i, k) in keys.enumerated() {
                 if i > 0 { await Input.sleep(typist.modifierLead()) }
                 try run.keyDown(k, r)
@@ -920,7 +1180,19 @@ enum Handlers {
             let menuRoute = try route(t, at: nil, foreground: foreground)
             try guardKeyboard(menuRoute)
             let path = AX.menuPath(a["item"] ?? a["path"] ?? a["text"])
-            let (chosen, shortcut) = try AX.pressMenu(pid: pid, path: path) { try Policy.checkItem(a, $0) }
+            // On a new hold, the window's click (see primeKeys) goes once the item has passed its check.
+            let prime = keysNeedPrimer(menuRoute)
+            let (chosen, shortcut): (String, String?)
+            do {
+                (chosen, shortcut) = try AX.pressMenu(pid: pid, path: path) { title in
+                    try Policy.checkItem(a, title)
+                    if prime { throw PrimeFirst() }
+                }
+            } catch is PrimeFirst {
+                await primeKeys(menuRoute)
+                (chosen, shortcut) = try AX.pressMenu(pid: pid, path: path) { try Policy.checkItem(a, $0) }
+            }
+            run.ranMenu = path.count == 1 ? chosen : nil  // a macro saves the path a name alone ran (`Macros.ran`)
             if let shortcut {
                 // A background app's menus are only brought up to date when opened, so "disabled" may be
                 // stale; its shortcut is checked by the app as it's pressed.
@@ -966,10 +1238,14 @@ enum Handlers {
             guard let n = try elementNode(a, t) else { throw HelperError("set_value needs element or target") }
             if Policy.isSecure(n.element), !Policy.config.allowSecureFields { throw Policy.secureRefusal() }
             let text = a["value"] as? String ?? a["text"] as? String ?? ""
-            if let c = AX.center(n) { await pointer.move(to: c, try route(t, at: c, foreground: false)) }
+            let shown = try await reveal(n, aimName(a))  // scrolled to first if it's out of view, as for every action
+            if let c = shown.map({ CGPoint(x: $0.midX, y: $0.midY) }) ?? AX.center(n) {
+                await pointer.move(to: c, try route(t, at: c, foreground: false))
+            }
             if !AX.setValue(n, text) { throw HelperError("the \(n.name) did not accept a value") }
         case "focus":
             guard let n = try elementNode(a, t) else { throw HelperError("focus needs element or target") }
+            _ = try await reveal(n, aimName(a))
             if !AX.focus(n) { throw HelperError("the \(n.name) can't take focus") }
         case "ax", "secondary", "perform":
             guard let n = try elementNode(a, t) else { throw HelperError("\(type) needs element or target") }
@@ -978,7 +1254,13 @@ enum Handlers {
             if ["press", "axpress", "confirm", "axconfirm", "pick", "axpick"].contains(name.lowercased()), let pid = pid(t) {
                 try Policy.checkPress(a, node: n, at: nil, pid: pid)
             }
-            if let c = AX.center(n) { await pointer.move(to: c, try route(t, at: c, foreground: false)) }
+            let shown = try await reveal(n, aimName(a))
+            if shown != nil, ["scrolltovisible", "scrollto", "scrollintoview", "reveal"].contains(name.lowercased().filter(\.isLetter)) {
+                return  // what it asked for is done (AppKit's controls don't take the action itself)
+            }
+            if let c = shown.map({ CGPoint(x: $0.midX, y: $0.midY) }) ?? AX.center(n) {
+                await pointer.move(to: c, try route(t, at: c, foreground: false))
+            }
             if AX.perform(n, name) {
                 pointer.click()
             } else {
@@ -1014,8 +1296,9 @@ enum Handlers {
         case "close_window", "close":
             guard case .window(let w) = t else { throw HelperError("close_window needs a window target") }
             if !AX.closeWindow(pid: w.pid, wid: w.id) { throw HelperError("window has no close button") }
-            try await Task.sleep(nanoseconds: 300_000_000)
-            if Windows.info(w.id)?.onScreen == true {
+            // Gone at once or in a moment; still there after 0.3 s, it's asking something.
+            let gone = try await Run.pollUntil(floor: 0, every: 0.05, cap: 0.3) { Windows.info(w.id)?.onScreen != true }
+            if !gone {
                 notes.append("the window is still open: the app may be asking something, or keeps it (a sheet may have opened)")
             }
         case "screenshot":
@@ -1084,6 +1367,7 @@ enum Handlers {
     static func press(_ keys: [String], _ r: Route) async throws {
         try Connection.check()
         try guardKeyboard(r)
+        await primeKeys(r)
         if !r.foreground, Windows.isChromium(r.pid), NSRunningApplication(processIdentifier: r.pid)?.isActive != true,
            let title = AX.pressMenuShortcut(pid: r.pid, keys: keys) {
             notes.append("\(keys.joined(separator: "+")) → menu \"\(title)\"")
@@ -1092,7 +1376,7 @@ enum Handlers {
         try await Input.keyCombo(keys, r, typist: typist)
     }
 
-    /// Type `text` like a person: up to about a sentence is typed; a longer stretch is pasted (as people
+    /// Type `text` like a person: up to `pasteOver` characters is typed; a longer stretch is pasted (as people
     /// do with long text), borrowing the clipboard and giving it back. Newlines and tabs are always the
     /// Return and Tab keys, so a "\n" still submits a field even between pasted paragraphs.
     ///
@@ -1143,8 +1427,10 @@ enum Handlers {
                     + "Ask the user; if they agree, type the rest with \"confirm\": true")
             }
             try Connection.check()
-            // The user may have taken the keyboard since the last stretch (a long text takes a while).
-            try guardKeyboard(r)
+            // The user may have taken the keyboard since the last stretch (a long text takes a while, and
+            // its last key coming up isn't checked): then what went out is said, as when typing stops.
+            do { try guardKeyboard(r) } catch where sent > 0 { throw typingInterrupted(sent, r) }
+            await primeKeys(r)
             if i > 0 { await Input.sleep(typist.between()) }
             let end = s.end.map { String($0) } ?? ""
             let quick = addressBar && i == 0  // (a Return after it leaves the address bar)
@@ -1294,6 +1580,7 @@ enum Handlers {
             do { try Policy.checkAction(a, pid: pid(t)) } catch {
                 throw HelperError("nothing was run: action \(base + i + 1) (\(kind(a))) is \(error)")
             }
+            if let why = unknownKeys(a) { throw HelperError("nothing was run: action \(base + i + 1) (\(kind(a))) \(why)") }
         }
         // Continuing after the user's OK: the steps recorded before the stop (never with a confirm).
         var recorded: [[String: Any]] = (p["recorded"] as? [[String: Any]] ?? []).map { step in
@@ -1310,13 +1597,18 @@ enum Handlers {
         var shownAtStart = false
         if case .window(let w) = t { shownAtStart = Windows.info(w.id)?.onScreen == true }
         let blind = firstLook && p["guard"] as? Bool != false && actions.contains(where: aimsByCoordinates)
+        var firstShot: (plan: CapturePlan, basis: PlanBasis?, shot: Shot)?  // shown if the first action fails (`ending`)
         if firstLook && (wantShot || actions.contains(where: needsCoordinates)) {
             // Establish the coordinate mapping (for actions that need one, like a scroll in the middle).
-            let shot = try await plan(t, region: nil, o).run()
+            let basis = PlanBasis.of(t)  // read before planning, as `settle` does
+            let start = try await plan(t, region: nil, o)
+            let shot = try await start.run()
             remember(t, shot, Signature(shot.image))
+            firstShot = (start, basis, shot)
         }
         // A picture the agent hasn't seen isn't a "before": on a first look, the result shows the window.
         var before = firstLook ? nil : meta[t.key]?.sig
+        let caretThen = firstLook ? nil : meta[t.key]?.caret  // the text cursor in that picture
         let foreground = p["foreground"] as? Bool == true
         let run = Run(target: t, foreground: foreground, guarded: p["guard"] as? Bool != false, box: o.windowBox)
         Run.active[ObjectIdentifier(run)] = (run, Session.current)
@@ -1331,7 +1623,7 @@ enum Handlers {
         pointer.enabled = p["cursor"] as? Bool != false
         pointer.speed = num(p["cursor_speed"]) ?? 1
         typist = Typist(wpm: num(p["typing_wpm"]) ?? 280)
-        pasteOver = max(0, int(p["paste_over"], 100))
+        pasteOver = max(0, int(p["paste_over"], 80))
         Trace.configure(p["trace"] as? String)
         AppCards.enabled = p["app_cards"] as? Bool != false
         var errors: [String] = []
@@ -1346,17 +1638,29 @@ enum Handlers {
         // layer it is active (and keep it so between calls, see `Hold`); the user's real focus is untouched.
         try Connection.check()
         if !foreground, case .window(let w) = t, !Hold.isFront(w.pid) {
-            if Hold.activate(pid: w.pid, wid: w.id) { try await Task.sleep(nanoseconds: 30_000_000) }
+            // Held on this window since an earlier call: the app has taken the record already, so it's sent
+            // again (it's cheap) without waiting for it.
+            let wasHeld = Hold.heldSettled(pid: w.pid, wid: w.id)
+            if Hold.activate(pid: w.pid, wid: w.id), !wasHeld { try await Task.sleep(nanoseconds: 30_000_000) }
             // Keyboard input (and key equivalents like cmd+a) only reach a window AppKit considers key.
             if actions.contains(where: { actsOnKeyboardFocus($0) }) {
+                // Held here and key already: sent again too, with no wait (and nothing to move).
+                let wasKey = wasHeld && AX.focusedWindow(pid: w.pid) == w.id
                 SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
-                try await Task.sleep(nanoseconds: 30_000_000)
-                // Not taken (Firefox ignores it) while another of the agent's own windows has the keyboard: a
-                // click just outside this one's content moves it, as a click on the window would. Never from
-                // a window of the user's: their keyboard stays where they left it (guardKeyboard says so).
-                if let key = AX.focusedWindow(pid: w.pid), key != w.id, agentWindows.contains(key) {
-                    await Input.primer(try route(t, at: nil, foreground: false), force: true)
-                    try await Run.pause(0.1)
+                if !wasKey {
+                    try await Task.sleep(nanoseconds: 30_000_000)
+                    switch keyPrimer(focused: AX.focusedWindow(pid: w.pid), wid: w.id, fresh: Hold.fresh.contains(w.pid),
+                                     agentWindows: agentWindows) {
+                    case .fromAgentWindow:
+                        // Not taken (Firefox ignores it) while another of the agent's own windows has the keyboard: a
+                        // click just outside this one's content moves it, as a click on the window would. Never from
+                        // a window of the user's: their keyboard stays where they left it (guardKeyboard says so).
+                        await Input.primer(try route(t, at: nil, foreground: false), force: true)
+                        await Input.afterPrimer()  // the keyboard gets the primer's whole gap and the pause to move
+                        try await Run.pause(0.1)
+                    case .freshHold, .none:
+                        break  // a new hold's click waits for the first key or menu command (`primeKeys`)
+                    }
                 }
             }
         } else {
@@ -1368,11 +1672,16 @@ enum Handlers {
             if !foreground, case .window(let w) = t, actions.contains(where: { actsOnKeyboardFocus($0) }),
                let key = AX.focusedWindow(pid: w.pid), key != w.id, agentWindows.contains(key), Input.userQuiet() {
                 await Input.primer(try route(t, at: nil, foreground: false), force: true)
+                await Input.afterPrimer()
                 try await Run.pause(0.1)
                 if AX.focusedWindow(pid: w.pid) == w.id {
                     notes.append("moved \(Policy.appName(w.pid))'s keyboard here from your other window #\(key)")
                 }
             }
+        }
+        // wait_for {change} compares with the window as it was before anything ran (taken only for such a batch).
+        if case .window(let w) = t, actions.contains(where: waitsForChange) {
+            run.changeBase = (try? await changeLook(t)).map { (wid: w.id, sig: $0) }
         }
         var stopped: String?
         var confirm: [String: Any]?
@@ -1411,7 +1720,7 @@ enum Handlers {
                 try Policy.checkAction(a, pid: pid(run.target))
                 try await Policy.$running.withValue(a) {
                     // Saved as it stands now: element numbers and pixels only mean something until the window changes.
-                    let step = saveAs == nil ? nil : Macros.record(a, run.target)
+                    let step = saveAs == nil ? nil : Macros.record(external(a), run.target)
                     // Keys pressed with a mouse button down: the hand on the mouse still trembles meanwhile.
                     let tremor: Task<Void, Never>? = run.heldButton.flatMap { held in
                         keyboardActions.contains(kind(a)) || kind(a) == "menu"
@@ -1421,9 +1730,11 @@ enum Handlers {
                         tremor?.cancel()
                         if tremor != nil { pointer.endHold() }
                     }
-                    try await perform(a, run)
+                    // What's over the window before it, so `settle` sees a sheet the action made at once.
+                    let overBefore = i < actions.count - 1 && mayOpen(a) ? run.baseline() : nil
+                    try await perform(marked(a, last: i == actions.count - 1, menuLook: !foreground && pid(run.target) != nil), run)
                     try Connection.check()  // given up partway: whether this one took effect isn't known
-                    if let step { recorded.append(step) }
+                    if let step { recorded.append(Macros.ran(step, menu: run.ranMenu)) }
                     done += 1
                     Connection.current?.work.done = done
                     Connection.current?.work.steps.append(brief(a))
@@ -1431,7 +1742,7 @@ enum Handlers {
                         if let (button, r, _) = run.heldButton {  // a hand holding the button down never quite stops
                             await pointer.hold(0.06, r, button: button)
                         } else if mayOpen(a) {
-                            try await run.settle()
+                            try await run.settle(since: overBefore)
                             // A menu left open would take the next actions' keys (and the user's): closed now.
                             if !foreground, let pid = pid(run.target) {
                                 await closeLeftOpenMenu(pid: pid, wait: false, afterKeys: typedIntoField(a, pid),
@@ -1479,13 +1790,16 @@ enum Handlers {
             await Connection.ungated {
                 _ = await run.releaseAll(clickTiming, cancelled: true)
                 if !foreground, let pid = pid(run.target) {  // not remembered: the agent never hears of it
-                    await closeLeftOpenMenu(pid: pid, wait: true, route: try? route(run.target, at: nil, foreground: false),
-                                            remember: false)
+                    await closeLeftOpenMenu(pid: pid, wait: cancelWait(actions, done: done),
+                                            route: try? route(run.target, at: nil, foreground: false), remember: false)
                 }
             }
             throw Cancelled()
         }
         let released = await run.releaseAll(clickTiming)
+        // The last input: settle_ms counts from here (the menu check and the work below are part of it), or
+        // from a menu closed just now.
+        var quiet = ProcessInfo.processInfo.systemUptime
         if !foreground, let pid = pid(run.target) {
             let last = done > 0 && actions.indices.contains(done - 1) ? actions[done - 1] : nil
             let typed = typedIntoField(last, pid)
@@ -1493,8 +1807,12 @@ enum Handlers {
             let combo = typed && AX.focusedElement(pid: pid).map {
                 AX.value($0, kAXRoleAttribute) as? String == "AXComboBox" && AX.webArea(of: $0) != nil
             } == true
-            await closeLeftOpenMenu(pid: pid, wait: (last.map(mayOpen) ?? false) || combo, afterKeys: typed,
-                                    route: try? route(run.target, at: nil, foreground: false))
+            var gone = false  // close_window closed it (checked again below, before saying so)
+            if closes(last), case .window(let w) = run.target { gone = Windows.info(w.id)?.onScreen != true }
+            if await closeLeftOpenMenu(pid: pid, wait: menuWait(last, combo: combo, gone: gone), afterKeys: typed,
+                                       route: try? route(run.target, at: nil, foreground: false)) {
+                quiet = ProcessInfo.processInfo.systemUptime
+            }
         }
         if !released.isEmpty { notes.append("let go of \(released.joined(separator: ", ")) (still held at the end)") }
         if let saveAs {
@@ -1511,8 +1829,15 @@ enum Handlers {
         if run.moved { before = nil }
         func followNewWindow() async -> Bool {
             guard done > 0, case .window(let w) = target,
-                  let nw = await follow(w, visibleBefore: run.visibleBefore, existedBefore: run.existedBefore, box: o.windowBox)
+                  let found = await follow(w, visibleBefore: run.visibleBefore, existedBefore: run.existedBefore,
+                                           box: o.windowBox, arrange: run.arrange(w.pid))  // only w.pid's windows
             else { return false }
+            let nw = found.window
+            guard found.followed else {  // may be the user's (noted): not looked at again, nor counted as one the batch opened
+                run.visibleBefore.insert(nw.id)
+                run.existedBefore.insert(nw.id)
+                return false
+            }
             target = .window(nw)
             agentWindows.insert(nw.id)
             Connection.current?.work.opened.append(nw.id)
@@ -1536,11 +1861,30 @@ enum Handlers {
                 return out
             }
         }
-        // Nothing ran (the first action failed): the error alone is enough. A stop shows the window, though.
-        if !wantShot || (done == 0 && !always && stopped == nil) {
+        let end = ending(wantShot: wantShot, always: always, done: done, stopped: stopped != nil,
+                         failed: !errors.isEmpty, firstLook: firstLook, moved: run.moved)
+        if end == .firstLook, let first = firstShot {
+            // Taken again (one capture): the failed action, or a wait_for that timed out, may have changed the
+            // window since. With the start's plan, unless something opened over the window or it moved: then
+            // a new plan, which the mapping (`result`) follows.
+            let again = PlanBasis.of(t) == first.basis ? first.plan : try? await plan(t, region: nil, o)
+            let shot = (try? await again?.run()) ?? first.shot
+            if let res = try? await result(t, shot, o, zoom: false, text: p["text"] as? Bool == true, diff: true) {
+                if !notes.isEmpty { out["notes"] = notes }
+                out.merge(res) { _, new in new }
+                if let note = partShown(t, shot) { out["notes"] = (out["notes"] as? [String] ?? []) + [note] }
+                out["changed"] = true
+                return out
+            }
+        }
+        if end != .settled {
             // No image: the agent still hasn't seen the window, so its coordinates stay unanchored.
             if firstLook { meta[t.key] = nil }
-            try await Task.sleep(nanoseconds: 200_000_000)
+            do { try await Run.pause(followWait(actions, done: done, failed: !errors.isEmpty)) } catch {
+                // The client gave up meanwhile: as above, the note for its lost result names what opened.
+                if let w = Connection.current?.work { Connection.current?.work.opened += openedBy(run).filter { !w.opened.contains($0) } }
+                throw error
+            }
             _ = await followNewWindow()
             if !notes.isEmpty { out["notes"] = notes }
             out["window"] = describe(target)
@@ -1548,22 +1892,78 @@ enum Handlers {
             return out
         }
 
-        let settle = min(max(num(p["settle_ms"]) ?? 250, 0), 10000)
-        await Input.sleep(settle / 1000)
+        // settle_ms after the last input, then still frames. Ones that show a change from what the agent last
+        // saw end the wait at once; ones that don't go on until the second frame the wait used to take (all of
+        // settle_ms after the menu check, then a frame, then 0.15 s), so "no visible change" comes no sooner.
+        // Web pages, Electron apps and the screen wait as before: there a hover or focus ring changes the
+        // picture before the page answers.
+        let settle = min(max(num(p["settle_ms"]) ?? 250, 0), 10000) / 1000
+        let full = waitsInFull(run.target), now = ProcessInfo.processInfo.systemUptime
+        func early() -> Early? {
+            full ? nil : Early(before: before, start: now + settle, wait: { try await Task.sleep(nanoseconds: UInt64($0 * 1e9)) })
+        }
+        var shadow: (sig: Signature?, at: Double)?
+        // After navigate there's no menu poll (`menuWait`), but a page may still be drawing itself after it
+        // says it's loaded: its first frame comes no sooner than with the poll (0.4 s), as before.
+        let navigated = !foreground && navigates(done > 0 && actions.indices.contains(done - 1) ? actions[done - 1] : nil)
+        if full, Trace.on, !navigated, min(settle, now - quiet) > 0.2 {
+            // Trace only: the frame an early end would have returned, to measure whether it's safe here too.
+            await Input.sleep(quiet + settle - now)
+            shadow = (await earlyFrame(target, o, before: before), ProcessInfo.processInfo.systemUptime)
+            await Input.sleep(now + settle - ProcessInfo.processInfo.systemUptime)
+        } else {
+            await Input.sleep(firstFrameWait(full: full, navigated: navigated, settle: settle, quiet: quiet, now: now))
+        }
         let followed = await followNewWindow()
         var shot: Shot, sig: Signature
+        var watched: Double?  // how long it went on looking for a new window after an early end (trace)
         do {
-            (shot, sig) = try await settledShot(target, o)
-            if !followed, await followNewWindow() { (shot, sig) = try await settledShot(target, o) }  // slower apps
+            let e = early()
+            (shot, sig) = try await settledShot(target, o, early: e)
+            if !followed {  // slower apps
+                var found = await followNewWindow()
+                // An early end comes before the wait used to look again: after an action that may open a window
+                // a moment later, keep looking until then.
+                if !found, let e, opensWindow(done > 0 ? actions[done - 1] : nil) {
+                    let began = ProcessInfo.processInfo.systemUptime
+                    found = try await watchForWindow(until: e.lookedAgain, look: followNewWindow, pause: { try await Run.pause(0.05) })
+                    watched = ProcessInfo.processInfo.systemUptime - began
+                }
+                if found { (shot, sig) = try await settledShot(target, o, early: early()) }
+            }
         } catch {
             if case .window(let w) = target, Windows.info(w.id) != nil { throw error }
             out["closed"] = "\(error)"
             current = nil
             return out
         }
+        if Trace.on {
+            var line: [String: Any] = ["k": "settled", "after": ProcessInfo.processInfo.systemUptime - quiet, "full": full]
+            if let watched { line["watched"] = watched }
+            if let shadow, target.key == run.target.key {
+                line["early"] = shadow.sig != nil  // the early end would have stopped at its second frame
+                if let s = shadow.sig {
+                    line["early_after"] = shadow.at - quiet
+                    line["early_diff"] = s.diff(sig, outW: 1, outH: 1)?.fraction ?? 0  // vs the frame returned
+                }
+            }
+            Trace.log(line)
+        }
         if !notes.isEmpty { out["notes"] = notes }
-        let change = before.flatMap { sig.diff($0, outW: shot.image.width, outH: shot.image.height) }
+        var change = before.flatMap { sig.diff($0, outW: shot.image.width, outH: shot.image.height) }
             ?? (before == nil ? (CGRect(x: 0, y: 0, width: shot.image.width, height: shot.image.height), 1) : nil)
+        let caretNow = caretThen != nil && target.key == t.key ? caret(target) : nil
+        // The text cursor blinked, and that's all: nothing the agent needs to see.
+        if change != nil, let b = before, let then = caretThen, let now = caretNow, blinked(sig, from: b, then: then, now: now, shot, target) {
+            change = nil
+            Trace.log(["k": "blink"])
+        }
+        // The cursor moved (a click in the text, an arrow key) but shows in neither picture, being between
+        // blinks: say so rather than drop it. (When it shows, that's a change, with the picture.)
+        if change == nil, let then = caretThen, let now = caretNow, now.moved(from: then) {
+            out["notes"] = (out["notes"] as? [String] ?? []) + ["the text cursor moved: it's now \(now.at) characters into the text"]
+            meta[t.key]?.caret = now  // the agent knows: its blinking there isn't a change
+        }
         if change == nil && !always && stopped == nil {
             Run.look(target)  // what the agent last saw still holds
             out["changed"] = false
@@ -1595,29 +1995,172 @@ enum Handlers {
     }
 
     /// Capture `t` once the UI has settled: re-capture until two consecutive frames match (ignoring tiny
-    /// blips like a caret), for at most ~0.9 s.
-    static func settledShot(_ t: Target, _ o: Opts) async throws -> (Shot, Signature) {
-        let plan = try await self.plan(t, region: nil, o)
-        var shot = try await plan.run()
+    /// blips like a caret), for at most ~0.9 s. A window that opens over it meanwhile (a dialog, panel or
+    /// popover), or the window moving, gets a new capture plan: the old one would leave it out. With
+    /// `early`, frames that show no change from `before` take longer to count as settled (see `settle`).
+    static func settledShot(_ t: Target, _ o: Opts, early: Early? = nil) async throws -> (Shot, Signature) {
+        try await settle(basis: { PlanBasis.of(t) }, makePlan: { try await plan(t, region: nil, o) },
+                         capture: { try await $0.run() }, pause: { try await Task.sleep(nanoseconds: 150_000_000) },
+                         early: early)
+    }
+
+    /// `act`'s early end, for `settle`.
+    final class Early {
+        /// What the agent last saw (nil: nothing, so any still frames are the answer).
+        let before: Signature?
+        /// When the wait used to take its first frame: all of settle_ms after the menu check (by `clock`).
+        let start: Double
+        /// A pause of a given length (s), to take a frame right when the wait used to take its second.
+        let wait: (Double) async throws -> Void
+        /// Set by `settle`: when the wait used to end at the soonest (its second frame taken), which is when
+        /// `act` used to look for a new window a second time.
+        var lookedAgain = 0.0
+
+        init(before: Signature?, start: Double, wait: @escaping (Double) async throws -> Void) {
+            (self.before, self.start, self.wait) = (before, start, wait)
+        }
+    }
+
+    /// `settledShot`'s loop, apart from the screen (unit-tested). Before each capture `basis` is read
+    /// again, and if it changed, `makePlan` makes a new plan. The shot and signature returned come from
+    /// the same plan, so the image, its change box and its coordinate mapping agree.
+    /// With `early` (`act`): matching frames that both show a change from `before` end the loop as ever.
+    /// Ones that don't (they look like it, a caret aside) end it only from when the loop used to take its
+    /// second frame: `start`, plus what this first plan and capture took, plus 0.15 s. Until then it keeps
+    /// looking, past the usual seven frames if need be, with a frame timed to land right then (the pause
+    /// before it stretched to at most 0.3 s). So "no visible change", or a frame only a caret tells from
+    /// `before`, comes no sooner than it did.
+    static func settle<Plan, Basis: Equatable>(
+        basis: () -> Basis, makePlan: () async throws -> Plan, capture: (Plan) async throws -> Shot,
+        pause: () async throws -> Void, early: Early? = nil,
+        clock: () -> Double = { ProcessInfo.processInfo.systemUptime }
+    ) async throws -> (Shot, Signature) {
+        let began = clock()
+        var madeFor = basis()  // read before planning: what changes while the plan is made shows up next time
+        var plan = try await makePlan()
+        let shotAt = clock()
+        var shot = try await capture(plan)
         var sig = Signature(shot.image)
-        for _ in 0..<6 {
-            try await Task.sleep(nanoseconds: 150_000_000)
-            guard let next = try? await plan.run() else { break }
+        let floor = early.map { $0.start + (clock() - began) + 0.15 } ?? 0
+        early?.lookedAgain = floor + (clock() - shotAt)  // and its second frame captured
+        let shows = { (s: Signature) in early.map { showsChange(s, from: $0.before) } ?? true }
+        var frames = 1, at = began
+        while frames < 7 || (at < floor && !shows(sig)) {
+            // Waiting for the floor: a frame right on it, not one just before it and the next well after.
+            let left = floor - clock()
+            if let early, left > 0, !shows(sig) { try await early.wait(left <= 0.3 ? left : 0.15) } else { try await pause() }
+            frames += 1
+            let now = basis()
+            let replanned = now != madeFor
+            if replanned {
+                guard let fresh = try? await makePlan() else { break }
+                (plan, madeFor) = (fresh, now)
+            }
+            let taken = clock()
+            guard let next = try? await capture(plan) else { break }
             let nsig = Signature(next.image)
-            let d = sig.diff(nsig, outW: next.image.width, outH: next.image.height)
-            shot = next
-            sig = nsig
-            if d == nil || d!.fraction < 0.002 { break }
+            let new = shows(sig) && shows(nsig)
+            let held = still(sig, nsig)
+            (shot, sig, at) = (next, nsig, taken)
+            // Settled: two matching frames of one plan, with nothing opening or closing over the window
+            // meanwhile (a sheet's window comes a moment before it's drawn).
+            if !replanned, held, basis() == madeFor, new || taken >= floor - 0.001 { break }
         }
         return (shot, sig)
+    }
+
+    /// Two frames that match, but for tiny blips like a caret.
+    nonisolated static func still(_ a: Signature, _ b: Signature) -> Bool {
+        a.diff(b, outW: b.w, outH: b.h).map { $0.fraction < 0.002 } ?? true
+    }
+
+    /// A frame that shows a change from `before` (nil: there's nothing to compare with), more than a caret
+    /// blinking in a text field: a change in a sliver at most 3 of the signature's cells wide doesn't count
+    /// (`act` still calls it a change; the early end just doesn't take it for the action's effect).
+    nonisolated static func showsChange(_ s: Signature, from before: Signature?) -> Bool {
+        guard let before else { return true }
+        guard let d = s.diff(before, outW: s.w, outH: s.h) else { return false }
+        return d.box.width > 3
+    }
+
+    /// Where `act` waits all of settle_ms after its menu check and takes the first frames that match, as it
+    /// always did: web pages (the early end isn't measured there yet) and the screen. Web pages are browsers,
+    /// Electron and other Chromium apps, Gecko apps, and any window showing one in a system web view (a mail
+    /// message, an app built on a web view).
+    static func waitsInFull(_ t: Target) -> Bool {
+        guard case .window(let w) = t else { return true }
+        if isBrowser(w.pid) || Windows.isChromium(w.pid) || Windows.isGecko(w.pid) { return true }
+        return showsWebPage(w.id) { AX.window(pid: w.pid, wid: w.id).flatMap { AX.webArea($0) } != nil }
+    }
+
+    /// Windows found to show a web page or not (`showsWebPage`), and when.
+    static var webPages: [CGWindowID: (web: Bool, at: Double)] = [:]
+    /// A window found with no web page is looked at again after this long (s): one can open in it later.
+    static let webRecheck = 30.0
+
+    /// Whether window `wid` shows a web page: `look` (a walk of its accessibility tree), then what it found,
+    /// so an act doesn't walk the window each time. Yes is kept. No is looked at again after `webRecheck`
+    /// s, and the first no at the next act: a web view may build its accessibility tree only once asked.
+    static func showsWebPage(_ wid: CGWindowID, now: Double = ProcessInfo.processInfo.systemUptime,
+                             look: () -> Bool) -> Bool {
+        let seen = webPages[wid]
+        if let seen, seen.web || now - seen.at < webRecheck { return seen.web }
+        let began = ProcessInfo.processInfo.systemUptime
+        let web = look()
+        if Trace.on { Trace.log(["k": "webpage", "ms": (ProcessInfo.processInfo.systemUptime - began) * 1000, "web": web]) }
+        webPages[wid] = (web, web || seen != nil ? now : -.infinity)
+        return web
+    }
+
+    /// After these a window may open a moment later (a document a double-click opens, a dialog Return or a
+    /// shortcut brings up, a menu command's), so after an early end `act` keeps looking for one until the
+    /// wait used to look again (`watchForWindow`). Not after single clicks, typing, scrolls or selects.
+    nonisolated static func opensWindow(_ a: [String: Any]?) -> Bool {
+        guard let a else { return false }
+        let keys: [String]
+        switch kind(a) {
+        case "double_click", "menu", "menu_item": return true
+        case "click", "left_click", "right_click", "middle_click":
+            return a["item"] != nil || (a["count"] ?? a["clicks"]) as? Int == 2  // a menu command, or a double-click
+        case "type", "type_text": return mayOpen(a)  // ends with Return
+        case "fill": return a["submit"] as? Bool == true  // Return
+        case "keypress", "key", "press_key", "hotkey", "key_up", "keyup", "hold_key", "hold":
+            keys = Keys.sequence(a["keys"] ?? a["key"] ?? a["text"]).flatMap { $0 }.map(Keys.normalize)
+        default: return false
+        }
+        return keys.contains { ["return", "enter", "kpenter"].contains($0) || Keys.modifiers[$0] == .maskCommand }
+    }
+
+    /// After an early end: until `until` (by `clock`), when the wait used to look for a new window a second
+    /// time, `look` for one (it follows it) after each `pause`. Whether one turned up.
+    static func watchForWindow(until: Double, look: () async -> Bool, pause: () async throws -> Void,
+                               clock: () -> Double = { ProcessInfo.processInfo.systemUptime }) async throws -> Bool {
+        while clock() < until {
+            try await pause()
+            if await look() { return true }
+        }
+        return false
+    }
+
+    /// Trace only, where `act` waits in full: the frame its early end would have returned now, if it would
+    /// have ended at its second frame (two frames 0.15 s apart that match and both show a change from `before`).
+    static func earlyFrame(_ t: Target, _ o: Opts, before: Signature?) async -> Signature? {
+        let basis = PlanBasis.of(t)
+        guard let p = try? await plan(t, region: nil, o), let a = try? await p.run() else { return nil }
+        await Input.sleep(0.15)
+        guard let b = try? await p.run(), PlanBasis.of(t) == basis else { return nil }
+        let (sa, sb) = (Signature(a.image), Signature(b.image))
+        return still(sa, sb) && showsChange(sa, from: before) && showsChange(sb, from: before) ? sb : nil
     }
 
     /// A window that appeared in `w`'s app during a batch: a browser window from cmd+n, a dialog, a
     /// settings window. Sheets and popovers drawn over `w` don't count (they're captured with it). With a
     /// `box`, windows the batch created are shrunk to it (points), so the screenshot fits the token cap at a readable scale
-    /// whatever the display's pixel density.
-    static func follow(_ w: WinInfo, visibleBefore: Set<CGWindowID>, existedBefore: Set<CGWindowID>,
-                       box: CGSize?) async -> WinInfo? {
+    /// whatever the display's pixel density. `arrange` (`Run.arrange`) says whether it may be shrunk and moved,
+    /// and whether it's switched to at all (`followed`): not when the user may have opened it, which is noted.
+    static func follow(_ w: WinInfo, visibleBefore: Set<CGWindowID>, existedBefore: Set<CGWindowID>, box: CGSize?,
+                       arrange: (fit: Bool, place: Bool, follow: Bool, users: Bool) = (true, true, true, false)) async
+        -> (window: WinInfo, followed: Bool)? {
         let parent = Windows.info(w.id)?.frame ?? w.frame
         let fresh = Windows.all(onScreenOnly: true).filter {
             $0.pid == w.pid && $0.layer == 0 && !visibleBefore.contains($0.id)
@@ -1626,24 +2169,47 @@ enum Handlers {
         guard let nw = fresh.first(where: { c in
             let el = AX.window(pid: c.pid, wid: c.id)
             let subrole = el.flatMap { AX.value($0, kAXSubroleAttribute) as? String }
-            guard parent.contains(c.frame) else {
-                // Not macOS's own bits shown in the app's name: the dictation orb is an untitled "dialog"
-                // holding one control. An app's alert has its text and buttons, or is modal.
-                guard c.title.isEmpty, let el, subrole != "AXStandardWindow" else { return true }
-                return AX.value(el, "AXModal") as? Bool == true || AX.children(el).count > 1
-            }
+            guard parent.contains(c.frame) else { return !systemWindow(c, el) }
             return subrole == "AXStandardWindow"
         }) else { return nil }
+        guard arrange.follow else {  // it may be the user's: left as it is, and not taken over
+            notes.append(Run.notFollowedNote(id: nw.id, title: nw.title, app: nw.app))
+            return (nw, false)
+        }
         var note = "now on new window #\(nw.id)"
-        if let box, !existedBefore.contains(nw.id), AX.fit(pid: nw.pid, wid: nw.id, box: box) {
-            try? await Task.sleep(nanoseconds: 300_000_000)  // let it lay out at the new size
-            if let f = Windows.info(nw.id)?.frame { note += ", sized to \(Int(f.width))x\(Int(f.height)) pt" }
+        if arrange.users, !existedBefore.contains(nw.id) { note += Run.leftAloneNote(nw.frame.size, box: box) }
+        if let box, arrange.fit, !existedBefore.contains(nw.id), AX.fit(pid: nw.pid, wid: nw.id, box: box) {
+            // Until it's that size, and has had a moment to lay out at it (0.3 s at most).
+            let size = CGSize(width: min(nw.frame.width, box.width), height: min(nw.frame.height, box.height))
+            if let f = try? await Run.resized(to: size, floor: 0.05, frame: { Windows.info(nw.id)?.frame }) {
+                note += ", sized to \(Int(f.width))x\(Int(f.height)) pt"
+            }
         }
         notes.append(note)
-        if !existedBefore.contains(nw.id), Run.placeOnScreen(nw) {
-            try? await Task.sleep(nanoseconds: 150_000_000)  // let it lay out where it is now
+        if arrange.place, !existedBefore.contains(nw.id), let to = Run.placeOnScreen(nw) {
+            try? await Run.placed(nw.id, at: to)
         }
-        return Windows.info(nw.id) ?? nw
+        return (Windows.info(nw.id) ?? nw, true)
+    }
+
+    /// macOS's own bits shown in the app's name, not the app's: the dictation orb is an untitled "dialog"
+    /// holding one control. An app's alert has its text and buttons, or is modal. `el`, the window's
+    /// accessibility element, is only looked up for an untitled window.
+    static func systemWindow(_ w: WinInfo, _ el: @autoclosure () -> AXUIElement?) -> Bool {
+        systemWindow(w, facts: {
+            el().map { (AX.value($0, kAXSubroleAttribute) as? String, AX.value($0, "AXModal") as? Bool == true, AX.children($0).count) }
+        })
+    }
+
+    /// The same, given an untitled window's subrole, modal flag and number of children (`facts`; nil: it has
+    /// no accessibility element).
+    static func systemWindow(_ w: WinInfo, facts: () -> (subrole: String?, modal: Bool, children: Int)?) -> Bool {
+        guard w.title.isEmpty, let f = facts() else { return false }
+        return systemWindow(subrole: f.subrole, modal: f.modal, children: f.children)
+    }
+
+    nonisolated static func systemWindow(subrole: String?, modal: Bool, children: Int) -> Bool {
+        subrole != "AXStandardWindow" && !modal && children <= 1
     }
 }
 
@@ -1669,6 +2235,13 @@ enum Hold {
     /// Really frontmost (WindowServer), not just AppKit-active.
     static func isFront(_ pid: pid_t) -> Bool {
         SkyLight.isFrontProcess(pid) ?? (NSRunningApplication(processIdentifier: pid)?.isActive == true)
+    }
+
+    /// Held on `wid` since an earlier call, so the app has long taken the activation record: `act` doesn't
+    /// wait after sending it again. Not on a fresh hold (the app may have just been told it's active), nor
+    /// when the hold is on another of its windows.
+    static func heldSettled(pid: pid_t, wid: CGWindowID) -> Bool {
+        held[pid] == wid && !fresh.contains(pid)
     }
 
     /// A request of the session came in: its apps aren't idle.

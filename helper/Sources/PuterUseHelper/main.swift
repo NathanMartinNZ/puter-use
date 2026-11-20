@@ -18,6 +18,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var server: Server?
     var signals: [DispatchSourceSignal] = []
 
+    /// An AppKit quit (logout's quit event, `osascript … quit`, Activity Monitor's Quit): batches under way
+    /// stop and let go of what they hold first, as on `quit` and a signal (bounded: `stopAll`'s 1 s and the
+    /// clipboard's give-back). After `quit`, which has done that already, it ends at once.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            if Run.stopped { return .terminateNow }
+            Task { @MainActor in
+                await Run.stopAll(within: 1)
+                await Clipboard.finish()
+                Run.exitLater()
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated {
             Clipboard.putBack()
@@ -40,14 +56,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             FileHandle.standardError.write("failed to start server: \(error)\n".data(using: .utf8)!)
             exit(1)
         }
-        // Stopped (pkill, logout): give the user's clipboard back if a paste had borrowed it, and let go of
-        // the apps kept active for agents.
+        // Stopped by a signal (kill, pkill, Ctrl-C): batches under way stop and let go of what they hold
+        // (within 1 s, as on quit), the user's clipboard comes back if a paste had borrowed it, and the apps
+        // kept active for agents are let go of. A logout's quit comes as an AppKit quit instead
+        // (`applicationShouldTerminate`).
         for sig in [SIGTERM, SIGINT, SIGHUP] {
             signal(sig, SIG_IGN)
             let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             src.setEventHandler {
                 Task { @MainActor in
-                    await Run.abandonAll()
+                    await Run.stopAll(within: 1)
                     Hold.releaseAll()
                     await Clipboard.finish()
                     exit(0)

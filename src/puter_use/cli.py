@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -127,6 +128,13 @@ def element_arg(v: str | None) -> dict:
     return {"element": int(v)} if v.strip().isdigit() else {"target": v}
 
 
+def read_arg(v: str | bool) -> int | str | bool:
+    """--read alone is the focused text; --read 12 is element 12; --read Notes what shows "Notes"."""
+    if v is True:
+        return True
+    return int(v) if v.strip().isdigit() else v
+
+
 def outline_args(args: argparse.Namespace, force: bool = False) -> dict:
     text = "interactive" if getattr(args, "interactive", False) else args.text or force
     return outline_params(text, getattr(args, "marks", False))
@@ -175,7 +183,9 @@ def build_action(args: argparse.Namespace) -> dict:
             raise SystemExit("open needs a URL, a file path, or --app")
         return a
     elif cmd == "wait-for":
-        a = {"type": "wait_for", "text": args.content}
+        if (args.content is None) != args.change:
+            raise SystemExit("wait-for needs TEXT, or --change (not both)")
+        a = {"type": "wait_for", "change": True} if args.change else {"type": "wait_for", "text": args.content}
         if args.role:
             a["role"] = args.role
         if args.gone:
@@ -235,7 +245,12 @@ async def run(args: argparse.Namespace) -> int:
         elif args.cmd == "windows":
             print(window_list(await h.call("windows", app=args.app, launch=args.launch or None,
                                            window_size=capture_params()["window_size"])))
+        elif args.cmd in ("shot", "screenshot") and args.read is not None:
+            return report(await h.call("screenshot", window=window_arg(args.window or args.window_pos),
+                                       read=read_arg(args.read), offset=args.offset, limit=args.limit))
         elif args.cmd in ("shot", "screenshot"):
+            if args.offset is not None or args.limit is not None:
+                raise SystemExit("--offset and --limit go with --read")
             return report(await h.call("screenshot", window=window_arg(args.window or args.window_pos),
                                        region=parse_region(args.region), image=False if args.no_image else None,
                                        **outline_args(args, args.no_image), **capture_params()))
@@ -266,10 +281,7 @@ async def run(args: argparse.Namespace) -> int:
         elif args.cmd == "release":
             await h.call("release", autostart=False)
         elif args.cmd == "quit":
-            try:
-                await h.call("quit", autostart=False)
-            except HelperError:
-                pass
+            await h.quit()
         else:
             return report(await h.call("act", window=window_arg(args.window), actions=[build_action(args)],
                                        foreground=args.fg or None, **outline_args(args),
@@ -296,7 +308,7 @@ def parser() -> argparse.ArgumentParser:
         sp.add_argument("--fg", action="store_true", help="foreground fallback: raise the app, use the real cursor")
         sp.add_argument("--screenshot", choices=["auto", "always", "never"], default="auto",
                         help="after acting: image only if the window changed (auto), always, or never")
-        sp.add_argument("--settle-ms", type=int, help="pause before checking for changes (default 250)")
+        sp.add_argument("--settle-ms", type=int, help="check for changes at least this long after the last input (default 250)")
         sp.add_argument("--no-guard", action="store_true",
                         help="don't stop before coordinate actions when something opened over the window")
         sp.add_argument("--confirm", action="store_true",
@@ -307,7 +319,7 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("setup", help="start the helper and request macOS permissions")
     sub.add_parser("status")
     sub.add_parser("release", help="hide the agent cursor and forget the current window")
-    sub.add_parser("quit", help="stop the helper app")
+    sub.add_parser("quit", help="stop the helper app (returns once it has exited)")
     sp = sub.add_parser("windows", help="list controllable windows")
     sp.add_argument("app", nargs="?")
     sp.add_argument("--launch", action="store_true", help="open the app in the background if needed")
@@ -320,6 +332,11 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("--marks", action="store_true", help="number the controls on the image (as in the outline)")
     sp.add_argument("--no-image", action="store_true",
                     help="accessibility outline only (with --region: just the text in that area)")
+    sp.add_argument("--read", nargs="?", const=True, metavar="ELEMENT",
+                    help="instead of an image, the whole text of a text area or field, scrolled-out parts too: its "
+                         "number or the text it shows (alone: the focused one)")
+    sp.add_argument("--offset", type=int, help="with --read: start at this character (default 0)")
+    sp.add_argument("--limit", type=int, help="with --read: this many characters (default 10000, at most 50000)")
     sp = sub.add_parser("find", help="find elements by the text they show; prints their numbers")
     sp.add_argument("query")
     sp.add_argument("--role", help="e.g. button, field, checkbox, link")
@@ -369,7 +386,7 @@ def parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("menus", help="list the app's menu commands and their shortcuts")
     sp.add_argument("query", nargs="?", help="only items matching this")
     sp.add_argument("-w", "--window", help="window id, app name, or 'screen' (default: last used)")
-    sp = target(sub.add_parser("menu", help="run a menu command, e.g. 'File > Export as PDF…'"))
+    sp = target(sub.add_parser("menu", help="run a menu command: 'File > Export as PDF…', or its name alone if unique"))
     sp.add_argument("item")
     sp = target(sub.add_parser("select", help="pick an option of a pop-up or combo box"))
     sp.add_argument("element", help="its number, or the text it shows")
@@ -382,10 +399,12 @@ def parser() -> argparse.ArgumentParser:
     sp = target(sub.add_parser("open", help="open a link, document or app in the background"))
     sp.add_argument("target", nargs="?", help="URL or file path")
     sp.add_argument("--app", help="the app to open it with (or to launch)")
-    sp = target(sub.add_parser("wait-for", help="wait until an element showing TEXT appears"))
-    sp.add_argument("content", metavar="text")
+    sp = target(sub.add_parser("wait-for", help="wait until an element showing TEXT appears (or the window changes)"))
+    sp.add_argument("content", metavar="text", nargs="?")
     sp.add_argument("--role", help="e.g. button, field, text")
     sp.add_argument("--gone", action="store_true", help="wait until it goes away instead")
+    sp.add_argument("--change", action="store_true",
+                    help="instead of TEXT: until the window looks different from when this call began, then settles")
     sp.add_argument("--timeout-ms", type=int)
     sp = target(sub.add_parser("scroll"))
     sp.add_argument("x", type=float, nargs="?")
@@ -406,6 +425,21 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def stoppable(command) -> int:
+    """Run a CLI command so that Ctrl-C (SIGINT) stops it with one line and exit status 130, no traceback.
+    The helper's request is cancelled on the way out: the connection closes, which the helper takes as a
+    cancel (nothing more is pressed or typed; held keys and buttons are let go). SIGINT stops it even when
+    it was ignored as the CLI started (a script's background job, which Ctrl-C reaches too): stopping
+    puter-use is what Ctrl-C is for."""
+    signal.signal(signal.SIGINT, signal.default_int_handler)  # asyncio.run then cancels the request on SIGINT
+    try:
+        return command()
+    except KeyboardInterrupt:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # it's stopping: another Ctrl-C needn't interrupt that
+        print("stopped: interrupted", file=sys.stderr)
+        return 130
+
+
 def main() -> None:
     args = parser().parse_args()
     if args.cmd == "mcp":
@@ -416,5 +450,5 @@ def main() -> None:
     if args.cmd == "screenshot":
         args.cmd = "shot"
     if args.cmd == "exec":
-        sys.exit(run_script(args))
-    sys.exit(asyncio.run(run(args)))
+        sys.exit(stoppable(lambda: run_script(args)))
+    sys.exit(stoppable(lambda: asyncio.run(run(args))))

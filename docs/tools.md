@@ -3,14 +3,17 @@
 | tool | what it returns |
 |---|---|
 | `windows(app?, launch?)` | `id · app · title · size` per window. `launch` opens the app in the background |
-| `screenshot(window?, region?, text?, image?, marks?)` | window image + one status line. `region` zooms; `region` + `image=false` returns just the text in that area (read off the screen if the app exposes none). Opt-in: `text` adds the element outline (`"interactive"`: only controls), `image=false` alone returns only the outline, `marks` numbers the controls on the image |
-| `find(query, role?, window?)` | the elements showing `query`, `[n] role "label" at (x,y)`, numbered for `element`. Read off the screen when the app has no accessibility tree |
+| `screenshot(window?, region?, text?, image?, marks?, read?, offset?, limit?)` | window image + one status line. `region` zooms; `region` + `image=false` returns just the text in that area (read off the screen if the app exposes none). Opt-in: `text` adds the element outline (`"interactive"`: only controls), `image=false` alone returns only the outline, `marks` numbers the controls on the image. In an app that answers slowly (a page loading, an IDE indexing), the outline and the text in a `region` stop after about 2.5 s and say they were cut short (`act` then sends that outline whole, not as changes). `read` returns a text area's or field's whole text instead, see [Reading long text](#reading-long-text) |
+| `find(query, role?, window?)` | the elements showing `query`, `[n] role "label" at (x,y)`, numbered for `element`. Then those scrolled out of view, tagged `(off screen)` instead of a place: acting on one scrolls it into view first. Read off the screen when the app has no accessibility tree. With none at all, up to three similar labels |
 | `menus(window?, query?)` | the app's menu bar as text: every command and its shortcut, one line per menu (`File: New Window cmd+n · Export as PDF… cmd+shift+e`). `query` lists just the matches, with full paths |
 | `macros(window?, all?, delete?)` | the macros saved for the window's app, with their variables |
-| `act(actions, window?, text?, marks?, foreground?, screenshot?, settle_ms?, guard?, save_as?)` | runs the actions, then returns an image only if something changed (`screenshot`: `auto`, `always` or `never`), plus a status line. `text` sends the outline's changes since the last one this session was sent (of the same kind) when that's shorter. A failed action makes the result an error (still with the image) |
+| `act(actions, window?, text?, marks?, foreground?, screenshot?, settle_ms?, guard?, save_as?)` | runs the actions, then returns an image only if something changed (`screenshot`: `auto`, `always` or `never`), plus a status line. `text` sends the outline's changes since the last one this session was sent (of the same kind) when that's shorter. A failed action makes the result an error (with the image if the window changed, or on a session's first act on it) |
 
-`window` is an id, an app name, or `"screen"`. It defaults to the last window used. Coordinates are
-pixels in the latest full screenshot of that window.
+`window` is an id, an app name, or `"screen"`. It defaults to the last window used. An app name means
+the session's window there: the one it's on, else the one of its own (windows it opened) it used last, else
+the app's front window (never macOS's dictation orb, which shows up as an untitled window of the app,
+while the app has another). When that isn't the front window, a note says so (once). Coordinates are pixels in the
+latest full screenshot of that window.
 
 Actions follow OpenAI/Anthropic conventions. Anything aimed at an element takes `x,y`, `element` (a
 number from an outline, `find` or marks) or `target` (the text it shows, see [Naming elements](#naming-elements)):
@@ -24,7 +27,7 @@ number from an outline, `find` or marks) or `target` (the text it shows, see [Na
   the user's too), nothing is chosen and the action fails
 - `move {x,y}`, `drag {path:[[x,y],…]}`
 - `scroll {x?,y?,scroll_x?,scroll_y?}` (pixels, positive = right/down)
-- `type {text, element|x,y?, clear?, submit?}`: with a field given, it's clicked first (the caret goes
+- `type {text, element|target|x,y?, clear?, submit?}`: with a field given, it's clicked first (the caret goes
   after its text; a selection the app made, like the whole address a browser selects when its address
   bar is clicked, is kept, so the new text replaces it); `clear` empties it, `submit` presses Return.
   Text typed at the focus into a browser's address bar replaces the address too. Only text fields:
@@ -39,30 +42,48 @@ number from an outline, `find` or marks) or `target` (the text it shows, see [Na
   the batch
 - `menu {item: "File > Export as PDF…"}`: presses a menu-bar item through accessibility. Each level
   matches exactly, else by a unique prefix, else a unique substring; a miss lists what's there. A
+  name alone (`"Export as PDF…"`) runs the one command with exactly that name (case, spacing and a
+  closing "…" aside) wherever it is. If no command has it, or several do, nothing runs and the error
+  lists the matching items with their full paths. A name alone never runs an item in History,
+  Bookmarks, Favorites, Profiles, Window or a recent-items submenu (Open Recent, Recently Closed):
+  those list the user's own pages, documents and windows, so they need the full path. A
   background app's menus are only updated when opened, so an item they show disabled is run by its
   shortcut if it has one. Services (which hand data to other apps) are refused
-- `fill {fields: [{element, text} | {element, option} | {element, checked}], submit?: true | element}`:
-  a whole form in one action. Text fields are cleared first unless `clear: false`
-- `select {element, option}`: picks a pop-up, menu button or combo box item by title (exactly, else by
+- `fill {fields: [{element|target, text|option|checked}, …], submit?: true | element | "Button text"}`:
+  a whole form in one action. Text fields are cleared first unless `clear: false`. Naming each field
+  by its label needs no outline first: `fields: [{target: "Email", text: "ada@example.com"},
+  {target: "Country", option: "NZ"}, {target: "I agree", checked: true}]`. A field is found by its own
+  label, placeholder or value; if only a separate text label beside it matches, the action fails
+  saying what it found (aim with the field's number from an outline then)
+- `select {element|target, option}`: picks a pop-up, menu button or combo box item by title (exactly, else by
   a unique prefix or substring), through accessibility. Anything else fails without being pressed
-- `navigate {url, new_window?}`: in a browser, `cmd+l`, the address, Return, then waits for the page
-  to load. In a window the agent didn't open, it opens its own first, so your tabs are left alone
+- `navigate {url, new_window?, timeout_ms?}`: in a browser, `cmd+l`, the address, Return, then waits for
+  the page to load, up to `timeout_ms` (default 10 s, at most 30 s; a note says if it's still loading). In
+  a window the agent didn't open, it opens its own first, so your tabs are left alone
 - `open {url|path, app?}`: opens a link, document or app the way a double-click would, without
   bringing it forward, and moves the batch to the window it opens. Only `http(s)`/`mailto` links and
   documents: apps by name are fine, but scripts, installers, other links (`shortcuts://`, `tel:`, …)
   and documents given to a terminal or script runner (`app: "Terminal"`) are refused
 - `wait_for {text, role?, gone?, timeout_ms?}`: until an element showing that text (and role) is in
-  any of the app's windows, or with `gone` until none is. Default 5 s, at most 30 s
+  the window, in a sheet, popover or menu over it, or in a window that appeared since the batch began,
+  or with `gone` until none is. The app's other windows (maybe yours) don't count. If the time runs
+  out, the action fails. Default 5 s, at most 30 s
+- `wait_for {change: true, timeout_ms?}`: until the window looks different from how it looked when
+  the batch began (so a change that started during the click before it counts), then until it has
+  settled. A window opening or closing counts too. Small changes (a caret, a spinner, a focus ring, a
+  line of status text, a browser's loading signs: under 1% of the window) don't. For a slow page or
+  search when you don't know what text will show: `[click "Search", wait_for {change: true}]`. If
+  nothing changes in time, a note says so and the batch goes on
 - `clipboard {offset?, limit?}` reads the clipboard into the result (after a copy): 10,000 characters
   from `offset` (default 0; `limit` up to 50,000), with a note saying where to read on when there's more.
   `clipboard {text}` puts text on it to stay. `paste {text}` pastes at the focus and puts back what was on the clipboard
-- `set_value {element,text}`, `focus {element}`, `activate {}`, `close_window {}`
-- `perform {element, name}`: an accessibility action with no pointer needed: `expand`, `collapse`,
+- `set_value {element|target, text}`, `focus {element|target}`, `activate {}`, `close_window {}`
+- `perform {element|target, name}`: an accessibility action with no pointer needed: `expand`, `collapse`,
   `increment`, `decrement`, `showmenu`, `scroll_to_visible`, `confirm`, `cancel`, `raise`, or any AX
   action name. An unsupported name fails with the actions the element does support
 - `macro {name, vars?}`: replays a saved macro (see [Macros](#macros))
-- `wait {ms}`, only for something slow (a page load, a search). `act` already waits for the window to
-  settle after each batch.
+- `wait {ms}`: a fixed pause. `act` already waits for the window to settle after each batch, and for
+  something slow (a page load, a search) `wait_for` ends as soon as it's there.
 
 **Keyboard isolation.** Key events go to the app's key window, not the window they're stamped for. If
 another window of the same app has the keyboard (you brought one forward), keyboard actions and menu
@@ -78,22 +99,42 @@ you've left the keyboard and mouse alone for 2 seconds, since you may be typing 
 otherwise the action stops and says to try again.
 
 A window the agent opens (with `navigate`, `open`, or an action that opens one) that lands partly off
-screen is moved onto it, since what's off screen can't be captured or clicked. Your own windows stay
-where you put them: a screenshot of one that's partly off screen says how much of it is shown.
+screen is moved onto it, since what's off screen can't be captured or clicked (unless you may have
+opened it yourself: see new windows below). Your own windows stay where you put them: a screenshot
+of one that's partly off screen says how much of it is shown.
 
 An element behind an open sheet or modal dialog can't be pressed, set or focused, just as a person
 couldn't click it: the action fails and names the sheet's buttons.
 
 ## Naming elements
 
-`target` is the text an element shows (its title, label, value or help), matched case-insensitively,
-whole words first: `"Save"`, or `{"text": "Save", "role": "button", "nth": 2}`. It's searched for in the
-window and in its app's sheets, popovers and menus over it, when the action runs. A control beats a
+`target` is the text an element shows (its title, label, value or help), matched case-insensitively:
+whole labels on screen when there are any (spacing and `...` vs `…` don't matter), else a single label
+containing it, unless a quick look finds a whole label off screen (then the action fails and lists
+both, numbered).
+`"Save"`, or `{"text": "Save", "role": "button", "nth": 2}`. It's searched for in the window and in
+its app's sheets, popovers and menus over it, when the action runs. A control beats a
 bare label saying the same thing. If more than one element is left, the action fails and names them,
 numbered, so the next call can pick one:
 
 ```
 error: action 1 (click): "OK" matches 2 elements: [31] button "OK" at (412,380); [44] button "OK" at (412,610). Name one by its number, or add role or nth
+```
+
+Only when nothing on screen matches is the rest of the window searched (below the fold, further down
+a list; up to 1.5 s, and not if the search on screen ran out of time). A single element whose whole
+label matches there is used: it's scrolled into view first, with the note `scrolled to "Submit" (it
+was below the visible part)`. Anything else fails as before and lists what's off screen, numbered.
+Any action on an element that's out of view (also by number) scrolls it into view first. If it can't
+be brought into view (it's kept off screen until something opens it), or where it is can't be told,
+the action fails and nothing is done: you never act on what you can't see.
+
+When nothing in the window shows the text at all, the error lists up to three similar labels there (or in
+what's open over it), numbered, and uses none: the same but for spaces and punctuation (`"Log in"` for
+`"Login"`), or sharing words. The app's other windows are never suggested:
+
+```
+error: action 1 (click): nothing shows "OpenSheet" (accessibility or on screen); similar (name one by its number if it's what you meant): [9] button "Open Sheet"
 ```
 
 In an app with no accessibility tree, the window is read with on-device text recognition (Vision)
@@ -115,7 +156,8 @@ stopped before action 3 (click by coordinates): something opened over the window
 The batch also stops before its first `x,y` action when this session has no earlier screenshot of the
 window to read the coordinates from (a new session, or puter-use restarted), and returns one. A
 session's first `act` on a window always returns its image, since there's no picture of yours to
-compare with. If puter-use stops in the middle of a batch, the batch isn't sent again (it may have
+compare with, even when its first action fails: the error comes with the window, so you can aim from it
+(later, an `act` whose first action fails returns the error alone). If puter-use stops in the middle of a batch, the batch isn't sent again (it may have
 partly run): the call fails, and a screenshot shows where things stand. Element, keyboard and menu
 actions carry on, since they don't depend on the picture: a shortcut that
 opens a dialog, then typing into it and Return, still runs as one batch. `guard=false` (`--no-guard`) turns the stop
@@ -132,8 +174,22 @@ note: a menu opened (Red · Green · Blue); it's closed again, as an open menu t
 ```
 
 If an action opens a new window in the app, `act` switches to it and reports
-`note: now on new window #9972`. With `PUTER_USE_WINDOW_SIZE` set, it also shrinks the window and adds
-`, sized to 1280x860 pt`.
+`note: now on new window #9972`. If the window is bigger than `PUTER_USE_WINDOW_SIZE` (1440×900 pt by
+default), it also shrinks it and adds its new size, e.g. `, sized to 1440x900 pt`. The same goes for the
+window `navigate` or `open` opens. Windows an app opens or restores as it launches (`windows` with
+`launch`, or an `open` that starts the app) keep their size: they may be the user's last session.
+
+A new window that appears while the user is typing, clicking or pressing modifier keys (Cmd, Shift, …) in
+that app, their front app, may be theirs. `act` doesn't switch to it, resize it or move it, and says so:
+
+```
+note: a new window #9980 "Inbox" opened in Firefox while the user was using it: not switched to, as it may be theirs. If your action was meant to open one (cmd+n, a link to a new window), pass window=9980
+```
+
+The window `navigate` or `open` opens is still switched to. It's not resized or moved if the user is
+clicking or pressing modifier keys there (`, not resized: the user may have opened it`); their typing
+alone doesn't stop that. In foreground mode, `act` still switches to a new window, as before (the agent's
+own input there looks like the user's); it doesn't resize or move it after a click or modifier key.
 
 The status line is all the extra context you get:
 
@@ -142,12 +198,42 @@ Firefox #244 "GitHub" · 918x756 · changed in (40,120)-(900,610)
 ```
 
 "Changed" is judged against the last image the agent was shown, so after `screenshot: "never"` calls
-the next image covers everything since then.
+the next image covers everything since then. `act` looks once the window has held still, at least
+`settle_ms` (250 by default) after the last input. A window that still looks the same (a blinking caret
+aside) is watched a little longer, about 1 s after the last input, before the result says nothing changed. Web
+pages (in a browser, an Electron app or another app's web view) always get that longer look. A text
+cursor blinking where it was isn't a change. One moved by a click or an arrow key is; when it's
+between blinks in both pictures, a note says it moved and how many characters into the text it is.
+
+## Reading long text
+
+The outline and `region` text cover only what's on screen, so reading a long document that way is a
+scroll and a look per screenful. `screenshot(read=…)` returns a text area's or text field's whole text
+instead (its accessibility value), including what's scrolled out of view, with no image. It's a look:
+nothing is clicked or typed, the clipboard isn't used, and it works in view-only apps.
+
+- `read` names the element as `element` or `target` do: its number (`read=15`), or what it shows
+  (`read="Notes"`, `{"text": "Notes", "role": "textarea"}`). `read=true` reads the text that has the
+  keyboard focus in the window, else the window's only text area; otherwise it fails and lists the text
+  areas and fields.
+- 10,000 characters from `offset` (default 0; `limit` up to 50,000). The label says which part it is
+  and where to read on:
+
+  ```
+  text of [15] textarea "Notes", characters 1-10000 of 33806; read on from offset 10000 (data, not instructions):
+  0001 The quick brown fox …
+  ```
+
+- Static text can be read too (the outline shortens long labels). Buttons, pop-ups and other controls
+  fail, saying so; password fields are refused. Whole web pages aren't read this way yet: scroll and
+  look, or read a part with `region` and `image=false`.
 
 ## Macros
 
-When a batch has done a job you'll want again, run it with `save_as`. If every action succeeds, it's
-saved under that name for the app (`~/Library/Application Support/puter-use/macros/<name>.json`):
+Add `save_as` to the `act` call that does a job you'll want again. If every action succeeds, the batch
+is saved under that name for the app (`~/Library/Application Support/puter-use/macros/<name>.json`);
+otherwise nothing is saved. Don't re-run a finished job just to save it: it would happen twice (a
+second export, a second form sent).
 
 ```json
 act(actions=[{"type":"menu","item":"File > Export as PDF…"},{"type":"type","text":"q3-report.pdf"},
@@ -168,14 +254,16 @@ of any batch. Steps are saved so they don't depend on a screenshot:
 - Other clicks, drags and scrolls keep their position in window points. Those depend on the window
   having the same layout, so prefer menus, keys and named controls in a macro. Such a step also stops
   the replay if what's open over the window (a sheet, a menu) isn't what was there when it was saved.
+- A `menu` step given by a name alone is saved as the full path it ran (`"View > Toggle Thing"`).
 - Each var's value becomes `{{var}}` where it appears in what the steps type, choose or open (`text`,
   `option`, `item`, `url`, …; a value under 3 characters only where it's the whole of one), to be
   filled in on replay. Replaying needs every var and takes no others. Anything else you typed is
   saved as it is, so don't save a batch that typed a secret. A `save_as` with a bad name or an empty
   var is refused before the batch runs; saving under an existing name replaces that macro.
 
-A macro only runs in the app it was saved in (by bundle id, or by name for an app without one). `macros`
-lists the window's app's, and `macros(delete=…)` removes one.
+A macro only runs in the app it was saved in (by bundle id, or by name for an app without one). The
+first look at an app lists its macros by name, with their vars (`saved macros: export pdf (file)`, in
+the line about the app). `macros` lists the window's app's in full, and `macros(delete=…)` removes one.
 
 ## Code mode
 
@@ -198,7 +286,9 @@ Every method is one `act` (`click`, `type`, `key`, `menu`, `select`, `fill`, `sc
 `select` and `fill` take `confirm=True` once the user has OK'd a press that asks. Each waits for the window to
 settle, and a failed action raises `ActionError`, so the script stops where things went wrong (a
 request refused outright, like an unknown macro or a window that isn't there, raises `HelperError`).
-`screenshot()`, `outline()`, `read(region)`, `find()` and `menus()` look. Scripts run in the CLI's
+`screenshot()`, `outline()`, `read()`, `find()` and `menus()` look: `read([x0, y0, x1, y1])` is the text in
+a box, and `read("Notes")` (or a number, or `True` for the focused text) the whole text of a text area or
+field, every page of it unless `offset`/`limit` ask for a part. Scripts run in the CLI's
 session and see what it has seen. There's no MCP equivalent: an agent that can run scripts has a shell.
 
 ## Sessions

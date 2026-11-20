@@ -33,6 +33,7 @@ extension Handlers {
         if a["element"] != nil || a["target"] != nil || a["x"] != nil || a["coordinate"] != nil {
             var click: [String: Any] = ["type": "click", "_pointer": true]  // a real click: it puts the caret there
             for k in ["element", "target", "x", "y", "coordinate", "units"] { if let v = a[k] { click[k] = v } }
+            if let node { click["_node"] = node }  // the field checked above, not found again
             try await perform(click, run)
             await Input.sleep(typist.between())
         }
@@ -237,7 +238,7 @@ extension Handlers {
         guard let n = try elementNode(f, run.target) else { throw HelperError("checked needs element or target") }
         guard let v = AX.value(n.element, kAXValueAttribute) as? NSNumber else { throw HelperError("the \(n.name) isn't a checkbox or switch") }
         if (v.intValue != 0) == want { return }
-        var click: [String: Any] = ["type": "click"]
+        var click: [String: Any] = ["type": "click", "_node": n]  // the one just read, not found again
         for k in ["element", "target", "x", "y", "units", "confirm"] { if let v = f[k] { click[k] = v } }
         try await perform(click, run)
     }
@@ -253,13 +254,18 @@ extension Handlers {
             throw HelperError("that's a \(AX.describe(n.element)), not a pop-up or combo box to select from")
         }
         if let match = AX.optionTitle(n.element, option) { try Policy.checkItem(a, match) }
-        if let c = AX.center(n) {
+        let shown = try await reveal(n, aimName(a))  // scrolled to first if it's out of view
+        if let c = shown.map({ CGPoint(x: $0.midX, y: $0.midY) }) ?? AX.center(n) {
             await pointer.move(to: c, try route(run.target, at: c, foreground: false))
             pointer.click()
         }
-        let chose = try await AX.choose(n.element, option) { try Policy.checkItem(a, $0) }
+        let chose = try await AX.choose(n.element, option, menuLater: a["_last"] as? Bool == true) { try Policy.checkItem(a, $0) }
         if AX.menuKey(chose) != AX.menuKey(option) { notes.append("selected \"\(chose)\"") }
     }
+
+    /// Whether `AX.choose` looks for its menu only once after the pick, not for 0.4 s: as the batch's last
+    /// action (`menuLater`), in a window `act` doesn't wait in full for (`waitsInFull`; nil, not known: it waits).
+    nonisolated static func looksOnce(menuLater: Bool, waitsInFull: Bool?) -> Bool { menuLater && waitsInFull == false }
 
     static let browsers: Set<String> = [
         "com.apple.safari", "com.apple.safaritechnologypreview", "org.mozilla.firefox", "org.mozilla.firefoxdeveloperedition",
@@ -293,7 +299,9 @@ extension Handlers {
             agentWindows.insert(nw.id)
             try await run.moveTo(nw, note: "opened its own window #\(nw.id)")
             r = try route(run.target, at: nil, foreground: run.foreground)
-            await Input.sleep(0.3)  // it focuses its address bar
+            // It focuses its address bar: go on once it has (cmd+l needs the keyboard in it, and the address is
+            // pasted only into an address bar), or after 0.6 s anyway.
+            _ = try await Run.pollUntil(floor: 0.05, every: 0.04, cap: 0.6) { readyForAddress(pid: nw.pid, wid: nw.id) }
         }
         try await press(["cmd", "l"], r)
         await Input.sleep(typist.between())
@@ -302,6 +310,13 @@ extension Handlers {
         let before = shownPage(run)
         try await press(["Return"], r)
         try await awaitPage(url, before: before, run, timeout: pageTimeout(a))
+    }
+
+    /// A browser window ready for an address: the app's key window, with its focus on a text input in it
+    /// (a new window focuses its address bar).
+    static func readyForAddress(pid: pid_t, wid: CGWindowID) -> Bool {
+        guard AX.focusedWindow(pid: pid) == wid, let f = AX.focusedElement(pid: pid) else { return false }
+        return AX.isInWindow(f, wid) && AX.isTextInput(f)
     }
 
     /// How long to wait for a page to load after a Return in the address bar (timeout_ms, ≤ 30 s).
@@ -317,20 +332,41 @@ extension Handlers {
     /// After the Return that goes to `url` from the address bar: wait for the page to load, with a note when
     /// it hasn't, or when the window still shows the page it showed `before` (Return didn't take).
     static func awaitPage(_ url: String, before: [String?]?, _ run: Run, timeout: Double) async throws {
-        if case .window(let now) = run.target, !(try await AX.waitForPage(pid: now.pid, wid: now.id, timeout: timeout)) {
+        if case .window(let now) = run.target,
+           !(try await AX.waitForPage(pid: now.pid, wid: now.id, timeout: timeout, first: firstPagePause(before, url))) {
             notes.append("the page was still loading after \(Int(timeout)) s")
         } else if let before, !sameAddress(before[0], url), case .window(let now) = run.target {
             // "Loaded" may be the old page: Firefox keeps it, loaded and idle, until the new one answers.
             let until = Date().addingTimeInterval(timeout)
-            while shownPage(run).map({ $0 == before }) == true, Date() < until { try await Run.pause(0.2) }
-            if shownPage(run).map({ $0 == before }) == true {
+            var shown = shownPage(run)
+            while shown.map({ $0 == before }) == true, Date() < until {
+                try await Run.pause(0.1)
+                shown = shownPage(run)
+            }
+            if shown.map({ $0 == before }) == true {
                 notes.append("the window still shows \"\(AX.clip((before[0] ?? before[1]) ?? "", 60))\" \(Int(timeout)) s after "
                     + "Return: the page may still be loading, or Return didn't reach the address bar. Look before navigating again")
             } else if until.timeIntervalSinceNow > 0.5,
-                      !(try await AX.waitForPage(pid: now.pid, wid: now.id, timeout: until.timeIntervalSinceNow)) {
+                      !(try await AX.waitForPage(pid: now.pid, wid: now.id, timeout: until.timeIntervalSinceNow,
+                                                 first: secondPagePause(before, shown))) {
                 notes.append("the page was still loading after \(Int(timeout)) s")
             }
         }
+    }
+
+    /// The pause before the first look at whether the page has loaded. When what the window showed is known
+    /// and the typed address isn't its own, a short one: the wait for the window to change (above) keeps the
+    /// old page from passing for the new one. Otherwise (the same address, or nothing to compare) 0.4 s.
+    static func firstPagePause(_ before: [String?]?, _ url: String) -> Double {
+        if let before, !sameAddress(before[0], url) { return 0.1 }
+        return 0.4
+    }
+
+    /// The pause before the look once the window shows something else: none when its page's address has
+    /// changed (the new page is in place), 0.4 s when only its title has.
+    static func secondPagePause(_ before: [String?], _ now: [String?]?) -> Double {
+        if let u = now?[0], u != before[0] { return 0 }
+        return 0.4
     }
 
     /// Whether a page's address is the one typed (so it's not expected to change): scheme, "www." and a
@@ -432,23 +468,31 @@ extension Handlers {
     }
 
     /// wait_for {text, role, gone, timeout_ms}: until an element showing `text` (and of `role`) is in
-    /// any of the app's windows, or with gone=true until none is.
+    /// the batch's window, what's open over it, or a window that appeared since the batch began (not the
+    /// app's other windows: they may be the user's), or with gone=true until none is.
+    /// wait_for {change: true, timeout_ms}: see `waitForChange`.
     static func waitFor(_ a: [String: Any], _ run: Run) async throws {
         guard case .window(let w) = run.target else { throw HelperError("wait_for needs a window target") }
         let q = a["text"] as? String ?? a["label"] as? String ?? ""
         let role = (a["role"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        guard !q.isEmpty || role != nil else { throw HelperError("wait_for needs text (and/or role)") }
-        let gone = a["gone"] as? Bool == true
         let ms = num(a["timeout_ms"] ?? a["ms"]) ?? 5000
         guard (0...30000).contains(ms) else { throw HelperError("wait_for's timeout_ms is 0-30000") }
         let timeout = ms / 1000
+        if waitsForChange(a) {
+            guard q.isEmpty, role == nil, a["gone"] as? Bool != true else {
+                throw HelperError("wait_for takes change: true or text (and/or role), not both")
+            }
+            return try await waitForChange(timeout, run)
+        }
+        guard !q.isEmpty || role != nil else { throw HelperError("wait_for needs text (and/or role), or change: true") }
+        let gone = a["gone"] as? Bool == true
         let start = Date()
         let what = (role.map { "\($0) " } ?? "") + (q.isEmpty ? "" : "\"\(q)\"")
         // An app with nothing in its accessibility tree (a canvas, a game): watch the pixels instead.
-        let byEye = !q.isEmpty && AX.search(pid: w.pid, query: "", limit: 1, budget: 0.5).isEmpty
+        let byEye = !q.isEmpty && AX.search(pid: w.pid, windows: waitScope(w, run), query: "", limit: 1, budget: 0.5).isEmpty
         while true {
             let found = byEye ? !((try? await ocrFind(q, run.target)) ?? []).isEmpty
-                : !AX.search(pid: w.pid, query: q, role: role, limit: 1, budget: 1).isEmpty
+                : !AX.search(pid: w.pid, windows: waitScope(w, run), query: q, role: role, limit: 1, budget: 1).isEmpty
             let waited = Date().timeIntervalSince(start)
             if found != gone {
                 if waited > 0.5 { notes.append("\(what) \(gone ? "went away" : "appeared") after \(String(format: "%.1f", waited)) s") }
@@ -460,14 +504,172 @@ extension Handlers {
             try await Run.pause(0.15)
         }
     }
+
+    /// Where wait_for looks for text: window `w`, what's open over it, and the app's windows on screen now
+    /// that weren't when the batch began.
+    static func waitScope(_ w: WinInfo, _ run: Run) -> Set<CGWindowID> {
+        waitScope(w.id, over: openOver(w), shown: Windows.all(onScreenOnly: true).filter { $0.pid == w.pid },
+                  atStart: run.visibleBefore) { systemWindow($0, AX.window(pid: $0.pid, wid: $0.id)) }
+    }
+
+    /// Not macOS's own windows shown in the app's name (`system`: the dictation orb).
+    nonisolated static func waitScope(_ target: CGWindowID, over: [CGWindowID], shown: [WinInfo],
+                                      atStart: Set<CGWindowID>, system: (WinInfo) -> Bool) -> Set<CGWindowID> {
+        Set([target] + over + shown.filter { !atStart.contains($0.id) && !system($0) }.map(\.id))
+    }
+
+    nonisolated static func waitsForChange(_ a: [String: Any]) -> Bool {
+        ["wait_for", "waitfor"].contains(kind(a)) && a["change"] as? Bool == true
+    }
+
+    /// The keys wait_for takes. It also reads `label` and `ms` (older names), and every action may have
+    /// `type`/`action`, `confirm` and puter-use's own "_" keys.
+    nonisolated static let waitForKeys = ["text", "role", "gone", "change", "timeout_ms"]
+
+    /// Why action `a` can't run as given, or nil: a wait_for with a key it doesn't read, which would otherwise
+    /// be ignored without a word (`timeout` for `timeout_ms` waited the default 5 s). Only wait_for: other
+    /// actions read their keys in many places, under the OpenAI and Anthropic names too, so no list of them
+    /// is kept to check against.
+    nonisolated static func unknownKeys(_ a: [String: Any]) -> String? {
+        guard ["wait_for", "waitfor"].contains(kind(a)) else { return nil }
+        let known = Set(waitForKeys + ["label", "ms", "type", "action", "confirm"])
+        let bad = a.keys.filter { !known.contains($0) && !$0.hasPrefix("_") }.sorted()
+        guard !bad.isEmpty else { return nil }
+        let named = bad.map { k in "\"\(k)\"" + (closest(k, waitForKeys).map { " (did you mean \($0)?)" } ?? "") }
+        return "has \(bad.count == 1 ? "an unknown key" : "unknown keys") \(named.joined(separator: ", ")): wait_for takes "
+            + waitForKeys.joined(separator: ", ")
+    }
+
+    /// The one of `names` that `key` most likely meant, if any is close: the same but for case and "_"/"-"
+    /// (timeoutMs), the same first four letters (timeout, changed), or a typo or two (txt).
+    nonisolated static func closest(_ key: String, _ names: [String]) -> String? {
+        let meant = ["target": "text", "query": "text", "seconds": "timeout_ms", "wait": "timeout_ms"]
+        func plain(_ s: String) -> String { s.lowercased().filter { $0 != "_" && $0 != "-" } }
+        let k = plain(key)
+        if let m = meant[k], names.contains(m) { return m }
+        if let n = names.first(where: { plain($0) == k }) { return n }
+        if k.count >= 4, let n = names.first(where: { plain($0).commonPrefix(with: k).count >= 4 }) { return n }
+        func distance(_ a: String, _ b: String) -> Int {  // edits from one to the other (Levenshtein)
+            let b = Array(b)
+            var row = Array(0...b.count)
+            for (i, ca) in a.enumerated() {
+                var prev = row[0]
+                row[0] = i + 1
+                for (j, cb) in b.enumerated() {
+                    let cur = row[j + 1]
+                    row[j + 1] = min(cur + 1, row[j] + 1, prev + (ca == cb ? 0 : 1))
+                    prev = cur
+                }
+            }
+            return row[b.count]
+        }
+        return names.map { ($0, distance(plain($0), k)) }.filter { $0.1 <= 2 && $0.1 < k.count }.min { $0.1 < $1.1 }?.0
+    }
+
+    /// The window as wait_for {change} compares it: the same capture size whatever the call's options.
+    static func changeLook(_ t: Target) async throws -> Signature {
+        Signature(try await plan(t, region: nil, Opts([:])).run().image)
+    }
+
+    /// How much of the window (a fraction of its signature's cells) has to look different for wait_for
+    /// {change}: a page or list redrawn, a dialog. A caret, a spinner, a focus ring, a line of status text
+    /// or a browser's loading signs (its tab spinner, Stop button, "Waiting for…" line) stay under it.
+    nonisolated static let changeThreshold = 0.01
+
+    nonisolated static func changed(from base: Signature, to now: Signature) -> Bool {
+        guard let d = base.diff(now, outW: now.w, outH: now.h) else { return false }
+        return d.fraction > changeThreshold
+    }
+
+    /// What ended a wait_for {change}: the window's picture, or a window (it closed, one opened, or the
+    /// batch is on another window by now).
+    enum ChangeSeen: Equatable { case picture, window }
+
+    /// wait_for {change: true}: until the window looks different from the start of the batch (so a change
+    /// that began during an earlier action counts), or a window opens or it closes; then, for a change in
+    /// the picture, until it settles. Nothing in time is a note, not an error: the batch goes on.
+    static func waitForChange(_ timeout: Double, _ run: Run) async throws {
+        guard case .window(let w) = run.target else { throw HelperError("wait_for needs a window target") }
+        guard let base = run.changeBase else {
+            throw HelperError("wait_for: the window couldn't be captured when the batch began, so there's nothing to compare with")
+        }
+        let clock = { ProcessInfo.processInfo.systemUptime }
+        let start = clock()
+        var shotPlan: CapturePlan?, madeFor: PlanBasis?
+        let seen = try await awaitChange(
+            from: base.wid == w.id ? base.sig : nil, timeout: timeout,
+            look: {
+                // A new plan when something opens over the window or it moves (as for act's screenshot).
+                let now = PlanBasis.of(run.target)
+                if shotPlan == nil || now != madeFor {
+                    (shotPlan, madeFor) = (try? await Handlers.plan(run.target, region: nil, Opts([:])), now)
+                }
+                let sig = (try? await shotPlan?.run()).map { Signature($0.image) }
+                if Trace.on, let sig { Trace.log(["k": "change", "fraction": base.sig.diff(sig, outW: sig.w, outH: sig.h)?.fraction ?? 0]) }
+                return sig
+            },
+            window: { Windows.info(w.id)?.onScreen != true || !newWindows(w, run).isEmpty },
+            pause: { try await Run.pause(0.15) }, clock: clock)
+        guard let seen else {
+            notes.append("wait_for: no visible change within \(String(format: "%.1f", timeout)) s (a spinner or a line of "
+                + "text doesn't count)")
+            return
+        }
+        let after = String(format: "%.1f", seen.after)
+        guard seen.seen == .picture else {
+            if base.wid != w.id { return }  // the batch moved to a window it opened (and said so)
+            notes.append(Windows.info(w.id)?.onScreen != true ? "the window closed after \(after) s" : "a new window opened")
+            return
+        }
+        do {
+            _ = try await settle(basis: { PlanBasis.of(run.target) }, makePlan: { try await Handlers.plan(run.target, region: nil, Opts([:])) },
+                                 capture: { try await $0.run() }, pause: { try await Run.pause(0.15) })
+        } catch let e as Cancelled { throw e } catch {}  // gone meanwhile: nothing left to settle
+        notes.append("the window changed after \(after) s (settled at \(String(format: "%.1f", clock() - start)) s)")
+    }
+
+    /// `waitForChange`'s loop, apart from the screen (unit-tested): a look each `pause` until one differs from
+    /// `base` by more than `changeThreshold` (no `base`: the batch is on another window, a change in itself),
+    /// or `window` says one opened or closed. How long that took, or nil after `timeout` seconds.
+    static func awaitChange(from base: Signature?, timeout: Double, look: () async throws -> Signature?,
+                            window: () -> Bool, pause: () async throws -> Void,
+                            clock: () -> Double) async throws -> (seen: ChangeSeen, after: Double)? {
+        let start = clock()
+        while true {
+            guard let base, !window() else { return (.window, clock() - start) }
+            if let now = try await look(), changed(from: base, to: now) { return (.picture, clock() - start) }
+            if clock() - start >= timeout { return nil }
+            try await pause()
+        }
+    }
+
+    /// The app's windows that have appeared since the batch began and aren't in `w`'s picture: not a sheet
+    /// within it, nor a tooltip or popover.
+    static func newWindows(_ w: WinInfo, _ run: Run) -> [WinInfo] {
+        appeared(Windows.all(onScreenOnly: true), over: Windows.info(w.id) ?? w, atStart: run.visibleBefore) {
+            systemWindow($0, AX.window(pid: $0.pid, wid: $0.id))
+        }
+    }
+
+    /// Of `wins`, `w`'s app's windows not on screen at `atStart` and not in `w`'s picture (a sheet within it,
+    /// a tooltip, a popover), nor macOS's own shown in the app's name (`system`: the dictation orb, which
+    /// can open when a text field takes the focus).
+    nonisolated static func appeared(_ wins: [WinInfo], over w: WinInfo, atStart: Set<CGWindowID>,
+                                     system: (WinInfo) -> Bool) -> [WinInfo] {
+        wins.filter {
+            $0.pid == w.pid && $0.layer == 0 && !atStart.contains($0.id) && $0.frame.width >= 200
+                && $0.frame.height >= 120 && !w.frame.contains($0.frame) && !system($0)
+        }
+    }
 }
 
 extension AX {
     /// Pick `option` in a pop-up button, combo box or menu button through accessibility: its menu is
     /// opened (if its items aren't already readable) and the matching item pressed. Matches exactly,
     /// else by a unique prefix, else a unique substring. `check` sees the title matched before it's
-    /// chosen (the policy's say on it). Returns the title picked.
-    @MainActor static func choose(_ el: AXUIElement, _ option: String,
+    /// chosen (the policy's say on it). Returns the title picked. `menuLater`: this is the batch's last
+    /// action, and the end of the batch looks for a menu left open as long as this would (`Handlers.marked`).
+    @MainActor static func choose(_ el: AXUIElement, _ option: String, menuLater: Bool = false,
                                   check: (String) throws -> Void = { _ in }) async throws -> String {
         let role = value(el, kAXRoleAttribute) as? String ?? ""
         let want = menuKey(option)
@@ -559,16 +761,22 @@ extension AX {
             throw HelperError("couldn't pick \"\(hits[0].1)\" (disabled?)")
         }
         // The item is chosen, but a menu opened through accessibility can stay open (taking the user's
-        // typing): close it.
+        // typing): close it. As the batch's last action (`menuLater`), the end of the batch looks for one
+        // as long and closes it with no note (`pickedFromMenu`), so in a native app it's looked for once
+        // here. Not where `act` waits in full (a browser): its first frame there would come sooner.
         if opened, let pid = pidOf(el) {
+            let full = windowID(el).flatMap { Windows.info($0) }.map { Handlers.waitsInFull(.window($0)) }
+            let once = Handlers.looksOnce(menuLater: menuLater, waitsInFull: full)
             for _ in 0..<8 {  // it may still be on its way up
                 if let m = openMenu(pid: pid) {
                     await Input.ms(80)
                     closeMenu(m)
                     break
                 }
+                if once { break }
                 await Input.ms(50)
             }
+            if menuLater { Handlers.pickedFromMenu(pid: pid) }
         }
         return hits[0].1
     }
@@ -618,14 +826,15 @@ extension AX {
     }
 
     /// After a navigation: true once the window's web page says it has loaded (false on timeout). Pages
-    /// that don't say (no AXLoaded) count as loaded; the batch's end settle covers them.
-    @MainActor static func waitForPage(pid: pid_t, wid: CGWindowID, timeout: Double) async throws -> Bool {
-        try await Run.pause(min(0.4, timeout))
+    /// that don't say (no AXLoaded) count as loaded; the batch's end settle covers them. The first look
+    /// comes after `first` s, then every 0.1 s.
+    @MainActor static func waitForPage(pid: pid_t, wid: CGWindowID, timeout: Double, first: Double = 0.4) async throws -> Bool {
+        try await Run.pause(min(first, timeout))
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             guard let win = window(pid: pid, wid: wid), let page = webArea(win) else { return true }
             if (value(page, "AXLoaded") as? Bool) != false, (value(page, "AXBusy") as? Bool) != true { return true }
-            try await Run.pause(0.2)
+            try await Run.pause(0.1)
         }
         return false
     }

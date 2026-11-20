@@ -18,7 +18,7 @@ open-codex-computer-use and cua-driver, and verified here on macOS 27:
 |---|---|
 | events must reach one app, not the cursor | `SLEventPostToPid`. Mouse events are stamped with the window: fields 51/91/92, pid field 40, and the private `CGEventSetWindowLocation` |
 | a background window swallows the first click to activate itself | a primer click at window-local (-1,-1), then the real click; skipped once the window is the key window of an app held active, where clicks count as they come |
-| background apps ignore key equivalents and route keys to no window | an AppKit-only activation record, plus "make key window" records (`SLPSPostEventRecordTo`). Your frontmost app and keyboard focus don't change |
+| background apps ignore key equivalents and route keys to no window | an AppKit-only activation record, plus "make key window" records (`SLPSPostEventRecordTo`). On a new hold the app has no key window, so shortcuts like cmd+a would find nothing to act on: the primer click is spent on the window just before the first key or menu command goes out, after that action's checks. Your frontmost app and keyboard focus don't change |
 | Chromium ignores background key equivalents | `cmd+…` is pressed as the matching menu item through accessibility |
 | WindowServer accelerates synthetic scrolls | scroll is sent as a paced trackpad gesture (began/changed/ended) |
 | a long scroll at the end would go on for seconds past it | every few steps it looks under the pointer: the scroll bar at the end, or the content no longer moving (after moving, or with its end in view), stops it with a note |
@@ -57,7 +57,8 @@ Verified with Claude/VS Code in front and the real cursor never moving:
 - **Menus opened by a click (the probe):** `right_click … item: "Layout Orientation > Horizontal"` and a
   pop-up's `click … item: "Green"` choose in one step; a menu left open is closed with a note
 - **New windows (Firefox):** `cmd+n` makes the new window the target (with `PUTER_USE_WINDOW_SIZE=1280x860`
-  it is also sized to 1280×860 pt). Text in a region (a Hacker News row) reads back exactly
+  it is also sized to 1280×860 pt; the default box is 1440×900). Text in a region (a Hacker News row) reads
+  back exactly
 
 ## Human input
 
@@ -100,7 +101,7 @@ modelled on human reaching, which is also what OpenAI's helper approximates:
   Shortcuts press their modifiers one after another, then the key.
 
 **Long text is pasted**, as people do: a stretch longer than `PUTER_USE_PASTE_OVER` characters (default
-100, about a sentence; `0` = always type) goes in with Cmd+V after a short pause. Newlines are still
+80; `0` = always type) goes in with Cmd+V after a short pause. Newlines are still
 Return key presses, so a multi-paragraph text pastes each long paragraph and presses Return between
 them. The clipboard is borrowed: the text is marked transient (clipboard managers skip it) and your
 own contents are put back 0.6 s later, unless you copied something in between.
@@ -116,7 +117,7 @@ whether the selection is being dragged away, so the caret is put at the click po
 click lands on plain text. Double- and triple-click (word, line) and Shift+arrow keys work as they
 are. Apps that handle the events themselves (browsers, Electron, custom views) need none of this.
 
-The cost is time: a click or move takes 0.14-0.85 s, and a 100-character sentence takes about 9 s to
+The cost is time: a click or move takes 0.14-0.85 s, and an 80-character line takes about 4 s to
 type. That's still small next to a model call, so batching actions remains the big win.
 `PUTER_USE_CURSOR_SPEED` and `PUTER_USE_TYPING_WPM` change the pace; `0` makes either instant.
 

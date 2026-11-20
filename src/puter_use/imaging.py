@@ -31,9 +31,14 @@ def _save(img: Image.Image, fmt: str, **opts) -> bytes:
     return buf.getvalue()
 
 
-def png8(img: Image.Image) -> bytes:
+def png8(img: Image.Image, max_bytes: int = 0) -> bytes:
     pal = img.quantize(256, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
-    return _save(pal, "PNG", optimize=True)
+    data = _save(pal, "PNG", compress_level=6)
+    # optimize=True (zlib 9) is ~4x slower for a few % fewer bytes (never over 25% in tests). Pay it only when that
+    # could bring an over-budget image under max_bytes, so no image turns to JPEG for the faster save.
+    if max_bytes and max_bytes < len(data) <= max_bytes * 1.5:
+        data = _save(pal, "PNG", optimize=True)
+    return data
 
 
 def _lossy(img: Image.Image, fmt: str, quality: int, max_bytes: int) -> bytes:
@@ -57,7 +62,7 @@ def encode(raw: bytes, fmt: str = "auto", quality: float = 0.8, max_bytes: int =
     img = _flatten(img)
     q = int(round(quality * 100 if quality <= 1 else quality))
     if fmt in ("auto", "png"):
-        data = png8(img)
+        data = png8(img, max_bytes)
         if fmt == "png" or not max_bytes or len(data) <= max_bytes:
             return data, MIME["png"]
         fmt = "jpeg"

@@ -59,9 +59,13 @@ enum Input {
         return true
     }
 
+    /// Tests: takes the events instead of an app (nothing is posted).
+    static var sink: ((CGEvent) -> Void)?
+
     /// Deliver to the target process only, stamped with its window so AppKit routes it without raising.
     static func post(_ e: CGEvent, at p: CGPoint?, _ route: Route) {
         Trace.event(e, at: p, pid: route.pid, wid: route.wid)
+        if let sink { return sink(e) }
         if route.foreground {
             e.post(tap: .cghidEventTap)
             return
@@ -81,6 +85,8 @@ enum Input {
     /// Never twice within a double-click interval: that spot is the window's resize corner, and a
     /// double-click there makes macOS expand the window to the screen edge.
     /// `force`: spend it even on a key window (to make this one the key window instead).
+    /// The app gets `primerGap` to take it before the next button or key goes down (`afterPrimer`), so the
+    /// pointer's way to the spot isn't added to it.
     static func primer(_ route: Route, force: Bool = false) async {
         guard !route.foreground, route.primer, route.wid != 0 else { return }
         // The key window of an app held active takes clicks as they come: there's no activation click to spend.
@@ -100,9 +106,26 @@ enum Input {
             await MainActor.run { _ = Hold.fresh.remove(route.pid) }
             await ms(2)
             mouse(.leftMouseUp, p, route)
+            primerUp = ProcessInfo.processInfo.systemUptime
         }
         Trace.label = nil
-        await ms(60)
+    }
+
+    nonisolated static let primerGap = 0.06
+    /// When the last primer's button came up (system uptime).
+    static var primerUp: TimeInterval?
+
+    /// What's left at `now` of the gap after a primer that came up at `up`: 0 once it's over, or with none.
+    static func gapLeft(since up: TimeInterval?, now: TimeInterval, gap: TimeInterval = primerGap) -> TimeInterval {
+        guard let up else { return 0 }
+        return min(gap, max(0, up + gap - now))
+    }
+
+    /// Before a button or key goes down: waits out what's left of the last primer's gap. The pointer's
+    /// travel there and the aim usually cover it; a jump (cursor speed 0), a pointer already on the spot
+    /// or modifier keys pressed on the way don't.
+    static func afterPrimer() async {
+        await sleep(gapLeft(since: primerUp, now: ProcessInfo.processInfo.systemUptime))
     }
 
     static func ms(_ n: UInt64) async { try? await Task.sleep(nanoseconds: n * 1_000_000) }
@@ -127,6 +150,7 @@ enum Input {
     static func press(_ p: CGPoint, _ route: Route, button: String = "left", count: Int = 1, flags: CGEventFlags = [],
                       typist: Typist) async {
         let (down, up, _, btn) = buttonTypes(button)
+        await afterPrimer()
         newClickGroup()
         for i in 1...max(1, count) {
             guard mouse(down, p, route, button: btn, clickState: i, flags: flags) else { return }  // cancelled
@@ -200,6 +224,7 @@ enum Input {
     /// the keys, not just the click's flags). Returns them for `releaseModifiers`.
     static func pressModifiers(_ flags: CGEventFlags, _ route: Route, typist: Typist) async -> [(flag: CGEventFlags, code: CGKeyCode)] {
         let mods = Keys.modifierOrder.filter { flags.contains($0.flag) && !held.contains($0.flag) }
+        if !mods.isEmpty { await afterPrimer() }
         for m in mods {
             held.insert(m.flag)  // the pointer's moves and presses carry it meanwhile, as with a real keyboard
             key(m.code, down: true, flags: [], route)
@@ -241,9 +266,11 @@ enum Input {
     /// hold, the next one may go down before the last is up, and Shift is pressed around capitals and
     /// symbols. Newlines and tabs are the Return and Tab keys.
     ///
-    /// `stillSafe` is asked before every key: false stops right there (letting go of the keys still down)
-    /// and is returned. A key goes to the app's key window, which may have become the user's. A client
-    /// hanging up stops it the same way. The characters that went out are counted in the request's `Work`.
+    /// `stillSafe` is asked before every key goes down (Shift, Return and Tab too): false stops right there
+    /// (letting go of the keys still down) and is returned. A key goes to the app's key window, which may
+    /// have become the user's. It isn't asked before a key comes up: stopping would send that same key-up
+    /// to the same window, and the next key down is checked. A client hanging up stops it the same way,
+    /// before any stroke. The characters that went out are counted in the request's `Work`.
     @discardableResult
     static func type(_ text: String, _ route: Route, typist: Typist, stillSafe: (() -> Bool)? = nil) async -> Bool {
         struct Stroke {
@@ -303,7 +330,7 @@ enum Input {
         var pressed = Set<CGKeyCode>()
         for s in strokes.sorted(by: { ($0.t, $0.order) < ($1.t, $1.order) }) {
             await sleep(s.t - (ProcessInfo.processInfo.systemUptime - start))
-            if Connection.hungUp || stillSafe?() == false {
+            if Connection.hungUp || (s.down != nil && stillSafe?() == false) {
                 for code in pressed { key(code, down: false, flags: [], route) }  // leave nothing held
                 return false
             }

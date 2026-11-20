@@ -13,6 +13,7 @@ enum AX {
         var label: String?  // its title/description then (not its value): how to tell it's still the same
         var name = ""  // outline role name ("button", "field", …)
         var parent: AXUIElement? = nil  // its container then: a replacement must be in the same one
+        var away = false  // numbered by an off-screen search: used only once where it is is known (`reveal`)
     }
 
     /// Element numbers per window, stable across looks: an element keeps its number for as long as it
@@ -23,6 +24,7 @@ enum AX {
         var nodes: [Int: Node] = [:]
         var next = 1
         var lines: [(Int, String)] = []  // the last outline's numbered lines, in order (for "what changed")
+        var cutShort = false  // that outline ran out of time (`walkBudget`): its lines are only part of the window
 
         func number(_ n: Node) -> Int {
             let id = ids[n.element] ?? { defer { next += 1 }; return next }()
@@ -79,7 +81,7 @@ enum AX {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 1.5)
         // Chromium/Electron only build their accessibility tree when asked.
-        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        askForTree(pid) { AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue) }
         // So does Firefox (Gecko), for clients asking for the "enhanced" UI: done on the first look at it, so
         // find and target: see its pages from the start. Never for other apps: some native ones change
         // behaviour with it.
@@ -89,6 +91,26 @@ enum AX {
             usleep(400_000)  // it builds the tree
         }
         return app
+    }
+
+    /// When each app (pid) last answered `AXManualAccessibility` (system uptime, s).
+    nonisolated(unsafe) static var treeAsked: [pid_t: TimeInterval] = [:]
+    /// How often it's asked again. Not once for good: another accessibility client turning Electron's
+    /// enhanced UI off turns its tree off too. Not on every lookup either: each is a round trip to the app,
+    /// and lookups come in bursts (about one per typed key). Agents' calls are usually further apart than
+    /// this, so each call still asks on its first lookup; a long one asks again every 5 s.
+    static let treeEvery: TimeInterval = 5
+
+    /// Sends `AXManualAccessibility` (`send`) to `pid` unless the app answered it less than `treeEvery` ago.
+    /// Done, unsupported (native apps) and not implemented count as answered; "cannot complete" (busy, or
+    /// still launching) doesn't, so the next lookup asks again.
+    static func askForTree(_ pid: pid_t, now: TimeInterval = ProcessInfo.processInfo.systemUptime, send: () -> AXError) {
+        func fresh(_ t: TimeInterval) -> Bool { now >= t && now - t < treeEvery }
+        if let last = treeAsked[pid], fresh(last) { return }
+        let err = send()
+        guard err == .success || err == .attributeUnsupported || err == .notImplemented else { return }
+        if treeAsked.count >= 32 { treeAsked = treeAsked.filter { fresh($0.value) } }  // gone apps, reused pids
+        treeAsked[pid] = now
     }
 
     static func window(pid: pid_t, wid: CGWindowID) -> AXUIElement? {
@@ -176,6 +198,22 @@ enum AX {
         kAXPlaceholderValueAttribute, kAXSelectedAttribute, kAXHelpAttribute,
     ]
 
+    /// An element's `attrs`, in one round trip to its app.
+    static func readAttrs(_ el: AXUIElement) -> [AnyObject]? {
+        var raw: CFArray?
+        guard AXUIElementCopyMultipleAttributeValues(el, attrs as CFArray, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
+              let vals = raw as? [AnyObject], vals.count == attrs.count else { return nil }
+        return vals
+    }
+
+    /// How long a walk over a window's elements (an outline, the text in an area) may take. Its other caps
+    /// count elements and characters, but an app that's busy yet answering (a page loading, an IDE
+    /// indexing) can take tens of seconds over a whole window. Then the walk stops with what it has and says
+    /// so. Checked between elements, so one slow answer can still run over. Longer than `search`'s 1.5 s
+    /// over the same reads: a big outline that's just big isn't cut, and cut short it loses more.
+    static let walkBudget: TimeInterval = 2.5
+    static func uptime() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+
     static func clip(_ s: String, _ n: Int) -> String {
         let one = s.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         return one.count > n ? String(one.prefix(n - 1)) + "…" : one
@@ -196,18 +234,24 @@ enum AX {
     /// for reading values exactly (a table row, a price) without a zoomed screenshot.
     static func text(pid: pid_t, wid: CGWindowID, within: CGRect) -> String? {
         guard let win = window(pid: pid, wid: wid) else { return nil }
+        return text(of: win, within: within)
+    }
+
+    /// `text` from window element `win`. `budget`, `now` and `read` are there for tests.
+    static func text(of win: AXUIElement, within: CGRect, budget: TimeInterval = walkBudget, now: () -> TimeInterval = uptime,
+                     read: (AXUIElement) -> [AnyObject]? = readAttrs) -> String {
         let area = within.insetBy(dx: -2, dy: -2)
         let inputs: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox"]
         let labelled: Set<String> = ["AXButton", "AXLink", "AXPopUpButton", "AXMenuButton", "AXCheckBox",
                                      "AXRadioButton", "AXMenuItem", "AXCell"]
         var runs: [(rect: CGRect, text: String)] = []
+        let end = now() + budget
+        var slow = false
 
         func walk(_ el: AXUIElement, depth: Int) {
-            guard depth < 60, runs.count < 500 else { return }
-            var raw: CFArray?
-            guard AXUIElementCopyMultipleAttributeValues(el, attrs as CFArray, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
-                  let vals = raw as? [AnyObject], vals.count == attrs.count
-            else { return }
+            guard depth < 60, runs.count < 500, !slow else { return }
+            if now() >= end { slow = true; return }
+            guard let vals = read(el) else { return }
             func str(_ i: Int) -> String? {  // keeps edge spaces: pages split "380 points" / " by " / "hn_acker"
                 guard let s = vals[i] as? String, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
                 return s.replacingOccurrences(of: "\n", with: " ")
@@ -253,7 +297,9 @@ enum AX {
             }
             return s.split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
         }
-        return out.isEmpty ? "(no text in that area)" : out.joined(separator: "\n")
+        // (Out of time with nothing read, it's read off the screen, as for an app that exposes no text.)
+        if out.isEmpty { return "(no text in that area)" }
+        return out.joined(separator: "\n") + (slow ? "\n… (cut short: the app answered slowly; zoom in with a screenshot for the rest)" : "")
     }
 
     /// Roles worth acting on, for the `interactive` outline.
@@ -267,23 +313,30 @@ enum AX {
     private static func buildOutline(pid: pid_t, wid: CGWindowID, within: CGRect?, maxElements: Int,
                                      maxChars: Int, interactive: Bool = false) -> String? {
         guard let win = window(pid: pid, wid: wid) else { return nil }
-        let reg = registry(wid)
-        var seen = Set<Int>()
         var visible = (frame(win) ?? Windows.info(wid)?.frame ?? .infinite).insetBy(dx: -2, dy: -2)
         if let within { visible = visible.intersection(within.insetBy(dx: -2, dy: -2)) }
+        return outline(of: win, registry(wid), visible: visible, menus: menuWindows(pid), maxElements: maxElements,
+                       maxChars: maxChars, interactive: interactive)
+    }
+
+    /// The outline of window element `win`, its elements in `visible` (global points) numbered in `reg`.
+    /// `menus`: where the app's open menus are. `budget`, `now` and `read` are there for tests.
+    static func outline(of win: AXUIElement, _ reg: Registry, visible: CGRect, menus: [CGRect], maxElements: Int,
+                        maxChars: Int, interactive: Bool, budget: TimeInterval = walkBudget,
+                        now: () -> TimeInterval = uptime, read: (AXUIElement) -> [AnyObject]? = readAttrs) -> String {
+        var seen = Set<Int>()
         var nodes: [Node] = []
         var lines: [String] = []
         var numbered: [(Int, String)] = []
         var chars = 0
         var truncated = false
+        let end = now() + budget
+        var slow = false
 
-        let menus = menuWindows(pid)
         func walk(_ el: AXUIElement, depth: Int, indent: Int, parentLabel: String?, parent: AXUIElement? = nil) {
-            if truncated || depth > 60 { return }
-            var raw: CFArray?
-            guard AXUIElementCopyMultipleAttributeValues(el, attrs as CFArray, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
-                  let vals = raw as? [AnyObject], vals.count == attrs.count
-            else { return }
+            if truncated || slow || depth > 60 { return }
+            if now() >= end { slow = true; return }
+            guard let vals = read(el) else { return }
             func str(_ i: Int) -> String? {
                 if let s = vals[i] as? String, !s.isEmpty { return s }
                 return nil
@@ -373,8 +426,10 @@ enum AX {
 
         walk(win, depth: 0, indent: 0, parentLabel: nil)
         reg.lines = numbered
-        reg.prune(keeping: seen)
+        reg.cutShort = slow
+        if !slow { reg.prune(keeping: seen) }  // what a walk cut short didn't reach may still be there: keep its numbers
         if truncated { lines.append("… (truncated; zoom with region or use a screenshot)") }
+        if slow { lines.append("… (outline cut short: the app answered slowly; look again later or use a screenshot)") }
         return lines.joined(separator: "\n")
     }
 

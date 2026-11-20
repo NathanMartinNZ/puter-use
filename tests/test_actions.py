@@ -66,6 +66,13 @@ def test_cli_tier1_commands():
         "type": "open", "path": "~/notes.txt", "app": "TextEdit"}
     assert build_action(p.parse_args(["wait-for", "Done", "--role", "text", "--timeout-ms", "900"])) == {
         "type": "wait_for", "text": "Done", "role": "text", "timeout_ms": 900}
+    assert build_action(p.parse_args(["wait-for", "--change", "--timeout-ms", "4000"])) == {
+        "type": "wait_for", "change": True, "timeout_ms": 4000}
+    import pytest
+
+    for bad in (["wait-for"], ["wait-for", "Done", "--change"]):
+        with pytest.raises(SystemExit):
+            build_action(p.parse_args(bad))
     assert build_action(p.parse_args(["type", "Ada", "-e", "3", "--clear", "--submit"])) == {
         "type": "type", "text": "Ada", "clear": True, "submit": True, "element": 3}
     assert build_action(p.parse_args(["type", "hi", "--at", "10", "20"]))["x"] == 10
@@ -91,6 +98,7 @@ def test_mcp_action_schema_tier1():
         Action(type="keypress", keys="Tab", repeat=101)
     with pytest.raises(pydantic.ValidationError):
         Action(type="wait_for", text="x", timeout_ms=60000)
+    assert Action(type="wait_for", change=True).model_dump(exclude_none=True) == {"type": "wait_for", "change": True}
 
 
 def test_stopped_batch_is_reported_and_fails_cli(capsys):

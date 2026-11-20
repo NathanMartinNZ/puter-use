@@ -16,9 +16,10 @@ def capture_params() -> dict:
         "max_tokens": int(env("PUTER_USE_MAX_TOKENS", "1000")),
         "tile": int(env("PUTER_USE_TILE", "28")),
         "format": "png",
-        # Windows the agent opens (cmd+n, launch) are left as the app sized them; "1280x860" etc. shrinks
-        # them to fit that many points, which keeps screenshots sharp within the token cap.
-        "window_size": env("PUTER_USE_WINDOW_SIZE", "off"),
+        # Windows the agent opens (navigate, open, cmd+n) are shrunk (never enlarged) to fit this many
+        # points: 1440x900 is captured at the full 0.75 px/pt within the token cap. Windows an app opens
+        # or restores as it launches keep their size. "off" leaves them all as the app sized them.
+        "window_size": env("PUTER_USE_WINDOW_SIZE", "1440x900"),
         # The agent's pointer moves like a hand and the app receives that same path. Cursor: drawn or not;
         # speed 1 = human pace, 2 = twice as fast, 0 = jump.
         "cursor": env("PUTER_USE_CURSOR", "1") != "0",
@@ -26,8 +27,9 @@ def capture_params() -> dict:
         # Typing pace of a fast human typist, with a human rhythm; 0 = as fast as possible.
         "typing_wpm": float(env("PUTER_USE_TYPING_WPM", "280")),
         # Text longer than this (per line, in characters) is pasted instead, as people do; 0 = always type.
-        "paste_over": int(env("PUTER_USE_PASTE_OVER", "100")),
-        # The first look at an app adds a few lines about it: its scripting support, its shortcuts, quirks.
+        "paste_over": int(env("PUTER_USE_PASTE_OVER", "80")),
+        # The first look at an app adds a few lines about it: its scripting support, its shortcuts, quirks,
+        # saved macros.
         "app_cards": env("PUTER_USE_APP_CARDS", "1") != "0",
         # Longest accessibility outline sent (characters); longer ones are cut with a note.
         "max_chars": int(env("PUTER_USE_OUTLINE_CHARS", "8000")),

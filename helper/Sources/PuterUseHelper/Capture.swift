@@ -22,6 +22,20 @@ struct CapturePlan {
     }
 }
 
+/// What a window's capture plan was made for: the app's windows over it (a plan composites only the
+/// windows there when it was made) and where it is (the plan's rect). When either changes, the plan is
+/// out of date: a sheet, dialog or popover that opened since would be missing from its picture.
+struct PlanBasis: Equatable {
+    let over: WindowSet
+    let frame: CGRect?
+
+    /// nil for the screen, whose plan doesn't depend on any window.
+    static func of(_ t: Target) -> PlanBasis? {
+        guard case .window(let w) = t else { return nil }
+        return PlanBasis(over: WindowSet.of(w), frame: Windows.info(w.id)?.frame)
+    }
+}
+
 /// How big a screenshot to send. Vision models bill images by area in fixed tiles (Claude: 28px,
 /// OpenAI: 32px), so size is set in output pixels per screen point, capped by a tile budget and
 /// snapped to the tile grid. File format/bytes don't affect the model's token count; dimensions do.

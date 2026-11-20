@@ -37,6 +37,7 @@ enum Macros {
     struct Entry {
         let name: String
         let line: String
+        var vars: [String] = []
     }
 
     /// Whether macro `m` was saved in the app running as `pid`: by bundle id, or by name for an app that
@@ -65,7 +66,7 @@ enum Macros {
             if let vars = m["vars"] as? [String], !vars.isEmpty { line += ", vars: \(vars.joined(separator: ", "))" }
             line += ")"
             if let d = m["description"] as? String, !d.isEmpty { line += ": \(d)" }
-            return Entry(name: name, line: line)
+            return Entry(name: name, line: line, vars: m["vars"] as? [String] ?? [])
         }
     }
 
@@ -159,11 +160,24 @@ enum Macros {
     ]
     static let clicks: Set<String> = ["click", "left_click", "double_click", "triple_click", "right_click", "middle_click"]
 
+    /// A menu step given by a name alone (`menu {item: "Toggle Thing"}`), once it has run, is saved as the
+    /// full path it ran (`ran`: "View > Toggle Thing"), so a replay doesn't depend on the name staying unique.
+    /// Any other step, and a menu step given by its path (`ran` nil), is saved as it was given.
+    nonisolated static func ran(_ step: [String: Any], menu ran: String?) -> [String: Any] {
+        guard let ran, ["menu", "menu_item"].contains(Handlers.kind(step)) else { return step }
+        var s = step
+        s["item"] = ran
+        s["path"] = nil  // where the menu action also reads its item from
+        s["text"] = nil
+        return s
+    }
+
     /// The step to save for action `a`, about to run on window `t`: element numbers (this session's
     /// only) and screenshot pixels become names and window points.
     static func record(_ a: [String: Any], _ t: Target) -> [String: Any] {
         var s = a
         s["confirm"] = nil  // the user's OK was for that time: a replay asks again
+        s["_node"] = nil  // an element looked up in this session (internal): never saved
         guard case .window(let w) = t, a["units"] as? String != "pt" else { return s }
         let frame = Windows.info(w.id)?.frame ?? w.frame
         func rel(_ g: CGPoint) -> [NSNumber] {  // to a tenth of a point, saved as written (586.9, not 586.8999…)
@@ -184,20 +198,21 @@ enum Macros {
         if let idx = Handlers.num(a["element"]) {
             s["element"] = nil
             if let n = try? AX.node(w.id, Int(idx)) {
-                if let label = n.label ?? AX.label(n.element), !label.isEmpty {
-                    s["target"] = ["text": label, "role": n.name]
-                    // A name others share only picks out the one at the saved spot on replay.
-                    let hits = Handlers.matches(Handlers.Spec(text: label, role: n.name), w)
-                    if !(hits.count == 1 && CFEqual(hits[0].element, n.element)) { s["spot"] = true }
-                }
-                if let c = AX.center(n) { place(c) }
+                let label = n.label ?? AX.label(n.element)
+                let alone = label.map { !$0.isEmpty && Handlers.namesAlone(n.element, Handlers.Spec(text: $0, role: n.name), w) } ?? false
+                let away = n.away || AX.sight(n.element).map(Handlers.offScreen) == true
+                let saved = byName(label: label, role: n.name, alone: alone, away: away, at: AX.center(n))
+                if let target = saved.target { s["target"] = target }
+                if saved.spot { s["spot"] = true }
+                if let c = saved.place { place(c) }
             }
         } else if a["target"] == nil, let g = xy.flatMap({ try? Handlers.toGlobal(t, $0.x, $0.y) }) ?? px(a["coordinate"]) {
             s["coordinate"] = nil
             place(g)
             if clicks.contains(Handlers.kind(a)), let name = anchor(w, at: g) { s["target"] = name }
         }
-        if let path = a["path"] as? [Any] {
+        // A drag's path is points; a menu's (["View", "Toggle Thing"]) is its item, kept as given.
+        if let path = Handlers.pointPath(a) {
             s["path"] = path.compactMap(px).map(rel)
             moved = true
         }
@@ -226,6 +241,23 @@ enum Macros {
         return s
     }
 
+    /// What a step on an element named by number saves: its name (`label`, `role`), with `spot` when the name isn't
+    /// its alone (`alone`: on screen or off; a replay then picks the one at the saved place), and its place (`at`)
+    /// only when it's in view: out of view (`away`), where it is means nothing on replay, so with no place a
+    /// `spot` step isn't replayed.
+    nonisolated static func byName(label: String?, role: String, alone: Bool, away: Bool,
+                                   at: CGPoint?) -> (target: [String: Any]?, spot: Bool, place: CGPoint?) {
+        let place = away ? nil : at
+        guard let label, !label.isEmpty else { return (nil, false, place) }
+        return (["text": label, "role": role], !alone, place)
+    }
+
+    /// A step saved as one of several elements with its name, with no place to pick it out by (it was out of view).
+    static func noSpot(_ v: Any) -> HelperError {
+        HelperError("\((try? Handlers.spec(v).description) ?? "the element") was one of several with that name when the macro "
+            + "was saved, and out of view, so its place wasn't saved and nothing was done")
+    }
+
     /// A step that acts at a saved position alone (no name to find it by).
     nonisolated static func positional(_ a: [String: Any]) -> Bool {
         if Handlers.kind(a) == "fill" { return (a["fields"] as? [[String: Any]] ?? []).contains(where: positional) }
@@ -248,7 +280,12 @@ enum Macros {
             let n = try AX.node(w.id, Handlers.number(here[0], w.id))
             return AX.center(n).map { ($0, n) }
         }
-        guard all.isEmpty, let role = sp.role, let el = element(w.pid, at: g, role: role), AX.blockedBy(el) == nil else {
+        // By the spot alone only inside the window (a hit-test elsewhere can find another of the app's windows, maybe
+        // the user's), and not while the name is still there off screen (its label didn't change; the spot is stale).
+        guard all.isEmpty, let role = sp.role, (Windows.info(w.id)?.frame ?? w.frame).contains(g) else { return nil }
+        let away = Handlers.offScreenCandidates(sp, w, limit: 30)
+        guard away.complete, !away.matches.contains(where: \.exact), let el = element(w.pid, at: g, role: role),
+              AX.blockedBy(el) == nil else {
             return nil
         }
         Handlers.notes.append("\(sp.description) wasn't there by name: used the \(role) where it was")

@@ -217,8 +217,8 @@ extension Handlers {
             }
             // A chosen item closes its menu (it fades out); one still open means it didn't take.
             var gone = false
-            for _ in 0..<10 {
-                await Input.ms(100)
+            for _ in 0..<20 {
+                await Input.ms(50)
                 if AX.openMenu(pid: r.pid) == nil { gone = true; break }
             }
             if !gone { throw HelperError("\(chosen.joined(separator: " > ")) didn't respond") }
@@ -243,17 +243,45 @@ extension Handlers {
         return nil
     }
 
+    /// A request the client gave up on: whether its cleanup gives a menu time to come up before closing it.
+    /// Only if an action that ran, or was cut short, could have opened one: anything that `mayOpen`, keys and
+    /// typing (a suggestions list), a key or button held down. After only waits, looks, moves and scrolls the
+    /// cleanup just looks once, so the session's next request isn't held up.
+    nonisolated static func cancelWait(_ actions: [[String: Any]], done: Int) -> Bool {
+        actions.prefix(done + 1).contains {
+            mayOpen($0) || ["type", "type_text", "paste", "key_down", "keydown", "mouse_down"].contains(kind($0))
+        }
+    }
+
+    /// Per session: the app whose pop-up the batch's last action picked from (`AX.choose`), and in which act.
+    static var picked: [ObjectIdentifier: (pid: pid_t, act: Int)] = [:]
+
+    /// The batch's last action picked from a menu of app `pid` it opened itself.
+    static func pickedFromMenu(pid: pid_t) { picked[ObjectIdentifier(Session.current)] = (pid, Session.current.acts) }
+
+    /// Whether this act's last action picked from a menu of app `pid` (`pickedFromMenu`). Asked once: the
+    /// answer is forgotten.
+    static func pickedJustNow(pid: pid_t) -> Bool {
+        guard let p = picked.removeValue(forKey: ObjectIdentifier(Session.current)) else { return false }
+        return p.pid == pid && p.act == Session.current.acts
+    }
+
     /// At the end of a batch: close a menu left open, telling the agent what was in it. After a click
     /// (`wait`), one may still be on its way up. After typing (`afterKeys`) it's a suggestions list.
+    /// After a pick from a pop-up's menu as the last action (`pickedJustNow`), it's that menu, still fading or
+    /// shown again: closed with no note, as the choice was made. Whether there was one (the window changed
+    /// again just now).
+    @discardableResult
     static func closeLeftOpenMenu(pid: pid_t, wait: Bool, afterKeys: Bool = false, route r: Route? = nil,
-                                  remember: Bool = true) async {
+                                  remember: Bool = true) async -> Bool {
+        let chosen = pickedJustNow(pid: pid)
         var menu = AX.openMenu(pid: pid)
         for _ in 0..<(wait && menu == nil ? 8 : 0) {
             await Input.ms(50)
             menu = AX.openMenu(pid: pid)
             if menu != nil { break }
         }
-        guard let menu else { return }
+        guard let menu else { return false }
         Trace.log(["k": "menu", "open": true])  // what went into it was the menu's (scripts/check_motion.py)
         await Input.ms(120)  // let it finish appearing before it's told to close
         let titles = AX.menuTitles(menu).filter { AX.menuKey($0) != "services >" && AX.menuKey($0) != "services" }
@@ -263,17 +291,19 @@ extension Handlers {
         if afterKeys {
             notes.append("a suggestions list opened as you typed (\(list)); "
                 + (closed ? "it's closed again, so your keys stay in the field" : "it's still open: Down or Return may pick from it"))
-            return
+            return true
         }
         if !closed {
             notes.append("a menu opened (\(list)) and couldn't be closed: it takes the keyboard until it is (Escape)")
-            return
+            return true
         }
+        if chosen { return true }  // the pop-up's own, after its choice was made: nothing to tell or remember
         if remember, let wid = r?.wid ?? current {
             Session.current.lastClosedMenu = (titles, wid, Session.current.acts)
         }
         notes.append("a menu opened (\(list)); it's closed again, as an open menu takes the user's typing. Open it and "
             + "choose in one step: the same click with item: \"…\" (\"Font > Bold\" for a submenu)")
+        return true
     }
 
     /// Close `menu`. Firefox's suggestions list ignores the accessibility cancel: then Escape, when keys

@@ -149,7 +149,7 @@ you're most likely to want:
 
 | variable | default | meaning |
 |---|---|---|
-| `PUTER_USE_WINDOW_SIZE` | `off` | e.g. `1280x860`: windows the agent opens are shrunk to fit, so screenshots stay sharp |
+| `PUTER_USE_WINDOW_SIZE` | `1440x900` | windows the agent opens (`navigate`, `open`, Cmd+N) are shrunk to fit, so screenshots stay sharp; `off` leaves them as the app sized them |
 | `PUTER_USE_CURSOR_SPEED` | `1` | pointer pace: `2` = twice as fast, `0` = jump instantly |
 | `PUTER_USE_TYPING_WPM` | `280` | typing speed; `0` = as fast as possible |
 | `PUTER_USE_CURSOR` | `1` | `0` hides the agent cursor |

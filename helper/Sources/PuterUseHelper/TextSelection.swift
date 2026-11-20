@@ -55,6 +55,22 @@ extension AX {
 
     static func selectedRange(_ el: AXUIElement) -> CFRange? { range(value(el, kAXSelectedTextRangeAttribute)) }
 
+    /// About where `el`'s text cursor is for an empty selection at `index` (global points, no width): the
+    /// left edge of the character after it (on the cursor's line, even a newline), else the right edge of the
+    /// one before it (at the end of the text), else the empty range's bounds (an empty field: AppKit reports
+    /// those a line too high).
+    static func insertionPoint(_ el: AXUIElement, at index: Int) -> CGRect? {
+        for (location, length, after) in [(index, 1, false), (index - 1, 1, true), (index, 0, false)] where location >= 0 {
+            var r = CFRange(location: location, length: length)
+            guard let rv = AXValueCreate(.cfRange, &r), let b = param(el, kAXBoundsForRangeParameterizedAttribute, rv),
+                  CFGetTypeID(b) == AXValueGetTypeID() else { continue }
+            var rect = CGRect.zero
+            guard AXValueGetValue(b as! AXValue, .cgRect, &rect), rect.height > 0 else { continue }
+            return CGRect(x: after ? rect.maxX : rect.minX, y: rect.minY, width: 0, height: rect.height)
+        }
+        return nil
+    }
+
     @discardableResult
     static func select(_ el: AXUIElement, _ r: CFRange) -> Bool {
         var r = r

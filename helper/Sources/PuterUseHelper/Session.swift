@@ -23,8 +23,12 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
     var notes: [String] = []  // remarks for the agent, per request
     var remarks: [String] = []  // from accessibility lookups, folded into notes
     var typist = Typist(wpm: 280)
-    var pasteOver = 100
-    var agentWindows = Set<CGWindowID>()  // windows this agent opened (navigate uses them)
+    var pasteOver = 80
+    var agentWindows = Set<CGWindowID>() {  // windows this agent opened (navigate uses them)
+        didSet { ownRecent += agentWindows.subtracting(oldValue) }
+    }
+    var ownRecent: [CGWindowID] = []  // those, the one it opened or used last at the end (an app name prefers it)
+    var pickNoted = Set<[CGWindowID]>()  // [its window, the front one]: an app name meant its window, and it was told
     var windowApps: [CGWindowID: (app: String, pid: pid_t)] = [:]  // each window it used: "not found" lists its app's others
     var acts = 0  // act requests so far
     var lastClosedMenu: (titles: [String], wid: CGWindowID, act: Int)?  // the last menu it closed, where, and in which act

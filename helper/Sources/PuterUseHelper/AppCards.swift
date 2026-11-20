@@ -2,7 +2,8 @@ import AppKit
 
 /// The first time an agent looks at an app, a few lines it would otherwise spend steps finding out:
 /// whether the app can be scripted (often far quicker than its UI), its most useful keyboard
-/// shortcuts, and quirks of driving it in the background. Once per app per session.
+/// shortcuts, quirks of driving it in the background, and the macros saved for it. Once per app per
+/// session.
 enum AppCards {
     static var enabled: Bool {
         get { Session.current.cards }
@@ -10,7 +11,7 @@ enum AppCards {
     }
     static var shown: Store<String, Bool> { Session.current.carded }
 
-    static func card(pid: pid_t) -> String? {
+    @MainActor static func card(pid: pid_t) -> String? {
         guard enabled, let app = NSRunningApplication(processIdentifier: pid), app.activationPolicy == .regular else { return nil }
         let id = app.bundleIdentifier ?? "pid \(pid)"
         guard shown[id] == nil else { return nil }
@@ -24,7 +25,19 @@ enum AppCards {
         }
         let keys = shortcuts(pid)
         if !keys.isEmpty { parts.append("shortcuts: " + keys.joined(separator: " · ") + " (menus lists all)") }
+        if let saved = savedMacros(Macros.list(pid: pid)) { parts.append(saved) }
         return parts.isEmpty ? nil : "\(name): " + parts.joined(separator: "; ")
+    }
+
+    /// "saved macros: export pdf (file), tidy up" for the card: the first 8 of the app's macros by name, with
+    /// their vars (no steps). Nil when it has none.
+    static func savedMacros(_ saved: [Macros.Entry]) -> String? {
+        guard !saved.isEmpty else { return nil }
+        let names = saved.prefix(8).map { m in
+            AX.clip(m.name, 28) + (m.vars.isEmpty ? "" : " (\(AX.clip(m.vars.joined(separator: ", "), 28)))")
+        }
+        let more = saved.count > 8 ? ", +\(saved.count - 8) more (macros lists all)" : ""
+        return "saved macros: " + names.joined(separator: ", ") + more
     }
 
     /// AppleScript support, as the app declares it.
@@ -41,19 +54,27 @@ enum AppCards {
         "enter full screen", "exit full screen", "zoom", "print…", "page setup…", "help", "autofill", "start dictation",
     ]
 
-    /// Up to a dozen shortcuts from the app's own menus, in menu order, skipping the obvious ones.
+    /// Up to a dozen shortcuts from the app's own menus, in menu order, skipping the obvious ones. The walk
+    /// stops at the 12th, so menus further along (a browser's History, Bookmarks) aren't read.
     static func shortcuts(_ pid: pid_t) -> [String] {
         var out: [String] = []
-        for item in AX.menuItems(pid: pid, budget: 1.2) where item.shortcut != nil && !item.hasSubmenu {
-            let title = item.path.last ?? ""
-            let key = title.lowercased()
-            if obvious.contains(key) || ["hide ", "quit ", "undo ", "redo ", "show all tabs"].contains(where: key.hasPrefix)
-                || item.path.first == "Window"
-                || item.path.first == "Help" { continue }
-            out.append("\(AX.clip(title, 28)) \(item.shortcut!)")
-            if out.count == 12 { break }
+        _ = AX.menuItems(pid: pid, budget: 1.2) { item in
+            if let s = shortcut(item) { out.append(s) }
+            return out.count == 12
         }
         return out
+    }
+
+    /// "Export as PDF… cmd+shift+e" for the card, or nil for an item without a shortcut, one that opens a
+    /// submenu, an obvious one, or one in Window or Help.
+    static func shortcut(_ item: AX.MenuItem) -> String? {
+        guard let keys = item.shortcut, !item.hasSubmenu else { return nil }
+        let title = item.path.last ?? ""
+        let key = title.lowercased()
+        if obvious.contains(key) || ["hide ", "quit ", "undo ", "redo ", "show all tabs"].contains(where: key.hasPrefix)
+            || item.path.first == "Window"
+            || item.path.first == "Help" { return nil }
+        return "\(AX.clip(title, 28)) \(keys)"
     }
 
     /// What's different about driving this app.

@@ -422,7 +422,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--trace", required=True, help="the helper's PUTER_USE_TRACE file")
     ap.add_argument("--probe", help="PuterUseProbe's log, to check what was received")
-    ap.add_argument("--wpm", type=float, default=140, help="PUTER_USE_TYPING_WPM used (default 140)")
+    ap.add_argument("--wpm", type=float, default=280, help="PUTER_USE_TYPING_WPM used (default 280)")
     ap.add_argument("--speed", type=float, default=1, help="PUTER_USE_CURSOR_SPEED used (default 1)")
     args = ap.parse_args()
     trace, probe = load(args.trace), load(args.probe)

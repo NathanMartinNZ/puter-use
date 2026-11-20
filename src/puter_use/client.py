@@ -7,6 +7,8 @@ import contextvars
 import itertools
 import json
 import os
+import shlex
+import socket
 import subprocess
 import uuid
 from pathlib import Path
@@ -56,6 +58,13 @@ def rebuild_hint() -> str:
     return f"run `{root}/scripts/build-helper.sh && uv run --directory {root} puter-use quit`"
 
 
+def cli_command() -> str:
+    """The command that runs this install's CLI from any directory: `puter-use` when installed, else
+    through uv in this checkout (--project, not --directory, so a script's relative paths still work)."""
+    root = _repo()
+    return "puter-use" if root is None else f"uv run --project {shlex.quote(str(root))} puter-use"
+
+
 def stale_build_warning() -> str | None:
     """In a checkout: a note if the helper app was built before its latest source changes."""
     root = _repo()
@@ -83,6 +92,43 @@ def restart_warning(built: float | None) -> str | None:
     if on_disk <= built + 1:
         return None
     return "the running helper is older than the one built since: run `puter-use quit` (the next call starts the new one)"
+
+
+def _running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def _listening() -> bool:
+    """Whether something accepts connections on the helper's socket."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.2)
+    try:
+        s.connect(str(SOCKET))
+    except (FileNotFoundError, ConnectionRefusedError):
+        return False
+    except OSError:
+        pass  # e.g. a full backlog: still there
+    finally:
+        s.close()
+    return True
+
+
+async def wait_exit(pid: int | None, timeout: float = 3.0) -> bool:
+    """Wait until a helper told to quit has exited: its pid is gone, or (a helper that didn't say its pid)
+    its socket refuses connections. Looks every 10 ms; False if it's still there after `timeout` seconds."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while _running(pid) if pid else _listening():
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
 
 
 class Helper:
@@ -249,6 +295,19 @@ class Helper:
             result.setdefault("notes", []).append(self._warning)
             self._warning = None
         return result
+
+    async def quit(self, timeout: float = 3.0) -> None:
+        """Stop the helper, returning once it has exited: the next call then starts a new one rather than
+        reaching (or racing) the one shutting down. Nothing to do if none is running."""
+        try:
+            pid = (await self.call("quit", autostart=False)).get("pid")
+        except HelperError:
+            pid = None  # not running, or gone before it replied: its socket tells
+        self._drop()
+        pid = pid if isinstance(pid, int) and pid > 0 else None
+        if not await wait_exit(pid, timeout):
+            raise HelperError(f"the helper was told to quit but is still running after {timeout:g} s"
+                              + (f": stop it with `kill {pid}`" if pid else ""))
 
     async def close(self) -> None:
         self._drop()

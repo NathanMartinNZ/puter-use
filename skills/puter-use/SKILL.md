@@ -10,18 +10,21 @@ window, so the user's real mouse and keyboard are untouched and they can keep wo
 cursor shows where you act, and macOS shows a purple capture icon on the window you observe.
 
 If the `puter-use` MCP tools (`windows`, `screenshot`, `find`, `menus`, `macros`, `act`) are available, use them.
-Otherwise use the CLI below. Prefix with `uv run --directory <repo>` if `puter-use` isn't on PATH.
+Otherwise use the CLI below. Prefix with `uv run --project <repo>` if `puter-use` isn't on PATH.
 
 **First, consider not using the UI at all.** You have a shell: a command-line tool, `osascript` (for
 scriptable apps: `sdef /Applications/App.app` lists what they can do), a URL scheme or `open` is
 usually quicker and surer than clicking. The first `shot` of an app prints a line `about this app:`
-saying whether it's scriptable, with its main shortcuts and quirks. Use the UI for what those can't do.
+saying whether it's scriptable, with its main shortcuts, quirks and saved macros. Use the UI for what
+those can't do.
 
 ## Loop
 
-1. `puter-use windows [APP] [--launch]` lists `id · app · title · size`. `--launch` opens the app in the background.
+1. `puter-use windows [APP] [--launch]` lists `id · app · title · size`, to choose among several windows.
+   `--launch` opens the app in the background. Otherwise skip it: an app name works as the window.
 2. `puter-use shot <id|app>` captures that window only, even when it's covered. It prints a status
-   line and `image: <path>`. **View the image file** before acting.
+   line and `image: <path>`. **View the image file** before acting. When your first step opens your
+   own window (`navigate`, `open`), skip this too: that step prints the new window's image.
 3. Act on it, then view the new image it prints. If it prints "no visible change", the action had no effect:
    - `puter-use click X Y` (`--right`, `--middle`, `--double`, `--mods cmd`), `puter-use click -e N` for
      element N, or `puter-use click -e Save` for the element showing "Save". Naming by text is
@@ -32,19 +35,23 @@ saying whether it's scriptable, with its main shortcuts and quirks. Use the UI f
    - `puter-use key cmd+l` (also `Return`, `Tab`, `Escape`, `BackSpace`, `Down`, `cmd+shift+t` …), or a
      sequence: `key "Tab Tab Return"`, `key Down --repeat 5`
    - `puter-use menus [query]` lists the app's menu commands with their shortcuts;
-     `puter-use menu "File > Export as PDF…"` runs one
-   - `puter-use select N Blue` picks an option of pop-up N; `puter-use navigate example.com` browses in
-     your own browser window; `puter-use open PATH|URL [--app App]` opens a document, link or app
-   - `puter-use wait-for "Done"` waits until text appears (`--gone` until it goes)
+     `puter-use menu "File > Export as PDF…"` runs one (`menu "Export as PDF…"` too, if the name is unique)
+   - `puter-use select Color Blue` picks Blue in the pop-up showing "Color" (`select N Blue`: in pop-up N);
+     `puter-use navigate example.com` browses in your own browser window;
+     `puter-use open PATH|URL [--app App]` opens a document, link or app
+   - `puter-use wait-for "Done"` waits until text appears (`--gone` until it goes; `--change` until the
+     window changes). In an `act` batch, end with `{"type":"wait_for","text":"…"}` (or `"change":true`)
+     after something slow, instead of taking screenshots until it's done
    - `puter-use scroll X Y --dy 600` (pixels, positive = down)
    - `puter-use drag X1 Y1 X2 Y2`
-   - `puter-use set N "text"` replaces element N's value
+   - `puter-use set Name "text"` replaces the value of the field showing "Name" (or of element N)
    - `puter-use perform N expand` runs an accessibility action on element N (`collapse`, `increment`,
      `decrement`, `showmenu`, `scroll_to_visible`, …) without aiming the pointer
    - `puter-use act '[{"type":"close_window"}]'` closes the current window (safer than cmd+w)
    - `puter-use act '[{"type":"click","x":120,"y":44},{"type":"type","text":"hi"},{"type":"keypress","keys":"Return"}]'`
-     batches several steps and returns one screenshot at the end. Forms in one step:
-     `act '[{"type":"fill","fields":[{"element":3,"text":"Ada"},{"element":5,"option":"Blue"},{"element":6,"checked":true}],"submit":true}]'`
+     batches several steps and returns one screenshot at the end. Forms in one step, each field named
+     by its label (or `"element": N`), no outline needed:
+     `act '[{"type":"fill","fields":[{"target":"Email","text":"ada@example.com"},{"target":"Country","option":"NZ"},{"target":"I agree","checked":true}],"submit":true}]'`
 4. Repeat until done, then run `puter-use release` to hide the agent cursor.
 
 Commands after the first apply to the last window used. Pass `-w <id|app>` to switch.
@@ -56,6 +63,9 @@ Commands after the first apply to the last window used. Pass `-w <id|app>` to sw
 - To read exact values (a price, a table row), `shot --region x0,y0,x1,y1 --no-image` prints just the
   text in that box. Without `--no-image` it zooms in instead. Keep using full-screenshot coordinates
   afterwards.
+- To read a long document or text area, don't scroll and look: `shot --read Notes` (its label or
+  number; `--read` alone: the focused one) prints its whole text, 10000 characters at a time
+  (`--offset` for the next part). Not whole web pages.
 - To browse, use `navigate URL`: it opens your own window instead of using the user's tabs, and
   puter-use switches to it. Close it when done.
 - Look for a menu command (`menus export`) before hunting through the UI; menu items and shortcuts
@@ -71,7 +81,7 @@ Commands after the first apply to the last window used. Pass `-w <id|app>` to sw
 - `--screenshot never` skips the image when you'll look later anyway; the next image then shows
   everything that changed since the last one you saw.
 - Input is human-paced: the pointer travels to each target (0.14-0.85 s) and text is typed at about
-  280 WPM (longer than a sentence, or an address in a browser's address bar, is pasted). Batch steps into one `act` rather than making more calls.
+  280 WPM (over 80 characters, or an address in a browser's address bar, is pasted). Batch steps into one `act` rather than making more calls.
 - Prefer naming elements by their text (`-e Save`, `"target": "Save"` in act JSON) over coordinates.
 - Only when you need it (dense forms, or a click that keeps missing), `--text` adds a numbered
   accessibility outline (`[12] button "Save"`, up to ~2k tokens); `--interactive` lists only controls.
@@ -79,9 +89,11 @@ Commands after the first apply to the last window used. Pass `-w <id|app>` to sw
   - `shot --marks` draws the numbers on the controls in the image instead.
   - `click -e 12` and `set 12 "…"` then work without pixel guessing.
 - In act JSON, `{"type":"clipboard"}` prints the clipboard after a copy (or use `pbpaste`).
-- Once a batch does a job that may be wanted again, run it with `--save-as NAME` (`--var file=q3.pdf`
-  makes that value a slot); afterwards `puter-use macro NAME file=q4.pdf` replays it in one step.
-  `puter-use macros` lists what's saved for an app: check it before working something out again.
+- Add `--save-as NAME` to the `act` that does a job that may be wanted again (`--var file=q3.pdf`
+  makes that value a slot); it's saved only if every action succeeds. Don't re-run a finished job to
+  save it. Afterwards `puter-use macro NAME file=q4.pdf` replays it in one step. The `about this app:`
+  line names an app's macros, and `puter-use macros` lists them in full: check before working
+  something out again.
 - For loops (each row of a file, each page of results), write a script and run it with
   `puter-use exec script.py`: `pu.click("Save")`, `pu.type("Ada", into="Name")`, `pu.fill({...})`,
   `pu.key("cmd+s")`, `pu.wait_for("Done")`, `pu.find("Save")`, `pu.read([x0,y0,x1,y1])`. A failed

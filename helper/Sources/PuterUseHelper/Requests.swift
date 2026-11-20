@@ -24,6 +24,7 @@ final class Connection: @unchecked Sendable {  // only touched on the main threa
     let key: RequestKey?  // nil for a client that doesn't say who it is (an older one): not tracked
     let reports: Bool  // the client reports done/lost; else a reply written counts as delivered
     var work = Work()  // what it has done so far, for a note if its result never reaches the agent
+    var windowNote: (text: String, pair: [CGWindowID])?  // the app name it passed meant a window other than the front one
     private var gone = false
 
     init(fd: Int32, key: RequestKey?, reports: Bool = true) {
@@ -34,10 +35,13 @@ final class Connection: @unchecked Sendable {  // only touched on the main threa
 
     @TaskLocal static var current: Connection?
 
+    /// The helper is quitting (`Run.stopAll`): every request counts as given up, so it stops at its next step.
+    nonisolated(unsafe) static var quitting = false
+
     /// Whether the client has hung up. poll() reports POLLHUP even with unread bytes waiting, and nothing
     /// else reads the socket while its request runs (`Server.serve` waits for the reply).
     func hungUp() -> Bool {
-        if gone { return true }
+        if gone || Connection.quitting { return true }
         guard fd >= 0 else { return false }
         var p = pollfd(fd: fd, events: Int16(POLLIN | POLLHUP), revents: 0)
         if poll(&p, 1, 0) > 0, p.revents & Int16(POLLHUP) != 0 { gone = true }

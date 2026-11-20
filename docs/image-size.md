@@ -13,11 +13,17 @@ smallest dimensions that keep UI text readable, and compression only keeps the p
 - **Cap.** At most 1000 tokens, about the 1024×768 that Anthropic and OpenAI recommend for computer
   use. Larger windows are scaled down further and get blurry.
 - **Agent windows.** Screenshot cost grows with window area, while legibility depends on pixels per
-  point. New windows the agent opens keep the size the app gives them, so a large one is scaled
-  below 0.75 to fit the cap and its text gets softer (see the table). Set `PUTER_USE_WINDOW_SIZE` to
-  shrink (never enlarge) them to fit a box instead.
-  - 1280×860 pt is about 780 tokens at full 0.75 sharpness. 1280×1080 still fits under the cap at 0.72.
-  - Your own windows are never resized.
+  point. A large window is scaled below 0.75 to fit the cap, and its text gets softer (see the table).
+  So new windows the agent opens (`navigate`, `open`, Cmd+N) are shrunk (never enlarged) to fit
+  1440×900 pt by default. Set `PUTER_USE_WINDOW_SIZE` to another box, or to `off` to keep the size the
+  app gives them.
+  - 1440×900 pt is about 910 tokens at full 0.75 sharpness. 1280×860 pt is about 780 tokens.
+  - Your own windows are never resized. Nor are the windows an app opens or restores as it launches
+    (they may be your last session), or a new window that appears while you're clicking or using
+    shortcuts in that app (it may be yours).
+  - A browser may give a new window the agent window's size if Cmd+N is pressed in it. It may also
+    keep that size for its next launch if the agent's window is still open when it quits. `off`
+    avoids both.
 - **Tile snap.** Dimensions are trimmed (by at most 10%) so a few stray pixels don't buy a whole extra
   row or column of tiles.
 - **Reading values.** `screenshot(region=…, image=false)` returns the accessibility text in that box,
@@ -32,8 +38,9 @@ smallest dimensions that keep UI text readable, and compression only keeps the p
 |---|---|---|
 | TextEdit 627×877 pt | 572×800, 609 tokens | 448×626, 368 tokens |
 | Finder 967×639 pt (Retina) | 1210×800, 1276 tokens | 700×462, 425 tokens |
+| Firefox window shrunk to 1440×900 pt (the default) | 1280×800, 1334 tokens | 1064×665, 912 tokens |
 | Firefox window shrunk to 1280×860 pt (`PUTER_USE_WINDOW_SIZE=1280x860`) | 1191×800, 1247 tokens | 952×639, 782 tokens |
-| Firefox window at 1712×1409 pt (not resized, the default) | 972×800, 1015 tokens | 918×756, 891 tokens (0.54 px/pt, soft) |
+| Firefox window at 1712×1409 pt (not resized, `PUTER_USE_WINDOW_SIZE=off`) | 972×800, 1015 tokens | 918×756, 891 tokens (0.54 px/pt, soft) |
 
 **Format.** The default `auto` sends a 256-colour palette PNG (PNG-8). UI is mostly flat colour and
 anti-aliased text, so it stays sharp at a few KB. If a photo- or video-heavy window would push it past

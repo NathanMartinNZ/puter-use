@@ -201,6 +201,71 @@ def test_an_old_helper_is_refused_except_for_status_and_quit(sock):
     assert cmds(run(main())) == ["quit"]
 
 
+def test_quit_returns_once_the_helper_has_exited(sock):
+    """The bug: quit replied before the helper was gone, so the next command could reach it as it shut down."""
+    import subprocess
+
+    proc = subprocess.Popen(["sleep", "30"])  # stands in for the helper's process
+
+    async def main():
+        async def answer(req, writer):
+            def exit_():
+                proc.kill()
+                proc.wait()  # reaped, as launchd does the real one
+                server.close()
+
+            asyncio.get_running_loop().call_later(0.2, exit_)  # exits a while after its reply
+            return ok(req, pid=proc.pid)
+
+        server, got, _ = await fake_helper(sock, answer)
+        t = time.monotonic()
+        await Helper("t").quit()
+        return time.monotonic() - t, got
+
+    try:
+        took, got = run(main())
+    finally:
+        proc.kill()
+        proc.wait()
+    assert cmds(got) == ["quit"]
+    assert 0.2 <= took < 1, took
+
+
+def test_quit_says_so_when_the_helper_does_not_exit(sock):
+    async def main():
+        async def answer(req, writer):
+            return ok(req, pid=os.getpid())  # a pid that stays
+
+        server, _, _ = await fake_helper(sock, answer)
+        t = time.monotonic()
+        with pytest.raises(HelperError, match=f"still running after 0.3 s: stop it with `kill {os.getpid()}`"):
+            await Helper("t").quit(timeout=0.3)
+        server.close()
+        return time.monotonic() - t
+
+    assert run(main()) < 1
+
+
+def test_quit_of_a_helper_that_does_not_say_its_pid_waits_for_its_socket(sock):
+    async def main():
+        async def answer(req, writer):
+            asyncio.get_running_loop().call_later(0.2, server.close)  # stops listening as it exits
+            return ok(req)  # an older helper: no pid
+
+        server, _, _ = await fake_helper(sock, answer)
+        t = time.monotonic()
+        await Helper("t").quit()
+        return time.monotonic() - t
+
+    assert 0.2 <= run(main()) < 1
+
+
+def test_quit_with_no_helper_running_is_quiet(sock):
+    t = time.monotonic()
+    run(Helper("t").quit())
+    assert time.monotonic() - t < 0.5
+
+
 def test_reports_go_with_the_next_request_and_clear_once_it_is_answered(sock):
     async def main():
         async def answer(req, writer):
@@ -279,6 +344,26 @@ def test_a_helper_still_running_an_older_build_is_mentioned(monkeypatch, tmp_pat
     assert "puter-use quit" in client.restart_warning(now - 100)
     assert client.restart_warning(now + 5) is None
     assert client.restart_warning(None) is None
+
+
+def test_the_instructions_give_the_command_that_runs_code_mode_here(monkeypatch, tmp_path):
+    from puter_use import mcp_server
+
+    assert f"`{client.cli_command()} exec loop.py`" in mcp_server.mcp.instructions
+    assert "{cli}" not in mcp_server.mcp.instructions
+    checkout = tmp_path / "my code"
+    monkeypatch.setattr(client, "_repo", lambda: checkout)
+    assert client.cli_command() == f"uv run --project '{checkout}' puter-use"  # cwd kept, path quoted
+    monkeypatch.setattr(client, "_repo", lambda: None)
+    assert client.cli_command() == "puter-use"
+
+
+def test_the_instructions_name_every_tool_to_load_at_once():
+    from puter_use import mcp_server
+
+    names = [t.name for t in run(mcp_server.mcp.list_tools())]
+    hint = mcp_server.mcp.instructions.split("load all six at once: ")[1].split(".")[0]
+    assert len(names) == 6 and sorted(hint.split(", ")) == sorted(names)
 
 
 # -- MCP: which tool calls' results reached the agent

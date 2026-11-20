@@ -171,10 +171,26 @@ class Computer:
                          **outline_params("interactive" if interactive else True), **capture_params())
         return raw.get("text", "")
 
-    def read(self, region: list[int]) -> str:
-        """The text in a box [x0, y0, x1, y1] of the last full screenshot (or read off the screen)."""
-        return self._call("screenshot", window=self.window, region=region, image=False,
-                          **capture_params()).get("text", "")
+    def read(self, what: list[int] | Aim | bool = True, *, offset: int = 0, limit: int | None = None) -> str:
+        """With a box [x0, y0, x1, y1] of the last full screenshot: the text in it (or read off the screen).
+        Otherwise the whole text of a text area or field, scrolled-out parts too: what is its number, what
+        it shows ("Notes" or {text, role, nth}), or True (the focused one, else the window's only text
+        area). From offset, limit characters (default: all of it, fetched 50000 at a time)."""
+        if isinstance(what, list):
+            return self._call("screenshot", window=self.window, region=what, image=False,
+                              **capture_params()).get("text", "")
+        if what is False or what is None:
+            raise TypeError("read takes a box [x0, y0, x1, y1], an element's number, what it shows, or True")
+        parts, pos = [], offset
+        while limit is None or pos < offset + limit:
+            want = 50000 if limit is None else min(50000, offset + limit - pos)
+            raw = self._call("screenshot", window=self.window, read=what, offset=pos, limit=want)
+            parts.append(raw.get("read", ""))
+            end, total = raw.get("read_range", [pos, pos, 0])[1:]
+            if end <= pos or end >= total:
+                break
+            pos = end
+        return "".join(parts)
 
     _FOUND = re.compile(r'^\[(\d+)\] (\S+) "(.*)"(?: at \((-?\d+),(-?\d+)\))?')
 
@@ -258,8 +274,16 @@ class Computer:
     def scroll(self, dy: int = 0, dx: int = 0, at: Aim = None) -> Result:
         return self.act(_aim({"type": "scroll", "scroll_y": dy, "scroll_x": dx}, at))
 
-    def wait_for(self, text: str, *, gone: bool = False, role: str | None = None, timeout_ms: int = 5000) -> Result:
-        a: dict[str, Any] = {"type": "wait_for", "text": text, "timeout_ms": timeout_ms}
+    def wait_for(self, text: str | None = None, *, gone: bool = False, role: str | None = None, change: bool = False,
+                 timeout_ms: int = 5000) -> Result:
+        """Until an element showing text appears (gone=True: goes). change=True instead: until the window looks
+        different from when this act began, then settles; a note if not. To catch a change the action before
+        starts, batch both: act([{"type": "click", "target": "Search"}, {"type": "wait_for", "change": True}])."""
+        a: dict[str, Any] = {"type": "wait_for", "timeout_ms": timeout_ms}
+        if text is not None:
+            a["text"] = text
+        if change:
+            a["change"] = True
         if gone:
             a["gone"] = True
         if role:

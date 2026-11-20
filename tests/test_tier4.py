@@ -64,7 +64,11 @@ def test_api_actions_become_act_calls():
     c.click(14, count=2)
     c.key("Tab", repeat=3)
     c.macro("export", file="a.pdf")
+    c.wait_for("Done", gone=True)
+    c.wait_for(change=True, timeout_ms=4000)
     acts = [p["actions"][0] for cmd, p in c._helper.calls]
+    assert acts[6] == {"type": "wait_for", "timeout_ms": 5000, "text": "Done", "gone": True}
+    assert acts[7] == {"type": "wait_for", "timeout_ms": 4000, "change": True}
     assert acts[0] == {"type": "click", "target": "Save"}
     assert acts[1] == {"type": "type", "text": "Ada", "target": "Name", "clear": True}
     assert acts[2]["fields"] == [{"target": "Name", "text": "Grace"}, {"target": "Subscribe", "checked": True}]
@@ -216,6 +220,32 @@ def test_mcp_declined_is_an_error_result():
     finally:
         m._run_with_consent = orig
     assert out.is_error is True
+
+
+def test_mcp_failed_first_look_keeps_its_image(monkeypatch):
+    """A first act whose first action fails comes with the window's image: the error result carries it."""
+    import asyncio
+    import base64
+    import io
+
+    from PIL import Image as PILImage
+
+    import puter_use.mcp_server as m
+
+    buf = io.BytesIO()
+    PILImage.new("RGB", (40, 30), "white").save(buf, "PNG")
+
+    async def fake_consent(ctx, params):
+        return {"done": 0, "total": 1, "errors": ['action 1 (click): nothing shows "No such button"'],
+                "image": base64.b64encode(buf.getvalue()).decode(), "mime": "image/png", "width": 40,
+                "height": 30, "zoom": False, "window": {"id": 7, "app": "App", "title": "w"}, "changed": True}
+
+    monkeypatch.setattr(m, "_run_with_consent", fake_consent)
+    out = asyncio.run(m.act([m.Action(type="click", target="No such button")]))
+    assert out.is_error is True
+    assert [c.type for c in out.content] == ["image", "text"]
+    assert "App #7 \"w\" · 40x30 · ran 0/1 actions" in out.content[1].text
+    assert 'error: action 1 (click): nothing shows "No such button"' in out.content[1].text
 
 
 def test_mcp_without_elicitation_passes_the_stop_on():

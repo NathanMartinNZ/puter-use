@@ -29,12 +29,16 @@ extension Handlers {
 
     /// Every element of `w` (or of what's open over it) showing `spec`'s text, as all or part of its label.
     static func candidates(_ sp: Spec, _ w: WinInfo, limit: Int) -> [AX.Match] {
-        // Over it: a menu, popover or panel, or a sheet or dialog (not another of the app's own windows).
-        let over = Windows.popups(over: w).filter { o in
+        AX.search(pid: w.pid, windows: Set([w.id] + openOver(w)), query: sp.text, role: sp.role, limit: limit)
+    }
+
+    /// What's open over window `w`: a menu, popover or panel, or a sheet or dialog (not another of the
+    /// app's own windows).
+    static func openOver(_ w: WinInfo) -> [CGWindowID] {
+        Windows.popups(over: w).filter { o in
             o.frame.intersects(w.frame)
                 && AX.window(pid: w.pid, wid: o.id).map { AX.value($0, kAXSubroleAttribute) as? String != "AXStandardWindow" } != false
-        }
-        return AX.search(pid: w.pid, windows: Set([w.id] + over.map(\.id)), query: sp.text, role: sp.role, limit: limit)
+        }.map(\.id)
     }
 
     /// Whole-label matches if there are any, and controls before bare labels saying the same thing.
@@ -54,16 +58,29 @@ extension Handlers {
     static func number(_ m: AX.Match, _ wid: CGWindowID) -> Int {
         let role = AX.value(m.element, kAXRoleAttribute) as? String ?? ""
         let label = role == "AXStaticText" ? nil : AX.label(m.element)
-        return AX.registry(wid).number(AX.Node(element: m.element, frame: m.frame, role: role, label: label, name: m.role))
+        return AX.registry(wid).number(AX.Node(element: m.element, frame: m.frame, role: role, label: label, name: m.role,
+                                               away: m.offScreen))
     }
 
     static func describe(_ m: AX.Match, id: Int, _ t: Target) -> String {
         var s = "[\(id)] \(m.role) \"\(AX.clip(m.label, 50))\""
+        if m.offScreen { return s + " (off screen)" }
         if let f = m.frame, let px = toPixels(t, CGPoint(x: f.midX, y: f.midY)) { s += " at (\(px[0]),\(px[1]))" }
         return s
     }
 
-    struct NotFound: Error, CustomStringConvertible { let description: String }
+    struct NotFound: Error, CustomStringConvertible {
+        let description: String
+        var offScreen = ""  // what's off screen showing it, numbered: added to the error the miss ends in
+        var near = ""  // what in the window is near it (`nearHint`): added after that
+        var hint: String { offScreen + near }
+    }
+
+    /// The error a target's miss `e` ends in (target `v`, in `t`): where it was in a menu just closed, or what
+    /// it says with what's off screen showing the text and what's near it.
+    static func missError(_ e: NotFound, _ v: Any, _ t: Target) throws -> HelperError {
+        HelperError(menuHint(try spec(v), t) ?? "\(e)\(e.hint)")
+    }
     /// What's named is there, but behind a sheet or dialog: never worked around.
     struct Behind: Error, CustomStringConvertible { let description: String }
 
@@ -71,14 +88,30 @@ extension Handlers {
     static func findOne(_ v: Any, _ t: Target) throws -> (Int, AX.Node) {
         guard case .window(let w) = t else { throw HelperError("target needs a window") }
         let sp = try spec(v)
-        var hits = matches(sp, w)
-        if hits.isEmpty { throw NotFound(description: "nothing shows \(sp.description) in the window") }
+        let start = Date()
+        let (shown, complete) = AX.searchAll(pid: w.pid, windows: Set([w.id] + openOver(w)), query: sp.text, role: sp.role, limit: 30)
+        var hits = narrowed(shown, sp)
+        Trace.log(["k": "search", "ms": (Date().timeIntervalSince(start) * 10000).rounded() / 10, "hits": hits.count])
+        if hits.isEmpty {
+            // A search that stopped early didn't look at all that's shown: what it missed may show the text.
+            guard complete else {
+                throw NotFound(description: "nothing shows \(sp.description) in the window",
+                               offScreen: "; the search stopped early (the app answered slowly), so part of the window wasn't looked at")
+            }
+            // Nothing on screen: one scrolled out of view, if it's the only one (it's scrolled to before it's used).
+            return try findOffScreen(sp, w)
+        }
         // With a sheet or dialog open, what's behind it can't be used; what's in it can.
         let open = hits.filter { AX.blockedBy($0.element) == nil }
         if open.isEmpty, let why = AX.blockedBy(hits[0].element) {
             throw Behind(description: "\(sp.description) is behind \(why) that's open over the window: deal with that first")
         }
         hits = open
+        // Only part of a label on screen shows the text: not used if a whole label off screen does (a quick look).
+        if !sp.text.isEmpty, !hits.contains(where: \.exact) {
+            let whole = offScreenCandidates(sp, w, limit: 10, budget: conflictBudget).matches.filter(\.exact)
+            if let why = partialConflict(hits, whole, sp, w, t) { throw HelperError(why) }
+        }
         if let nth = sp.nth {
             guard nth >= 1, nth <= hits.count else { throw HelperError("\(sp.description): only \(hits.count) match") }
             hits = [hits[nth - 1]]
@@ -116,12 +149,13 @@ extension Handlers {
                 throw HelperError("\(try spec(v).description) isn't where it was when the macro was saved (others show the "
                     + "same), so nothing was done")
             }
+            if saved == nil, a["spot"] as? Bool == true { throw Macros.noSpot(v) }
             do { return try findOne(v, t).1 } catch {
                 if let (x, y) = saved, !(error is Behind) {
                     if let (_, n) = try Macros.spot(v, t, at: try toGlobal(t, x, y, a)) { return n }
                     throw HelperError("\(error) (a macro step: what it acted on isn't where it was, so nothing was done)")
                 }
-                if let e = error as? NotFound { throw HelperError(menuHint(try spec(v), t) ?? "\(e)") }
+                if let e = error as? NotFound { throw try missError(e, v, t) }
                 throw error
             }
         }
@@ -194,12 +228,22 @@ extension Handlers {
         if meta[t.key] == nil, let shot = try? await plan(t, region: nil, Opts(p)).run() { remember(t, shot, Signature(shot.image)) }
         let limit = max(1, min(int(p["limit"], 20), 100))
         let all = candidates(sp, w, limit: limit + 5)
-        let hits = Array(narrowed(all, sp).prefix(limit))
+        var hits = Array(narrowed(all, sp).prefix(limit))
+        // Then what's scrolled out of view (a search of its own), tagged: acting on one scrolls to it first.
+        // Whole-label ones follow whole-label ones shown; the rest go with those that only contain the text.
+        // With nothing shown, that search also notes what's near the text, for when there's none at all.
+        let near = hits.isEmpty && !q.isEmpty ? AX.Near(q) : nil
+        // A whole label shown already: only a quick look (`conflictBudget`) for more off screen.
+        let quick = hits.contains(where: \.exact) ? conflictBudget : 1.5
+        let (away, complete) = hits.count < limit ? offScreenCandidates(sp, w, limit: limit + 5, budget: quick, near: near) : ([], true)
+        hits += narrowed(hits.contains(where: \.exact) ? away.filter(\.exact) : away, sp).prefix(limit - hits.count)
+        // A whole label off screen comes before ones shown that only contain the text: those go under "also".
+        if hits.contains(where: \.exact) { hits = hits.filter(\.exact) }
         var lines = hits.map { describe($0, id: number($0, w.id), t) }
-        // A target takes whole-label matches only, but find also shows a few that contain the text
+        // A target takes whole-label matches when there are any, but find also shows a few that contain the text
         // ("Sign in" is also in "Sign in with Google"), controls first.
         if !q.isEmpty, hits.contains(where: \.exact) {
-            let rest = all.filter { m in !m.exact && !hits.contains { CFEqual($0.element, m.element) } }
+            let rest = (all + away).filter { m in !m.exact && !hits.contains { CFEqual($0.element, m.element) } }
             let more = (sp.role == nil ? rest.filter { $0.role != "text" } + rest.filter { $0.role == "text" } : rest).prefix(5)
             if !more.isEmpty {
                 lines.append("also containing \"\(AX.clip(q, 40))\" (as a target, give the whole text, or use the number):")
@@ -213,7 +257,13 @@ extension Handlers {
                 return "text \"\(AX.clip(h.line, 60))\"\(px) (read off the screen: click it by x,y)"
             }
         }
-        var out: [String: Any] = ["window": describe(t), "text": lines.isEmpty ? "(nothing shows \(sp.description))" : lines.joined(separator: "\n")]
+        if lines.isEmpty, let near {
+            let similar = nearest(near, w)
+            if !similar.isEmpty { lines = ["(nothing shows \(sp.description)) similar:"] + similar.map { describe($0.1, id: $0.0, t) } }
+        }
+        var text = lines.isEmpty ? "(nothing shows \(sp.description))" : lines.joined(separator: "\n")
+        if !complete { text += "\n(more may be off screen: the search there stopped early)" }
+        var out: [String: Any] = ["window": describe(t), "text": text]
         AppCards.enabled = p["app_cards"] as? Bool != false
         if let card = AppCards.card(pid: w.pid) { out["card"] = card }
         return out

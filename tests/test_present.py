@@ -17,6 +17,16 @@ def test_summary_with_image_and_change_box():
     assert "1280x800" in line and "changed in (10,20)-(300,400)" in line and "…" in line
 
 
+def test_summary_of_a_stop_before_anything_ran_has_no_change_claim():
+    """A confirm stop before action 1 ran nothing: "no visible change" would read as a press that did nothing."""
+    stop = "stopped before action 1 (click): pressing “Delete” may not be undoable; it was not run. Ask the user"
+    res = {"window": {"id": 7, "app": "App", "title": "w"}, "image": "", "width": 574, "height": 420,
+           "changed": False, "done": 0, "total": 1, "stopped": stop}
+    assert summarize(res).splitlines() == ['App #7 "w" · 574x420 · ran 0/1 actions', stop]
+    # Once something ran, an unchanged window is still said to be.
+    assert "no visible change" in summarize({**res, "done": 1, "total": 2})
+
+
 def test_summary_reports_errors_and_partial_runs():
     res = {"window": {"id": 1, "app": "A"}, "done": 1, "total": 3, "errors": ["action 2 (click): boom"]}
     assert summarize(res).splitlines() == ["A #1 · ran 1/3 actions", "error: action 2 (click): boom"]
@@ -80,6 +90,59 @@ def test_photo_like_screenshots_fall_back_to_jpeg_under_budget():
     assert encode(_png(noise), "webp")[1] == "image/webp"
 
 
+def _ui_and_best():
+    """A UI-like image and today's slowest, smallest palette PNG of it (optimize=True)."""
+    from PIL import Image, ImageDraw
+
+    from puter_use.imaging import _save
+
+    img = Image.new("RGB", (600, 400), (250, 250, 250))
+    d = ImageDraw.Draw(img)
+    for y in range(10, 390, 14):
+        d.text((10 + y % 30, y), "Save  Cancel  Search results: 1-20 of 3,482  " * 2, fill=(30, 30, 30))
+    pal = img.quantize(256, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
+    return img, _save(pal, "PNG", optimize=True)
+
+
+def test_png8_fast_save_keeps_the_same_palette_pixels():
+    import io
+
+    from PIL import Image
+
+    from puter_use.imaging import png8
+
+    img, best = _ui_and_best()
+    fast = png8(img)
+    a, b = Image.open(io.BytesIO(fast)), Image.open(io.BytesIO(best))
+    assert a.format == "PNG" and a.mode == "P"
+    assert a.tobytes() == b.tobytes() and a.getpalette() == b.getpalette()
+    assert len(best) < len(fast) < len(best) * 1.5
+
+
+def test_png_just_over_budget_retries_the_smaller_save_before_jpeg():
+    from puter_use.imaging import encode, png8
+
+    img, best = _ui_and_best()
+    budget = (len(png8(img)) + len(best)) // 2
+    assert encode(_png(img), max_bytes=budget) == (best, "image/png")
+    assert encode(_png(img), "png", max_bytes=budget) == (best, "image/png")
+
+
+def test_png_far_over_budget_skips_the_slow_save(monkeypatch):
+    import os
+
+    from PIL import Image
+
+    from puter_use import imaging
+
+    calls = []
+    real = imaging._save
+    monkeypatch.setattr(imaging, "_save", lambda img, fmt, **o: calls.append((fmt, o)) or real(img, fmt, **o))
+    noise = Image.frombytes("RGB", (500, 400), os.urandom(500 * 400 * 3))
+    assert imaging.encode(_png(noise), max_bytes=60_000)[1] == "image/jpeg"
+    assert not any(o.get("optimize") for _, o in calls)
+
+
 def test_capture_params_have_no_fixed_pixel_box(monkeypatch):
     from puter_use.settings import capture_params
 
@@ -101,6 +164,8 @@ def test_window_size_setting(monkeypatch):
     from puter_use.settings import capture_params
 
     monkeypatch.delenv("PUTER_USE_WINDOW_SIZE", raising=False)
-    assert capture_params()["window_size"] == "off"
+    assert capture_params()["window_size"] == "1440x900"
     monkeypatch.setenv("PUTER_USE_WINDOW_SIZE", "1280x860")
     assert capture_params()["window_size"] == "1280x860"
+    monkeypatch.setenv("PUTER_USE_WINDOW_SIZE", "off")
+    assert capture_params()["window_size"] == "off"
