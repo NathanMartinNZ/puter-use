@@ -14,7 +14,8 @@ enum Permissions {
     }
 }
 
-/// What the agent's coordinates mean for a target: the last full screenshot it was shown.
+/// What the agent's coordinates mean for a target: the last full screenshot it was shown, or one taken to
+/// place what `find` lists (`shown` false: the agent has its pixels, not the picture).
 struct Meta {
     var offset: CGPoint  // capture origin relative to the window origin (points)
     var size: CGSize  // captured area (points)
@@ -22,6 +23,45 @@ struct Meta {
     var height: Int
     var sig: Signature
     var caret: Caret? = nil  // the text cursor then: a later frame that differs only by its blinking hasn't changed
+    // The picture went to the agent as an image. Kept with the rest, so a reply that never reached the agent
+    // takes it back too (`Store`): only a picture it was sent counts as seen.
+    var shown = false
+    // The blank margins left out of the picture sent (`Trim`): its pixels map back through it. `width` and
+    // `height` stay the whole capture's, as does `sig`.
+    var trim: Trim? = nil
+    // What kept moving by itself in the frames just before the picture (signature cells, `Ambient`).
+    var ambient: [CGRect] = []
+    // Keys, typing or a click went to the window since the picture, with no new picture after them: a change
+    // shaped like a text cursor may be a character typed (`CaretShape`).
+    var typedSince = false
+    // The part of the capture the picture sent shows, when it showed only what changed (`ChangeCrop`; capture
+    // pixels): its pixels map back through its origin. `width`, `height` and `sig` stay the whole capture's.
+    var crop: CGRect? = nil
+    // How many pictures of the window in a row, this one included, were crops (`ChangeCrop.keyframe`).
+    var crops = 0
+    // Where the capture was (global points): a window moved or resized since gets a whole picture (`ChangeCrop`).
+    var captured: CGRect? = nil
+
+    /// A box in the whole capture (pixels) as the picture sent shows it: in a crop, from its origin and within
+    /// it; through the margins left out of it (`Trim.box`). Nil if none of it is in the picture.
+    func pictureBox(_ r: CGRect) -> CGRect? {
+        if let crop {
+            let b = r.intersection(crop)
+            guard !b.isNull, !b.isEmpty else { return nil }
+            return b.offsetBy(dx: -crop.minX, dy: -crop.minY)
+        }
+        if let trim { return trim.box(r) }
+        return r
+    }
+
+    /// What a crop shows, in window points (from the window's top-left corner), whole points round it.
+    var cropInWindow: CGRect? {
+        guard let crop, width > 0, height > 0 else { return nil }
+        let sx = size.width / Double(width), sy = size.height / Double(height)
+        let x0 = (offset.x + crop.minX * sx).rounded(.down), y0 = (offset.y + crop.minY * sy).rounded(.down)
+        let x1 = (offset.x + crop.maxX * sx).rounded(.up), y1 = (offset.y + crop.maxY * sy).rounded(.up)
+        return CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+    }
 }
 
 /// The text cursor in a window when an image was taken (`Handlers.caret`): the focused text field it's in
@@ -206,10 +246,17 @@ enum Handlers {
 
     // MARK: - params
 
+    /// A number, or one as text ("12"). An element's number as an outline writes it ("#12": `#` then only digits,
+    /// spaces round it aside) is that number too; nothing else with a `#` is.
     nonisolated static func num(_ v: Any?) -> Double? {
         if let n = v as? NSNumber { return n.doubleValue }
-        if let s = v as? String { return Double(s) }
-        return nil
+        guard let s = v as? String else { return nil }
+        let t = s.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("#") {
+            let digits = t.dropFirst()
+            return !digits.isEmpty && digits.allSatisfy({ ("0"..."9").contains($0) }) ? Double(String(digits)) : nil
+        }
+        return Double(s)
     }
 
     nonisolated static func int(_ v: Any?, _ d: Int) -> Int { num(v).map { Int($0) } ?? d }
@@ -324,32 +371,99 @@ enum Handlers {
 
     static func windows(_ p: [String: Any]) async throws -> [String: Any] {
         let app = (p["app"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let launched = app != nil && p["launch"] as? Bool == true
         let wins: [WinInfo]
-        if let app, p["launch"] as? Bool == true {
+        if let app, launched {
             // Not shrunk to the window box: an app may restore the user's last session as it launches.
             wins = try await Windows.launch(app)
         } else {
             wins = Windows.targetable(app: app)
         }
+        // Windows drawn fully transparent (an app's preloaded or helper windows) aren't listed: nothing of them
+        // shows. Only here: an app name still resolves, and launch still waits, as before. A window just
+        // launched may still be fading in, so with nothing else to list it's looked at again for a moment.
+        var shown = wins.filter { listable(alpha: $0.alpha) }
+        if launched, shown.isEmpty, !wins.isEmpty {
+            for _ in 0..<3 where shown.isEmpty {
+                try await Run.pause(0.15)
+                shown = wins.compactMap { Windows.info($0.id) }.filter { listable(alpha: $0.alpha) }
+            }
+        }
         // Apps the policy keeps agents out of aren't listed (their window titles are theirs too).
         var kept: [String] = []
-        let listed = wins.compactMap { w -> [String: Any]? in
-            var j = w.json
+        let allowed = shown.compactMap { w -> (WinInfo, Policy.Level)? in
             let l = Policy.level(w.pid)
             if l == .deny {
                 if !kept.contains(w.app) { kept.append(w.app) }
                 return nil
             }
             if systemWindow(w, AX.window(pid: w.pid, wid: w.id)) { return nil }  // macOS's dictation orb, not the app's
+            return (w, l)
+        }
+        // Which are the agent's, the one it's on, the one in front, the one with its app's keyboard.
+        let ws = allowed.map { $0.0 }
+        var keys: [pid_t: CGWindowID] = [:]
+        for pid in keyboardApps(ws, agent: agentWindows, current: current) { keys[pid] = keyWindow(pid) }
+        let front = Set(ws.map { $0.pid }).first { Hold.isFront($0) }
+        let tags = windowTags(ws, agent: agentWindows, current: current, front: front, keys: keys)
+        let listed = allowed.map { pair -> [String: Any] in
+            let (w, l) = pair
+            var j = w.json
             if l != .full { j["policy"] = l.rawValue }
+            for tag in tags[w.id] ?? [] { j[tag] = true }
             return j
         }
         var out: [String: Any] = ["windows": listed, "permissions": Permissions.status()]
         var notes: [String] = []
+        if let app, shown.isEmpty, !wins.isEmpty {
+            notes.append("\(wins[0].app.isEmpty ? app : wins[0].app)'s windows are all invisible (fully transparent), "
+                + "so none is listed")
+        }
         if !kept.isEmpty { notes.append("not listed: \(kept.joined(separator: ", ")) (puter-use's policy keeps agents out)") }
         if let problem = Policy.config.problem { notes.append("policy: \(problem)") }
         if !notes.isEmpty { out["notes"] = notes }
         return out
+    }
+
+    /// Whether a window drawn at `alpha` is listed by `windows`: not when it's fully transparent (≤ 0.05, as
+    /// what's over a window is counted), like an app's preloaded or helper windows.
+    nonisolated static func listable(alpha: Double) -> Bool { alpha > 0.05 }
+
+    /// The apps whose key window `windows` asks for (`windowTags`): those with more than one window listed
+    /// (keys sent to the app go to one of them), or with the agent's own window or the one it's on.
+    nonisolated static func keyboardApps(_ wins: [WinInfo], agent: Set<CGWindowID>, current: CGWindowID?) -> Set<pid_t> {
+        var count: [pid_t: Int] = [:]
+        for w in wins { count[w.pid, default: 0] += 1 }
+        return Set(wins.filter { count[$0.pid, default: 0] > 1 || agent.contains($0.id) || $0.id == current }.map(\.pid))
+    }
+
+    /// The tags of each window `windows` lists (`wins`, front to back for those on screen), in this order:
+    /// `yours`, one the agent opened (`agent`); `current`, the one it's on; `front`, the front window of the
+    /// app really in front (`front`: what the user sees on top); `keyboard`, the window of its app that has
+    /// the app's keyboard (`keys`, each asked app's key window: keys sent to that app go there).
+    nonisolated static func windowTags(_ wins: [WinInfo], agent: Set<CGWindowID>, current: CGWindowID?, front: pid_t?,
+                                       keys: [pid_t: CGWindowID]) -> [CGWindowID: [String]] {
+        let frontWindow = front.flatMap { pid in wins.first { $0.pid == pid && $0.onScreen } }?.id
+        var out: [CGWindowID: [String]] = [:]
+        for w in wins {
+            var tags: [String] = []
+            if agent.contains(w.id) { tags.append("yours") }
+            if w.id == current { tags.append("current") }
+            if w.id == frontWindow { tags.append("front") }
+            if keys[w.pid] == w.id { tags.append("keyboard") }
+            if !tags.isEmpty { out[w.id] = tags }
+        }
+        return out
+    }
+
+    /// The app's key window, as its accessibility says: asked without switching on a browser's accessibility
+    /// tree (its windows are the app's own either way), giving up quickly on a busy app as `caret` does.
+    static func keyWindow(_ pid: pid_t) -> CGWindowID? {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, caretTimeout)
+        guard let w = AX.value(app, kAXFocusedWindowAttribute), CFGetTypeID(w) == AXUIElementGetTypeID() else { return nil }
+        var id: CGWindowID = 0
+        return _AXUIElementGetWindow(w as! AXUIElement, &id) == .success ? id : nil
     }
 
     struct Opts {
@@ -361,10 +475,17 @@ enum Handlers {
         var interactive = false  // outline: only things to act on
         var maxChars = 8000  // outline length cap
         var marks = false  // number the interactive elements on the image
+        var trimBlank = true  // leave blank margins out of an act's picture (`Trim`); a screenshot's never
+        var cropChanges = false  // an act's picture may show only what changed (`ChangeCrop`); a screenshot's never
+        var lowDetail = false  // `detail: "low"`: fewer pixels a point, as far as text stays readable (`DetailLow`)
+        var textHeight: Double?  // with `lowDetail`, the window's text height that set the scale (`detailed`)
         init(_ p: [String: Any]) {
             interactive = p["interactive"] as? Bool == true
             maxChars = max(500, min(Handlers.int(p["max_chars"], maxChars), 40_000))
             marks = p["marks"] as? Bool == true
+            trimBlank = p["trim_blank"] as? Bool != false
+            cropChanges = p["crop_changes"] as? Bool == true
+            lowDetail = (p["detail"] as? String)?.lowercased() == "low"
             if p.keys.contains("window_size") { windowBox = Handlers.size(p["window_size"]) }
             maxBytes = Handlers.int(p["max_bytes"], maxBytes)
             sizing.scale = Handlers.num(p["scale"]) ?? sizing.scale
@@ -404,30 +525,140 @@ enum Handlers {
             return CGPoint(x: f.minX + x, y: f.minY + y)
         }
         guard let m = meta[t.key] else { throw HelperError("take a screenshot first so coordinates have meaning") }
-        guard x >= 0, y >= 0, x <= Double(m.width), y <= Double(m.height) else {
-            throw HelperError("(\(Int(x)),\(Int(y))) is outside the \(m.width)x\(m.height) screenshot")
+        // The capture's pixel: from a crop's origin, or through the margins left out of the picture, if any. Below a
+        // picture cut short at the bottom, the window carries on (blank) to the capture's height.
+        var c = CGPoint(x: x, y: y)
+        if let crop = m.crop {
+            // Only the picture's own pixels: ones off it may be from an earlier, whole picture.
+            guard x >= 0, y >= 0, x <= crop.width, y <= crop.height else {
+                throw HelperError("(\(Int(x)),\(Int(y))) is outside the \(Int(crop.width))x\(Int(crop.height)) screenshot, which "
+                    + "showed only what changed: aim by element or target, or take a screenshot for the whole window")
+            }
+            c = CGPoint(x: crop.minX + x, y: crop.minY + y)
+        } else if let trim = m.trim {
+            guard x >= 0, y >= 0, y <= Double(m.height), let q = trim.toCapture(c) else {
+                throw HelperError("(\(Int(x)),\(Int(y))) is outside the \(trim.width)x\(trim.height) screenshot")
+            }
+            c = q
+        } else {
+            guard x >= 0, y >= 0, x <= Double(m.width), y <= Double(m.height) else {
+                throw HelperError("(\(Int(x)),\(Int(y))) is outside the \(m.width)x\(m.height) screenshot")
+            }
         }
         let o = origin(t)
-        return CGPoint(x: o.x + m.offset.x + x * m.size.width / Double(m.width),
-                       y: o.y + m.offset.y + y * m.size.height / Double(m.height))
+        return CGPoint(x: o.x + m.offset.x + c.x * m.size.width / Double(m.width),
+                       y: o.y + m.offset.y + c.y * m.size.height / Double(m.height))
     }
 
+    /// Global point → the agent's last picture's pixel; nil where blank margins were left out of it (`Trim`), or
+    /// outside a picture of only what changed (`Meta.crop`).
     static func toPixels(_ t: Target, _ p: CGPoint) -> [Int]? {
         guard let m = meta[t.key] else { return nil }
         let o = origin(t)
-        return [Int(((p.x - o.x - m.offset.x) * Double(m.width) / m.size.width).rounded()),
-                Int(((p.y - o.y - m.offset.y) * Double(m.height) / m.size.height).rounded())]
+        var c = CGPoint(x: (p.x - o.x - m.offset.x) * Double(m.width) / m.size.width,
+                        y: (p.y - o.y - m.offset.y) * Double(m.height) / m.size.height)
+        if let crop = m.crop {
+            guard c.x >= crop.minX, c.y >= crop.minY, c.x <= crop.maxX, c.y <= crop.maxY else { return nil }
+            c = CGPoint(x: c.x - crop.minX, y: c.y - crop.minY)
+        } else if let trim = m.trim {
+            guard let q = trim.toImage(c) else { return nil }
+            c = q
+        }
+        return [Int(c.x.rounded()), Int(c.y.rounded())]
     }
 
-    static func remember(_ t: Target, _ shot: Shot, _ sig: Signature) {
+    /// The middle of what the agent's last picture of `t` captured (global points), margins left out of it or
+    /// not: where a scroll given no place goes.
+    static func captureCenter(_ t: Target) -> CGPoint? {
+        guard let m = meta[t.key] else { return nil }
+        let o = origin(t)
+        return CGPoint(x: o.x + m.offset.x + m.size.width / 2, y: o.y + m.offset.y + m.size.height / 2)
+    }
+
+    /// A `w` x `h` signature's cells per point for `shot`, and where it starts in `t`'s window (points).
+    static func cellScale(_ w: Int, _ h: Int, _ shot: Shot, _ t: Target) -> (perPoint: CGSize, offset: CGPoint) {
+        let o = origin(t)
+        return (CGSize(width: Double(w) / max(shot.rect.width, 1), height: Double(h) / max(shot.rect.height, 1)),
+                CGPoint(x: shot.rect.minX - o.x, y: shot.rect.minY - o.y))
+    }
+
+    /// Whether what differs (`d`, from a frame of `t` in `shot`) is only the text cursor blinking: as
+    /// accessibility tells it (`onlyCaretBlinked`, with the cursor `then` and `now`), or where it can't, by the
+    /// shape of what changed (`CaretShape`, in the field the cursor was in when that's known). Not by its shape
+    /// when accessibility says the cursor moved or the text changed, nor after keys, typing or a click
+    /// (`typed`).
+    static func cursorBlinked(_ d: CellDiff, then: Caret?, now: Caret?, _ shot: Shot, _ t: Target, typed: Bool) -> Bool {
+        guard let box = d.box, shot.rect.width > 0, shot.rect.height > 0 else { return false }
+        let (perPoint, offset) = cellScale(d.w, d.h, shot, t)
+        if let then, let now {
+            if onlyCaretBlinked(box, now: now, then: then, scale: perPoint, offset: offset) { return true }
+            guard now.same(as: then) else { return false }
+        }
+        let field = (now ?? then).map { Signature.cells($0.field, perPoint: perPoint, offset: offset) }
+        return CaretShape.blinked(d, near: field, perPoint: perPoint, typed: typed)
+    }
+
+    /// What an act's settled frame (`now`) shows as changed since the agent's last image (`before`) for whether
+    /// its picture is sent: nothing (`change` nil) when all that differs is what keeps moving by itself (`mask`,
+    /// cells: `leftOut`) or, of what's left, a text cursor blinking (`blink`: `blinked`). Else the change as
+    /// `Signature.diff` gives it, all of it (a picture of another size: the whole picture). This decides only
+    /// whether the picture is sent: a wait for a change or for text, and the outline's check that the window
+    /// changed though its outline didn't, go by the frames as they are.
+    nonisolated static func shownChange(_ now: Signature, from before: Signature, outW: Int, outH: Int, mask: [CGRect],
+                                        blink: (CellDiff) -> Bool)
+        -> (change: (box: CGRect, fraction: Double)?, leftOut: Bool, blinked: Bool) {
+        guard let d = CellDiff(now, from: before) else {
+            return (change: (box: CGRect(x: 0, y: 0, width: outW, height: outH), fraction: 1), leftOut: false, blinked: false)
+        }
+        guard !d.isEmpty else { return (change: nil, leftOut: false, blinked: false) }
+        let rest = d.clearing(mask)
+        guard !rest.isEmpty else { return (change: nil, leftOut: true, blinked: false) }
+        if blink(rest) { return (change: nil, leftOut: rest.count < d.count, blinked: true) }
+        return (change: d.change(outW: outW, outH: outH), leftOut: false, blinked: false)
+    }
+
+    /// Where a batch's pointer went (global points), so what keeps moving stays in its change where the batch
+    /// aimed at it (`Ambient.touched`): each scroll's or move's x,y, and the middle of the picture for a scroll
+    /// given none. Nil when one was aimed by element or target, or its point can't be told: nothing is left out.
+    static func aimedPoints(_ ran: [[String: Any]], _ t: Target) -> [CGPoint]? {
+        var out: [CGPoint] = []
+        for a in ran where ["scroll", "move", "mouse_move", "hover"].contains(kind(a)) {
+            guard a["element"] == nil, a["target"] == nil else { return nil }
+            let xy = num(a["x"]).flatMap { x in num(a["y"]).map { CGPoint(x: x, y: $0) } } ?? point(a["coordinate"])
+            if let xy {
+                guard let p = try? toGlobal(t, xy.x, xy.y, a) else { return nil }
+                out.append(p)
+            } else if kind(a) == "scroll", let c = captureCenter(t) {
+                out.append(c)
+            } else {
+                return nil
+            }
+        }
+        return out
+    }
+
+    /// Keep `shot` as what coordinates in `t` refer to (and what was over the window then, `Run.look`).
+    /// `shown`: it goes to the agent as an image (else it only places what the agent is told in pixels).
+    static func remember(_ t: Target, _ shot: Shot, _ sig: Signature, shown: Bool) {
         let o = origin(t)
         let start = AX.uptime(), cursor = caret(t)
         if Trace.on, case .window = t {
             Trace.log(["k": "caret", "ms": ((AX.uptime() - start) * 10_000).rounded() / 10, "found": cursor != nil])
         }
         meta[t.key] = Meta(offset: CGPoint(x: shot.rect.minX - o.x, y: shot.rect.minY - o.y), size: shot.rect.size,
-                           width: shot.image.width, height: shot.image.height, sig: sig, caret: cursor)
+                           width: shot.image.width, height: shot.image.height, sig: sig, caret: cursor, shown: shown,
+                           captured: shot.rect)
         Run.look(t)
+        if shown { VerifyEdit.seen(t.key) }  // the edits whose pictures were withheld are in this one
+    }
+
+    /// How an act starts on a window, from what's kept of it (`m`): `firstLook`, with no picture of it at all,
+    /// so one is taken to aim from and coordinates stop; `unseen`, with none the agent was shown (none, or
+    /// only the one `find` took to place what it lists): then there's no picture to compare with, so the
+    /// result shows the window rather than "no change", and a failed first action shows it too. A batch
+    /// begun with open (`opening`) has neither: it moves to the window open brings up.
+    nonisolated static func startLook(_ m: Meta?, opening: Bool) -> (firstLook: Bool, unseen: Bool) {
+        (!opening && m == nil, !opening && m?.shown != true)
     }
 
     /// How long one question about the cursor waits for the app: it's asked with every picture, and an app
@@ -510,28 +741,22 @@ enum Handlers {
         try Policy.checkLook(pid(t))
         current = t.key
         if readRequested(p["read"]) { return try readText(t, p["read"]!, p) }  // one element's whole text: ReadText.swift
-        let o = Opts(p)
-        var region: CGRect?
-        if let r = p["region"] as? [Any], r.count == 4, let x0 = num(r[0]), let y0 = num(r[1]),
-           let x1 = num(r[2]), let y1 = num(r[3])
-        {
-            let a = try toGlobal(t, min(x0, x1), min(y0, y1)), b = try toGlobal(t, max(x0, x1), max(y0, y1))
-            region = CGRect(x: a.x, y: a.y, width: max(1, b.x - a.x), height: max(1, b.y - a.y))
-        }
+        let region = try regionPoints(p["region"]).map { try regionRect(t, $0) }
+        // (`detail: "low"` for the window's picture; a zoom is a closer look, and no image needs none.)
+        let o = region == nil && p["image"] as? Bool != false ? detailed(Opts(p), t) : Opts(p)
+        // How the agent looks at this window from now on when an act isn't told (`ViewMode`), once this look is done.
+        let mode = viewMode(afterScreenshot: p)
+        func looked() { if case .window(let w) = t, let mode { Session.current.modes[w.id] = mode } }
         if p["image"] as? Bool == false {  // accessibility text only: the cheapest way to look
             var out: [String: Any] = ["window": describe(t)]
             if let region, case .window(let w) = t {  // just the words in that area
-                var text = AX.text(pid: w.pid, wid: w.id, within: region)
-                if text == nil || text == "(no text in that area)" {  // nothing exposed there: read the pixels
-                    let lines = try await OCR.read(try await sharpShot(t, region: region))
-                    if !lines.isEmpty { text = "(read off the screen)\n" + OCR.text(lines) }
-                }
-                out["text"] = text ?? "(no text in that area)"
+                out["text"] = try await regionText(t, w, region)
                 return out
             }
             AppCards.enabled = p["app_cards"] as? Bool != false
             if case .window(let w) = t, let card = AppCards.card(pid: w.pid) { out["card"] = card }
-            return out.merging(accessibility(t, o)) { _, new in new }
+            looked()
+            return bearings(out.merging(accessibility(t, o), uniquingKeysWith: { _, new in new }), t)
         }
         let shot = try await plan(t, region: region, o).run()
         var out = try await result(t, shot, o, zoom: region != nil, text: p["text"] as? Bool == true)
@@ -539,7 +764,18 @@ enum Handlers {
         out["changed"] = true
         AppCards.enabled = p["app_cards"] as? Bool != false
         if case .window(let w) = t, let card = AppCards.card(pid: w.pid) { out["card"] = card }
-        return out
+        looked()
+        return region == nil ? bearings(out, t) : out  // (a zoom is a closer look, not a new one)
+    }
+
+    /// How a screenshot sets the agent's way of looking at its window (`ViewMode`): one without an image
+    /// (its outline) makes acts that aren't told otherwise return the outline's changes rather than a picture;
+    /// one with an image, a zoom included, puts them back to pictures. Reading one element's text or a
+    /// region's (`read`, or `region` with no image) changes nothing: nil.
+    nonisolated static func viewMode(afterScreenshot p: [String: Any]) -> ViewMode? {
+        if readRequested(p["read"]) { return nil }
+        guard p["image"] as? Bool == false else { return .visual }
+        return regionPoints(p["region"]) == nil ? .outline(interactive: p["interactive"] as? Bool == true) : nil
     }
 
     nonisolated static func kind(_ a: [String: Any]) -> String {
@@ -571,7 +807,7 @@ enum Handlers {
     nonisolated static func mayOpen(_ a: [String: Any]) -> Bool {
         switch kind(a) {
         case "move", "mouse_move", "hover", "scroll", "wait", "sleep", "wait_for", "waitfor", "key_down", "keydown",
-             "mouse_down", "focus", "set_value", "screenshot", "clipboard", "paste":
+             "mouse_down", "focus", "set_value", "screenshot", "clipboard", "paste", "read":
             return false
         case "type", "type_text":
             return a["submit"] as? Bool == true || (a["text"] as? String ?? "").hasSuffix("\n")
@@ -637,17 +873,306 @@ enum Handlers {
         return ran.contains { mayOpen($0) || ["key_down", "keydown"].contains(kind($0)) } ? 0.2 : 0.05
     }
 
-    enum Ending { case status, firstLook, settled }
+    enum Ending { case status, firstLook, check, settled }
 
-    /// What an act returns at its end: no image with screenshot "never", or when nothing ran (the error
-    /// alone; a stop shows the window, though). But on a first look whose first action failed, the window
-    /// it was going to be shown anyway, so the agent can aim from it. Else a settled screenshot if it changed,
-    /// as when the batch moved to a new window (`moved`, then failed): that one is the agent's now.
-    nonisolated static func ending(wantShot: Bool, always: Bool, done: Int, stopped: Bool, failed: Bool,
-                                   firstLook: Bool, moved: Bool = false) -> Ending {
+    /// What an act returns at its end: no image with screenshot "never", nor after a batch that only reads
+    /// text or the clipboard, or sets it (`clipboardOnly`: nothing it does shows), unless "always". When nothing ran,
+    /// because the first action failed or the batch stopped before it for the user's OK (`confirm`): on a
+    /// first look, the window it was going to be shown anyway, so the agent can aim from it; else one quick
+    /// look, shown only if the window changed since the agent's last image (`check`). An empty batch: the
+    /// status alone. A stop before coordinates (not `confirm`) shows the window. Else a settled screenshot
+    /// if it changed (after a `confirm` stop, only then), as when the batch moved to a new window (`moved`,
+    /// then failed): that one is the agent's now.
+    nonisolated static func ending(wantShot: Bool, always: Bool, done: Int, stopped: Bool, confirm: Bool = false,
+                                   failed: Bool, firstLook: Bool, moved: Bool = false, clipboardOnly: Bool = false) -> Ending {
         guard wantShot else { return .status }
-        if done > 0 || always || stopped || moved { return .settled }
-        return firstLook && failed ? .firstLook : .status
+        if always || moved { return .settled }
+        if clipboardOnly { return .status }
+        if done > 0 || (stopped && !confirm) { return .settled }
+        guard failed || stopped else { return .status }
+        return firstLook ? .firstLook : .check
+    }
+
+    /// A batch that only reads (text with read, the clipboard) or sets the clipboard: nothing on screen
+    /// changes, so there's nothing to look at before or after it (unless "always" asks for a picture anyway).
+    nonisolated static func onlyClipboard(_ actions: [[String: Any]], always: Bool) -> Bool {
+        !always && !actions.isEmpty && actions.allSatisfy { ["clipboard", "read"].contains(kind($0)) }
+    }
+
+    /// `act`'s quick look when nothing ran (`Ending.check`): one frame (`capture`), and what in it differs
+    /// from the agent's last image (`before`). Nil when nothing does, or only the text cursor blinked
+    /// (`blinked`): then the agent's image still holds, and none is sent.
+    static func quickLook(before: Signature, capture: () async throws -> Shot, blinked: (Signature, Shot) -> Bool) async throws
+        -> (shot: Shot, change: (box: CGRect, fraction: Double)?) {
+        let shot = try await capture()
+        let sig = Signature(shot.image)
+        guard let change = sig.diff(before, outW: shot.image.width, outH: shot.image.height), !blinked(sig, shot) else {
+            return (shot, nil)
+        }
+        return (shot, change)
+    }
+
+    /// What an act was told about a picture at its end: "never", "auto" (only if the window changed) or
+    /// "always".
+    enum ShotMode { case never, auto, always }
+
+    /// The screenshot mode an act was given (`screenshot`: false for "never", true for "auto" or, with
+    /// `always_image`, "always"), or nil when it wasn't: then how the agent last chose to look at the window
+    /// decides (`ViewMode`), and "auto" when that's pictures.
+    nonisolated static func shotMode(_ p: [String: Any]) -> ShotMode? {
+        let given = p["screenshot"].flatMap { $0 is NSNull ? nil : $0 as? Bool }
+        if given != false, p["always_image"] as? Bool == true { return .always }
+        return given.map { $0 ? .auto : .never }
+    }
+
+    /// Whether an act goes by its window's outline rather than pictures, and which outline (true: only what
+    /// can be acted on): only when it wasn't told about a picture (`given` nil) and the agent's last look at
+    /// the window had no image (`mode`). An outline asked for in the act itself (`text`, `interactive`) says
+    /// which; else the one the agent last had. Nil: by pictures.
+    nonisolated static func outlineKind(given: ShotMode?, mode: ViewMode?, _ p: [String: Any]) -> Bool? {
+        guard given == nil, case .outline(let interactive)? = mode else { return nil }
+        return p["text"] as? Bool == true ? p["interactive"] as? Bool == true : interactive
+    }
+
+    /// Why an act going by the window's outline (`ViewMode.outline`) shows the window after all, as "auto"
+    /// would, from how its batch ended; nil if nothing did. An action failed; it stopped before an action
+    /// aimed by position (coordinates come from a picture) or for the user's OK (a press that can't be undone
+    /// is looked at before it's made); or it moved to another window.
+    nonisolated static func outlineEscalation(failed: Bool, stopped: Bool, confirm: Bool, moved: Bool) -> String? {
+        if failed { return "an action failed" }
+        if confirm { return "the batch stopped for the user's OK (look before a press that can't be undone)" }
+        if stopped { return "the batch stopped before an action aimed by position" }
+        if moved { return "the batch moved to another window" }
+        return nil
+    }
+
+    /// `notes` without `note` (an escalation's, when the act ends with no image after all).
+    nonisolated static func dropping(_ note: String, from notes: [String]) -> [String] {
+        notes.filter { $0 != note }
+    }
+
+    /// Why the window's outline (`text`, as `AX.outline` returned it: nil with no tree; `interactive`: of
+    /// what can be acted on) can't stand in for a picture of it, or nil if it can: nothing in it (a canvas, an
+    /// app without accessibility), or only part of the window (the walk ran out of time, `cutShort`, or the
+    /// outline ran past its length cap: `truncated`, as its registry says, else told by its last lines).
+    nonisolated static func outlineProblem(_ text: String?, interactive: Bool, cutShort: Bool, truncated: Bool? = nil) -> String? {
+        guard let text else { return "the window has no accessibility tree" }
+        if text.isEmpty { return interactive ? "its outline has nothing to act on" : "its outline is empty" }
+        if cutShort { return "its outline was cut short (the app answered slowly)" }
+        if truncated ?? outlineTruncated(text) { return "its outline is too long to send whole" }
+        return nil
+    }
+
+    /// Whether an outline ends with the line saying it ran past its length cap (`AX.Registry.truncated` says so
+    /// for the outline just written).
+    nonisolated static func outlineTruncated(_ text: String) -> Bool {
+        text.split(separator: "\n").suffix(2).contains { $0.hasPrefix("… (truncated") }
+    }
+
+    /// A batch that only brings its window forward (activate): the window becomes key at its start, as for
+    /// keys, so that change of look is taken apart from what the batch does (`Baseline`).
+    nonisolated static func activatesOnly(_ actions: [[String: Any]]) -> Bool {
+        !actions.isEmpty && actions.allSatisfy { ["activate", "raise", "focus_window"].contains(kind($0)) }
+    }
+
+    /// Whether an act's start may change how its window looks by itself, so frames are taken around it
+    /// (`Baseline.flip`): only with a picture the agent was shown to compare with (`seen`), the window on
+    /// screen, and either its app not held on it yet (`heldHere`: being made active flips its title bar, the
+    /// colour of what's selected) or keys to send (`keys`) to a window that isn't key yet (`keyHere`).
+    nonisolated static func probesFlip(seen: Bool, onScreen: Bool, heldHere: Bool, keys: Bool, keyHere: Bool) -> Bool {
+        seen && onScreen && (!heldHere || (keys && !keyHere))
+    }
+
+    /// How long the window gets to draw its new look after being made active or key, before the frame after
+    /// it, and before one more if that one still differs from the frame before (s).
+    nonisolated static let flipDraw = 0.05, flipRedraw = 0.06
+
+    /// The agent's last image (`before`) as the window looks once `flip` has run (making its app active, the
+    /// window key), when that's all that changed: a frame just before it (`capture`) that matches `before`, or
+    /// differs only by the text cursor blinking (`blinked`), says nothing else had changed, and the window's
+    /// place and what's over it staying the same (`basis`) says the flip opened nothing (a popover an app shows
+    /// again as it becomes active). Then the frame after it, once its new look is drawn, is returned, to compare
+    /// the act's end with. Else nil, and `before` stands: an outside change is never folded in. `flip` runs
+    /// whatever the frames; one that can't be taken (nil) only means nil.
+    static func rebase<Basis: Equatable>(_ before: Signature, basis: () -> Basis, capture: () async -> Shot?,
+                                         flip: () async throws -> Void, pause: (Double) async -> Void,
+                                         blinked: (Signature, Shot) -> Bool) async rethrows -> Signature? {
+        let start = basis()
+        var preSig: Signature?  // the frame before, when it matches `before`
+        if let pre = await capture() {
+            let s = Signature(pre.image)
+            if s.diff(before, outW: s.w, outH: s.h) == nil || blinked(s, pre) { preSig = s }
+        }
+        try await flip()
+        guard let preSig else { return nil }
+        await pause(flipDraw)
+        guard let first = await capture() else { return nil }
+        var now = Signature(first.image)
+        if now.diff(preSig, outW: now.w, outH: now.h) != nil {  // its new look: once more, in case it was still being drawn
+            await pause(flipRedraw)
+            if let again = await capture() { now = Signature(again.image) }
+        }
+        return basis() == start ? now : nil
+    }
+
+    /// What an act's end is compared with: the agent's last image of its window (`sig`), moved past the
+    /// window's own change of look as the act makes its app active or the window key (`flip`), when nothing
+    /// else has changed it since that image. Going by the outline, the window as the batch began instead
+    /// (`kept` false: it's no image the agent was shown, so what's kept of that stays as it is).
+    @MainActor
+    final class Baseline {
+        private(set) var sig: Signature
+        let target: Target
+        let opts: Opts
+        let caretThen: Caret?  // the text cursor in the agent's image
+        let kept: Bool
+        /// Keys, typing or a click went to the window since the agent's image (before the batch, or in an action
+        /// of it run already): a change shaped like a text cursor may be a character then.
+        var typed: Bool
+        private var plan: (plan: CapturePlan, basis: PlanBasis?)?
+
+        init(sig: Signature, target: Target, opts: Opts, caretThen: Caret?, kept: Bool = true, typed: Bool = false) {
+            (self.sig, self.target, self.opts, self.caretThen, self.kept, self.typed) = (sig, target, opts, caretThen, kept, typed)
+        }
+
+        var wid: CGWindowID { target.key }
+
+        /// Run `body` (the activation, or the click that makes the window key) with a frame taken before and
+        /// after it (`rebase`). A new baseline also goes into what's kept of the agent's image (`meta`, when
+        /// `kept`), so the next act, the window held and key by then, doesn't see the flip either.
+        func flip(_ body: () async throws -> Void) async rethrows {
+            let t = target
+            let new = try await Handlers.rebase(sig, basis: { PlanBasis.of(t) }, capture: { await self.frame() }, flip: body,
+                                                pause: { _ = try? await Task.sleep(nanoseconds: UInt64($0 * 1e9)) },
+                                                blinked: { self.blinked($0, $1) })
+            guard let new else { return }
+            sig = new
+            if kept { Handlers.meta[t.key]?.sig = new }
+            if Trace.on { Trace.log(["k": "rebased"]) }
+        }
+
+        /// A frame of the window now: one plan for them all, made again when what's over the window or its
+        /// place changes. Nil when it can't be taken.
+        private func frame() async -> Shot? {
+            let basis = PlanBasis.of(target)
+            if plan == nil || plan?.basis != basis {
+                guard let made = try? await Handlers.plan(target, region: nil, opts) else { return nil }
+                plan = (made, basis)
+            }
+            return try? await plan?.plan.run()
+        }
+
+        /// Whether frame `s` differs from the baseline only by the text cursor blinking: where accessibility
+        /// can't tell, by its shape (`cursorBlinked`), but for the frame a batch going by the outline began with
+        /// (not `kept`): what that's compared with goes by the frames as they are.
+        private func blinked(_ s: Signature, _ shot: Shot) -> Bool {
+            guard kept else {
+                guard let then = caretThen, let now = Handlers.caret(target) else { return false }
+                return Handlers.blinked(s, from: sig, then: then, now: now, shot, target)
+            }
+            guard let d = CellDiff(s, from: sig) else { return false }
+            return Handlers.cursorBlinked(d, then: caretThen, now: caretThen == nil ? nil : Handlers.caret(target), shot, target,
+                                          typed: typed)
+        }
+    }
+
+    /// A batch begun with open and no window: the window open brings up is the one it works in, so none is
+    /// looked up, captured or activated before (the session's may be anyone's). Not with a macro step: a
+    /// macro belongs to an app, known only once open has run.
+    nonisolated static func opensFirst(_ p: [String: Any]) -> Bool {
+        guard p["window"] == nil || p["window"] is NSNull, let actions = p["actions"] as? [[String: Any]],
+              let first = actions.first else { return false }
+        return opens(first) && !actions.contains { kind($0) == "macro" }
+    }
+
+    nonisolated static func opens(_ a: [String: Any]) -> Bool { ["open", "open_url", "launch"].contains(kind(a)) }
+
+    /// Why the policy refuses actions `from` on of a batch in app `pid` (looking at it, then each of them),
+    /// for its errors; nil if it allows them all. Checked before any of them runs.
+    static func refusal(_ actions: [[String: Any]], from: Int, pid: pid_t, base: Int) -> String? {
+        guard actions.indices.contains(from) else { return nil }
+        do { try Policy.checkLook(pid) } catch { return "action \(base + from + 1) (\(kind(actions[from]))): \(error)" }
+        for (i, a) in actions.enumerated().dropFirst(from) {
+            do { try Policy.checkAction(a, pid: pid) } catch { return "action \(base + i + 1) (\(kind(a))): \(error)" }
+        }
+        return nil
+    }
+
+    /// The app open {url | path | file, app} would open its target in, by the same lookups open makes: nil
+    /// when open would fail anyway (its own error says why then).
+    static func openApp(_ a: [String: Any]) -> URL? {
+        if let name = (a["app"] as? String).flatMap({ $0.isEmpty ? nil : $0 }) {
+            return Windows.appURL(name) ?? Windows.runningApp(name)?.bundleURL
+        }
+        guard let s = (a["url"] ?? a["path"] ?? a["file"]) as? String, !s.isEmpty, let u = try? openable(s) else { return nil }
+        return NSWorkspace.shared.urlForApplication(toOpen: u)
+    }
+
+    /// The level of `apps` (the policy's, keyed by lowercase bundle id or name) for an app that may not be
+    /// running yet: its bundle id's, as `Policy.level` reads a running app's, else the strictest of its
+    /// names' (an app's name can be read more than one way before it runs), else full.
+    nonisolated static func launchLevel(_ apps: [String: Policy.Level], bundleID: String?, names: [String]) -> Policy.Level {
+        if let id = bundleID?.lowercased(), let l = apps[id] { return l }
+        return names.compactMap { apps[$0.lowercased()] }.min() ?? .full
+    }
+
+    /// The least level that lets action `a` start or use an app: navigate types into it (full); open
+    /// only hands it something (click, as for any action that isn't typing).
+    nonisolated static func levelToLaunch(_ a: [String: Any]) -> Policy.Level { navigates(a) ? .full : .click }
+
+    /// Before action `a` (open, navigate) starts or uses the app at `url`: does the policy let it? Read by
+    /// bundle id before anything is launched; for an app already running, as for any action in it.
+    static func checkLaunch(_ url: URL, _ a: [String: Any]) throws {
+        let bundle = Bundle(url: url)
+        if let id = bundle?.bundleIdentifier,
+           let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first(where: { !$0.isTerminated }) {
+            return try Policy.checkAction(a, pid: app.processIdentifier)
+        }
+        var name = FileManager.default.displayName(atPath: url.path)
+        if name.lowercased().hasSuffix(".app") { name.removeLast(4) }
+        let info = [bundle?.localizedInfoDictionary, bundle?.infoDictionary].compactMap { $0 }
+        let names = [name, url.deletingPathExtension().lastPathComponent]
+            + ["CFBundleDisplayName", "CFBundleName"].flatMap { key in info.compactMap { $0[key] as? String } }
+        let level = launchLevel(Policy.config.apps, bundleID: bundle?.bundleIdentifier, names: names)
+        guard level < levelToLaunch(a) else { return }
+        let what: String
+        switch level {
+        case .deny: what = "keeps agents out of \(name) entirely"
+        case .view: what = "lets agents look at \(name) but not act in it"
+        case .click: what = "lets agents click in \(name) but not type, press keys or run menu commands"
+        case .full: what = "allows it"
+        }
+        throw HelperError("not allowed: puter-use's policy \(what) (\(kind(a))). The user can change that in \(Policy.file.path)")
+    }
+
+    /// The default browser (the app web addresses open in).
+    static func defaultBrowser() -> URL? {
+        URL(string: "https://example.com").flatMap { NSWorkspace.shared.urlForApplication(toOpen: $0) }
+    }
+
+    /// The target of an act: its window, as for every command. With none, a batch begun with navigate goes
+    /// to a browser: the session's window when that's a browser's, else the default browser's window (the
+    /// one its name would mean), the browser started or given a window first if it has none, in the
+    /// background, once the policy is known to allow it (read by bundle id, before anything starts).
+    static func actTarget(_ p: [String: Any]) async throws -> Target {
+        let v = p["window"]
+        guard v == nil || v is NSNull, let first = (p["actions"] as? [[String: Any]])?.first, navigates(first),
+              !(p["actions"] as? [[String: Any]] ?? []).contains(where: { kind($0) == "macro" }) else { return try resolve(v) }
+        if let cur = current, cur != 0, let w = Windows.info(cur), isBrowser(w.pid) { return used(w) }
+        guard let url = defaultBrowser(), let id = Bundle(url: url)?.bundleIdentifier, browsers.contains(id.lowercased()) else {
+            throw HelperError("no window selected: pass window (a browser's name or id, from windows), or use open {url} "
+                + "to open the address in the default browser")
+        }
+        do { try checkLaunch(url, first) } catch {
+            throw HelperError("nothing was run: action \(max(int(p["first"], 1), 1)) (\(kind(first))) is \(error)")
+        }
+        var wins = Windows.targetable(app: id)
+        if wins.isEmpty { wins = try await Windows.launch(id) }
+        let system = { (w: WinInfo) in systemWindow(w, AX.window(pid: w.pid, wid: w.id)) }  // the dictation orb
+        guard let w = pick(wins, current: current, own: Session.current.ownRecent, system: system)?.0 else {
+            throw HelperError("no window for \(id) (use windows with launch=true)")
+        }
+        return used(w)
     }
 
     nonisolated static let keyboardActions: Set<String> = [
@@ -678,11 +1203,15 @@ enum Handlers {
 
     /// On a new hold, the primer's click makes the window key, just before the first key or menu command
     /// goes out: after that action's checks (policy, confirm, guardKeyboard), so a batch that stops before
-    /// any key clicks nothing. Once per hold: the click ends `Hold.fresh`.
+    /// any key clicks nothing. Once per hold: the click ends `Hold.fresh`. Becoming key changes how the
+    /// window looks, so in the act's own window that's taken apart from what the act does (`Baseline`).
     static func primeKeys(_ r: Route) async {
         guard keysNeedPrimer(r) else { return }
-        await Input.primer(r)
-        await Input.afterPrimer()
+        let click = {
+            await Input.primer(r)
+            await Input.afterPrimer()
+        }
+        if let base = Session.current.baseline, base.wid == r.wid { await base.flip(click) } else { await click() }
     }
 
     /// Thrown by a menu command's check on a new hold, so its click goes after the check and before the press.
@@ -690,8 +1219,13 @@ enum Handlers {
 
     nonisolated static func actsOnKeyboardFocus(_ a: [String: Any]) -> Bool {
         if keyboardActions.contains(kind(a)) || kind(a) == "menu" || kind(a) == "menu_item" { return true }
-        guard a["keys"] != nil || a["modifiers"] != nil else { return false }
-        return ["click", "double_click", "triple_click", "right_click", "middle_click", "mouse_down", "drag"].contains(kind(a))
+        // A move holds keys only when it names a modifier (OpenAI's computer use sends an empty list otherwise).
+        if ["move", "mouse_move", "hover"].contains(kind(a)) {
+            return Keys.splitCombo(modifierKeys(a)).contains { Keys.modifiers[Keys.normalize($0)] != nil }
+        }
+        guard a["keys"] != nil || a["modifiers"] != nil || modifierText(a) != nil else { return false }
+        return ["click", "left_click", "double_click", "triple_click", "right_click", "middle_click", "mouse_down", "drag",
+                "left_click_drag"].contains(kind(a))
     }
 
     /// The app's menu bar as text (every command and its shortcut), or the items matching `query`.
@@ -705,73 +1239,168 @@ enum Handlers {
 
     /// The opt-in accessibility view: focused element plus the numbered outline. Never sent by default.
     /// `within` (global points) limits the outline to one area and skips the focus line. With `diff`, and
-    /// an earlier outline of this window that this session was sent (of the same kind: interactive or
-    /// not), just what changed since (when that's shorter).
+    /// an earlier outline of this window that this session was sent (of the same kind, or a full one for an
+    /// interactive one now), just what changed since when that's much shorter (`OutlineDiff`).
     static func accessibility(_ t: Target, _ o: Opts = Opts([:]), within: CGRect? = nil, diff: Bool = false) -> [String: Any] {
+        let look = outlineLook(t, o, within: within, diff: diff)
+        look.keep()
+        return look.out
+    }
+
+    /// `accessibility`'s view, before it's sent: its fields (`out`), why it can't stand in for a picture of
+    /// the window (`problem`, see `outlineProblem`; nil when it can), and `keep`, which records it as the
+    /// outline the agent was sent (what the next diff is against). Not kept, the agent's last outline stands.
+    /// `unchanged`: with `diff`, the outline says just what the agent's last one did, its text included (nothing
+    /// to tell). Kept, the changes leave the agent what it had past where a cut outline stops (`Changes.baseline`).
+    static func outlineLook(_ t: Target, _ o: Opts, within: CGRect? = nil, diff: Bool)
+        -> (out: [String: Any], problem: String?, keep: () -> Void, unchanged: Bool) {
         var out: [String: Any] = [:]
         if within == nil, let pid = pid(t), let f = AX.focusedSummary(pid: pid, wid: t.key) { out["focused"] = f }
-        if case .window(let w) = t {
-            let full = AX.outline(pid: w.pid, wid: w.id, within: within, maxChars: o.maxChars, interactive: o.interactive)
-            out["text"] = full.map { $0.isEmpty ? (o.interactive
-                ? "(no interactive elements in this window; try text: true, or find)"
-                : "(no accessibility elements in this window)") : $0 } ?? "(no accessibility tree for this window)"
-            if full != nil, within == nil, let reg = AX.registries[w.id] {
-                if reg.cutShort {
-                    // Only part of the window: sent whole (a diff would list the rest as gone), and not kept to
-                    // diff the next one against (it would list the rest as new).
-                    Session.current.outlines[w.id] = nil
-                } else {
-                    if diff, let sent = Session.current.outlines[w.id], sent.interactive == o.interactive,
-                       let changes = outlineChanges(sent.lines, reg.lines) {
-                        out["text"] = changes
-                    }
-                    Session.current.outlines[w.id] = (o.interactive, reg.lines)
-                }
-            }
+        guard case .window(let w) = t else { return (out, "the screen has no outline", {}, false) }
+        let full = AX.outline(pid: w.pid, wid: w.id, within: within, maxChars: o.maxChars, interactive: o.interactive)
+        out["text"] = full.map { $0.isEmpty ? (o.interactive
+            ? "(no interactive elements in this window; try text: true, or find)"
+            : "(no accessibility elements in this window)") : $0 } ?? "(no accessibility tree for this window)"
+        let written = full != nil ? AX.registries[w.id] : nil
+        let problem = outlineProblem(full, interactive: o.interactive, cutShort: written?.cutShort == true,
+                                     truncated: written?.truncated)
+        guard within == nil, let reg = written, let whole = full else { return (out, problem, {}, false) }
+        if reg.cutShort {
+            // Only part of the window: sent whole (a diff would list the rest as gone), and not kept to
+            // diff the next one against (it would list the rest as new).
+            return (out, problem, { Session.current.sentOutlines[w.id] = nil }, false)
         }
-        return out
+        let now = OutlineDiff.Outline(reg, interactive: o.interactive)  // now: the registry is rewritten by later outlines
+        let changes = diff ? Session.current.sentOutlines[w.id].flatMap { OutlineDiff.changes($0, now, full: whole) } : nil
+        if let changes { out["text"] = changes.text }
+        let keep = changes?.baseline ?? now
+        return (out, problem, { Session.current.sentOutlines[w.id] = keep }, changes?.unchanged ?? false)
     }
 
-    /// What changed between an outline the agent was sent and the window's latest, or nil if the change
-    /// is most of it (then the whole outline reads better).
-    static func outlineChanges(_ old: [(Int, String)], _ lines: [(Int, String)]) -> String? {
-        let before = Dictionary(old, uniquingKeysWith: { a, _ in a })
-        let now = Dictionary(lines, uniquingKeysWith: { a, _ in a })
-        var out: [String] = []
-        for (id, line) in lines where before[id] != line { out.append((before[id] == nil ? "+ " : "~ ") + line) }
-        for (id, line) in old where now[id] == nil { out.append("- " + line) }
-        if out.isEmpty { return "outline: nothing changed since your last outline (\(now.count) elements)" }
-        guard out.count * 2 <= max(now.count, 4) else { return nil }
-        let same = lines.filter { before[$0.0] == $0.1 }.count
-        return "outline changes since your last outline (+ new, ~ changed, - gone; the \(same) unchanged elements keep their numbers):\n"
-            + out.joined(separator: "\n")
-    }
-
-    static func result(_ t: Target, _ shot: Shot, _ o: Opts, zoom: Bool, text: Bool, diff: Bool = false) async throws -> [String: Any] {
-        let sig = Signature(shot.image)
-        if !zoom { remember(t, shot, sig) }
+    /// The reply's picture of `shot` (and the outline, with `text`), kept as what the agent's coordinates refer to
+    /// unless it's a zoom. `trim`: an act's picture, which leaves blank margins out (`Trim`, unless `trim_blank`
+    /// is false; a window's, not a zoom); a screenshot's never does, as it would cut the ends of a browser's
+    /// toolbar and tabs too. `ambient`: what kept moving by itself in the frames before it (`Meta.ambient`).
+    /// `crop`: an act's picture of only what changed, this part of the capture (pixels, `ChangeCrop`): marks are
+    /// drawn on it, it's never trimmed, and without marks or an outline the reply has the outline of what can be
+    /// acted on in it (`crop_outline`; `cropOutline`: that, read already to decide on the crop). `withhold`: the
+    /// reply is marked verified (`VerifyEdit`), so the agent isn't shown its picture, crop or whole: nothing of it is
+    /// kept as what the agent saw (`VerifyEdit.remembers`; nor does a crop count towards the whole pictures due), and
+    /// its own record goes to `withhold` instead.
+    static func result(_ t: Target, _ shot: Shot, _ o: Opts, zoom: Bool, text: Bool, diff: Bool = false, trim: Bool = false,
+                       ambient: [CGRect] = [], crop: CGRect? = nil, cropOutline given: String?? = nil,
+                       withhold: ((Meta) -> Void)? = nil) async throws -> [String: Any] {
+        let sig = Signature(shot.image)  // (of the whole capture, margins and all)
+        let crops = meta[t.key]?.crops ?? 0  // (crops in a row before this picture; what's kept is replaced next)
+        let keep = VerifyEdit.remembers(zoom: zoom, verified: withhold != nil)
+        if keep {  // the image goes to the agent in this reply
+            remember(t, shot, sig, shown: true)
+            meta[t.key]?.ambient = ambient
+        }
+        // A picture withheld from the agent: its own record, apart from what the agent saw (for where it changed).
+        var own: Meta?
+        if !keep, !zoom {
+            let corner = origin(t)
+            own = Meta(offset: CGPoint(x: shot.rect.minX - corner.x, y: shot.rect.minY - corner.y), size: shot.rect.size,
+                       width: shot.image.width, height: shot.image.height, sig: sig, caret: caret(t), captured: shot.rect)
+        }
+        // What the picture shows: the whole capture, or only the part of it round what changed.
+        var view = shot
+        var shownPart: CGRect?  // the part of the capture a crop shows (pixels)
+        if let crop, !zoom, case .window = t,
+           case let c = crop.integral.intersection(CGRect(x: 0, y: 0, width: shot.image.width, height: shot.image.height)),
+           !c.isNull, !c.isEmpty, let part = shot.image.cropping(to: c) {
+            shownPart = c
+            view = Shot(image: part, rect: ChangeCrop.points(c, of: shot))
+            if keep {
+                meta[t.key]?.crop = c
+                meta[t.key]?.crops = crops + 1
+            }
+            own?.crop = c
+        }
         var acc: [String: Any] = [:]
         if text { acc = accessibility(t, o, within: zoom ? shot.rect : nil, diff: diff) }
-        var image = shot.image
+        var image = view.image
         if o.marks, case .window(let w) = t {
             // Number what can be acted on (this outline isn't sent). Not when the outline just sent ran out of
             // time: this would too; its numbers are marked.
             if !text || !o.interactive, !(text && AX.registry(w.id).cutShort) {
-                _ = AX.outline(pid: w.pid, wid: w.id, within: zoom ? shot.rect : nil, maxChars: 40_000, interactive: true)
+                _ = AX.outline(pid: w.pid, wid: w.id, within: zoom || shownPart != nil ? view.rect : nil, maxChars: 40_000,
+                               interactive: true)
             }
             let reg = AX.registry(w.id)
             let marks = reg.lines.compactMap { entry -> Marks.Mark? in
                 guard let n = reg.nodes[entry.0], let f = n.frame, AX.actionable.contains(n.role) else { return nil }
-                return Marks.Mark(id: entry.0, rect: f)
+                return Marks.Mark(id: entry.0, rect: f, role: n.role)
             }
-            image = Marks.draw(shot, marks)
+            image = Marks.draw(view, marks)
+        }
+        // Blank margins left out, planned on the picture as it's sent (marks' badges are in it, so no cut goes
+        // through one), never through the focused text field. (Not from a crop: it's round what changed already.)
+        var cut: Trim?
+        if trim, !zoom, shownPart == nil, o.trimBlank, case .window = t, let m = own ?? meta[t.key], let px = Pixels(image) {
+            let s = Double(shot.scale)
+            let focus = m.caret.map { c in
+                CGRect(x: (c.field.minX - m.offset.x) * s, y: (c.field.minY - m.offset.y) * s,
+                       width: c.field.width * s, height: c.field.height * s)
+            }
+            if let plan = Trim.plan(px, perPoint: s, protect: focus.map { [$0] } ?? [], tile: o.sizing.tile),
+               let cropped = plan.crop(image) {
+                cut = plan
+                image = cropped
+                if keep { meta[t.key]?.trim = plan }
+                own?.trim = plan
+            }
         }
         let (data, mime) = Capture.encode(image, format: o.format, quality: o.quality, maxBytes: o.maxBytes)
         var out: [String: Any] = [
-            "image": data.base64EncodedString(), "mime": mime, "width": shot.image.width,
-            "height": shot.image.height, "zoom": zoom, "window": describe(t),
+            "image": data.base64EncodedString(), "mime": mime, "width": image.width,
+            "height": image.height, "zoom": zoom, "window": describe(t),
         ]
+        if let cut {
+            // What was left out, for the status line: the whole capture's size, and columns cut at each side (the
+            // right's left of the scroll bar, which stays) and rows at the bottom.
+            out["trimmed"] = ["left": cut.left, "right": cut.right, "bottom": cut.bottom, "scroll_bar": cut.split,
+                              "full": [cut.fullWidth, cut.fullHeight]] as [String: Any]
+        }
+        if shownPart != nil, let box = (own ?? meta[t.key])?.cropInWindow {
+            // What the crop shows, in window points (as change_box gives a box), for the status line.
+            out["crop"] = [Int(box.minX), Int(box.minY), Int(box.maxX), Int(box.maxY)]
+            // The numbers to act on what it shows by, when neither marks nor an outline give them.
+            if !o.marks, !text, case .window(let w) = t, let outline = given ?? cropOutline(w, within: view.rect) {
+                out["crop_outline"] = outline
+            }
+        }
+        if o.lowDetail, !zoom {
+            // How sparse the picture is (px per point) and the text height that allowed it (points; none: not known).
+            var d: [String: Any] = ["level": "low", "scale": (Double(shot.scale) * 100).rounded() / 100]
+            if let h = o.textHeight { d["text_height"] = (h * 10).rounded() / 10 }
+            out["detail"] = d
+        }
+        if let own { withhold?(own) }
         out.merge(acc) { _, new in new }
+        return out
+    }
+
+    /// What can be acted on in the part of window `w` a picture of only what changed shows (`within`, global
+    /// points), numbered as in its outline (`AX.outline`, interactive), so the agent can act on what it sees by
+    /// element. Nil when there's nothing, it ran out of time, or asking would switch on the app's tree
+    /// (`treeReady`): a picture never does.
+    static func cropOutline(_ w: WinInfo, within: CGRect) -> String? {
+        guard treeReady(w.pid),
+              let text = AX.outline(pid: w.pid, wid: w.id, within: within, maxChars: ChangeCrop.outlineChars, interactive: true),
+              !text.isEmpty, !AX.registry(w.id).cutShort else { return nil }
+        return text
+    }
+
+    /// `o` for a picture of `t` at `detail: "low"` (`lowDetail`): its scale as low as keeps the window's text
+    /// readable (`DetailLow`), by the text height accessibility gives (`AX.textHeight`; not asked where that would
+    /// switch on the app's tree, `treeReady`, nor for the screen). Else `o` as it is.
+    static func detailed(_ o: Opts, _ t: Target) -> Opts {
+        guard o.lowDetail else { return o }
+        var out = o
+        if case .window(let w) = t, treeReady(w.pid) { out.textHeight = AX.textHeight(pid: w.pid, wid: w.id) }
+        out.sizing.scale = DetailLow.scale(textHeight: out.textHeight, normal: o.sizing.scale)
         return out
     }
 
@@ -794,6 +1423,14 @@ enum Handlers {
             try Policy.checkRoute(pid: app.processIdentifier, keyboard: p == nil)
             return Route(pid: app.processIdentifier, wid: 0, frame: .zero, foreground: foreground)
         }
+    }
+
+    /// Whether a click posted at a point that routes to window `routedTo` lands in one of the app's pop-ups (a menu,
+    /// or a suggestions or saved-data list: `Run.popupLayer`, from `layer`) lying over the element it's aimed at,
+    /// which is in the target window (`elementWindow`). An element in a sheet, panel or menu of its own (or one
+    /// whose window isn't known) is left as it was.
+    nonisolated static func popupCovers(routedTo: CGWindowID, target: CGWindowID, layer: Int?, elementWindow: CGWindowID?) -> Bool {
+        routedTo != target && elementWindow == target && layer.map(Run.popupLayer) == true
     }
 
     /// route(t, at:) for every point of a move that crosses the app's windows (into a submenu), with the
@@ -836,7 +1473,10 @@ enum Handlers {
             // A macro step names what it pressed and where it was: see Macros.spot.
             let saved = a["units"] as? String == "pt" ? num(a["x"]).flatMap { x in num(a["y"]).map { (x, $0) } } : nil
             if let (x, y) = saved, a["spot"] as? Bool == true {
-                if let (p, n) = try Macros.spot(v, t, at: try toGlobal(t, x, y, a), strict: true) { return (p, n) }
+                if let (p, n) = try Macros.spot(v, t, at: try toGlobal(t, x, y, a), strict: true) {
+                    TargetLookup.current?.found = true
+                    return (p, n)
+                }
                 throw HelperError("\(try spec(v).description) isn't where it was when the macro was saved (others show the "
                     + "same), so nothing was pressed")
             }
@@ -848,11 +1488,18 @@ enum Handlers {
                 n = found
             } catch {
                 if let (x, y) = saved, !(error is Behind) {
-                    if let (p, n) = try Macros.spot(v, t, at: try toGlobal(t, x, y, a)) { return (p, n) }
+                    if let (p, n) = try Macros.spot(v, t, at: try toGlobal(t, x, y, a)) {
+                        TargetLookup.current?.found = true
+                        return (p, n)
+                    }
                     throw HelperError("\(error) (a macro step: what it pressed isn't where it was, so nothing was pressed)")
                 }
                 guard let miss = error as? NotFound else { throw error }
-                do { return (try await readOffScreen(v, t), nil) } catch let e as HelperError where !miss.hint.isEmpty {
+                do { return (try await readOffScreen(v, t), nil) } catch let e as Missing {
+                    // Not on the screen either: missing only if nothing off screen showed it (that's listed then).
+                    let text = "\(e)\(miss.hint)"
+                    throw miss.clean ? Missing(description: text) : HelperError(text)
+                } catch let e as HelperError where !miss.hint.isEmpty {
                     throw HelperError("\(e)\(miss.hint)")  // with what's off screen showing it, and what's near it
                 }
             }
@@ -867,7 +1514,7 @@ enum Handlers {
     static func perform(_ a: [String: Any], _ run: Run) async throws {
         let t = run.target, foreground = run.foreground
         let type = kind(a)
-        let flags = modifierFlags(a["keys"] ?? a["modifiers"])
+        let flags = modifierFlags(modifierKeys(a))  // (a click's text too, as Anthropic's computer use gives them)
         let pressing: Set<String> = ["click", "left_click", "double_click", "triple_click", "right_click", "middle_click",
                                      "drag", "left_click_drag", "mouse_down"]
         if run.heldButton != nil, pressing.contains(type) {
@@ -903,10 +1550,15 @@ enum Handlers {
                !foreground, let popup = popUpButton(node?.element ?? AX.element(pid: r.pid, at: p)) {
                 let want = AX.menuPath(item)[0]
                 if let match = AX.optionTitle(popup, want) { try Policy.checkItem(a, match) }
+                VerifyEdit.clicking(node, at: p, pid: r.pid)  // where it went, when the act checks its edits
                 await pointer.move(to: p, r)
                 await Input.sleep(clickTiming.aim())
                 pointer.click()
-                let chose = try await AX.choose(popup, want, menuLater: a["_last"] as? Bool == true) { try Policy.checkItem(a, $0) }
+                let keys = try? route(t, at: nil, foreground: false)  // for a web page's pop-up, if need be
+                let chose = try await AX.choose(popup, want, menuLater: a["_last"] as? Bool == true, typeAhead: keys,
+                                                click: { try await clickToOpen(popup, t) }) {
+                    try Policy.checkItem(a, $0)
+                }
                 if AX.menuKey(chose) != AX.menuKey(want) { notes.append("chose \"\(chose)\"") }
                 return
             }
@@ -932,6 +1584,26 @@ enum Handlers {
                     over = why
                 }
             }
+            // A click aimed at an element but posted where one of the app's pop-ups lies over it (a suggestions or
+            // saved-data list over the next field) would land in the pop-up, maybe on an entry that fills the form
+            // in: the pop-up is closed first, and if it stays, nothing is clicked.
+            if !viaAX, !foreground, let node, case .window(let w) = t,
+               popupCovers(routedTo: r.wid, target: w.id, layer: Windows.info(r.wid)?.layer, elementWindow: AX.windowID(node.element)) {
+                await closeSuggestions(r.pid, before: "clicking \(aimName(a))", route: try? route(t, at: nil, foreground: false))
+                r = try route(t, at: p, foreground: false)
+                if popupCovers(routedTo: r.wid, target: w.id, layer: Windows.info(r.wid)?.layer, elementWindow: w.id) {
+                    throw HelperError("a pop-up of \(w.app) (#\(r.wid)) lies over \(aimName(a)) and couldn't be closed, so nothing "
+                        + "was clicked (the click would land in it). keypress Escape may close it")
+                }
+            }
+            // A link followed or a form sent by this click: the batch waits for the page it goes to.
+            if run.pageMark == nil, button == "left", count == 1, allFlags.isEmpty, a["item"] == nil, isBrowser(r.pid),
+               let mark = pageMark(at: node?.element ?? AX.element(pid: r.pid, at: p), run,
+                                   watch: a["_submit"] != nil ? submitWatch : nil) {
+                run.pageMark = mark
+            }
+            // Where it goes (a checkbox it names, as an edit), when the act checks its edits.
+            VerifyEdit.clicking(node, at: p, pid: r.pid)
             if foreground { prepareForeground(r) }
             if !viaAX { await Input.primer(r) }
             let mods = await Input.pressModifiers(flags, r, typist: clickTiming)  // keys held on the way, as a hand does
@@ -979,11 +1651,16 @@ enum Handlers {
             if a["item"] != nil { try await pickFromMenu(a, r, t) }
         case "move", "mouse_move", "hover":
             guard let (p, _) = try await actionPoint(a, t) else { return }
-            if let (button, r, _) = run.heldButton {  // a button is down: this is a drag
-                await pointer.move(to: p, r, button: button)
-            } else {
-                await pointer.move(to: p, try route(t, at: p, foreground: foreground))
+            let r = try run.heldButton?.route ?? route(t, at: p, foreground: foreground)
+            // Its keys (OpenAI's computer use gives them) are held on the way, as a click's are: the moves carry them.
+            // Not in an app the agent may only look at (a move alone is looking).
+            if !flags.isEmpty, case let level = Policy.level(r.pid), level <= .view {
+                throw Policy.refusal(r.pid, level, doing: "move holding keys")
             }
+            if !flags.isEmpty { try guardKeyboard(r) }  // its modifiers go to whichever window has the keyboard
+            let mods = await Input.pressModifiers(flags, r, typist: clickTiming)
+            await pointer.move(to: p, r, button: run.heldButton?.button)  // a button is down: this is a drag
+            await Input.releaseModifiers(mods, r, typist: clickTiming)
         case "mouse_down":
             let button = (a["button"] as? String)?.lowercased() ?? "left"
             var p: CGPoint
@@ -1083,30 +1760,40 @@ enum Handlers {
                 // Over what's shown of it: a text view's centre can be far below the window.
                 let win: CGRect? = { if case .window(let w) = t { return Windows.info(w.id)?.frame ?? w.frame } else { return nil } }()
                 p = n.flatMap { AX.shownPart($0.element, in: win) }.map { CGPoint(x: $0.midX, y: $0.midY) } ?? q
+            } else if let until = a["until"], !(until is NSNull), case .window(let w) = t, let aim = untilAim(until, w) {
+                // A scroll until aimed nowhere: the list or page that can hold its text, not what's under the middle.
+                p = aim
             } else if case .window(let w) = t,
                 meta[t.key] == nil || a["units"] as? String == "pt" {  // the middle of the window
                 let f = Windows.info(w.id)?.frame ?? w.frame
                 p = CGPoint(x: f.midX, y: f.midY)
             } else {
-                guard let m = meta[t.key] else { throw HelperError("take a screenshot first") }
-                p = try toGlobal(t, Double(m.width) / 2, Double(m.height) / 2)
+                // The middle of what the picture captured (whatever blank was left out of the picture itself).
+                guard let c = captureCenter(t) else { throw HelperError("take a screenshot first") }
+                p = c
             }
             let m = meta[t.key]
             let ptPerPx = a["units"] as? String == "pt" ? 1 : m.map { $0.size.width / Double($0.width) } ?? 1
-            var dx = num(a["scroll_x"] ?? a["dx"]) ?? 0, dy = num(a["scroll_y"] ?? a["dy"]) ?? 0
-            if let dir = a["direction"] as? String ?? a["scroll_direction"] as? String {  // Anthropic-style
-                let amt = (num(a["amount"] ?? a["scroll_amount"]) ?? 3) * 100
-                switch dir { case "up": dy = -amt; case "down": dy = amt; case "left": dx = -amt; default: dx = amt }
-            }
             let r = try route(t, at: p, foreground: foreground)
+            // Until a text shows: step by step, looking after each, only scrolling (see scrollUntil).
+            if let until = a["until"], !(until is NSNull) {
+                try await scrollUntil(a, until, at: p, r, ptPerPx: ptPerPx, t)
+                return
+            }
+            let (dx, dy) = scrollDelta(a)  // (a batch's own scroll of 0 px was refused before it ran: `invalid`)
             await pointer.move(to: p, r)
-            // A scroll that runs into the end stops there (see ScrollWatch), and says so.
+            // A scroll that runs into the end stops there (see ScrollWatch), and says which end. One that doesn't
+            // says where it left the scroll bar, where there's one to ask (the reply's scroll; the batch's last
+            // scroll's).
             let watch = ScrollWatch(pid: r.pid, at: p, within: r.frame, dx: dx * ptPerPx, dy: dy * ptPerPx)
             let sent = await Input.scroll(p, dx: dx * ptPerPx, dy: dy * ptPerPx, r, watch: watch)
             if watch.stopped {
                 let (asked, went) = watch.vertical ? (abs(dy), abs(sent.y) / ptPerPx) : (abs(dx), abs(sent.x) / ptPerPx)
-                notes.append("the scroll reached the end after about \(Int(went.rounded())) of \(Int(asked.rounded())); "
-                    + "the rest wasn't sent")
+                notes.append("the scroll reached \(ScrollWatch.end(vertical: watch.vertical, forward: watch.forward)) after "
+                    + "about \(Int(went.rounded())) of \(Int(asked.rounded())); the rest wasn't sent")
+                Session.current.scrolled = nil
+            } else {
+                Session.current.scrolled = watch.place()
             }
         case "type", "type_text":
             guard let text = a["text"] as? String ?? a["value"] as? String else { throw HelperError("type needs text") }
@@ -1117,7 +1804,19 @@ enum Handlers {
             }
             let r = try route(t, at: nil, foreground: foreground)
             if foreground { prepareForeground(r) }
+            // Into the focused field: read back afterwards as for a field named (a key lost, an autocomplete
+            // that took over, typing that went elsewhere), never a password field.
+            let field = focusedField(r, for: text)
+            let expected = VerifyEdit.expectation(field, typed: text)  // when the act checks its edits
+            // A Return typed into a page's one-line field sends its form: the batch waits for the page it goes to.
+            if text.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\r\n" }), let mark = pageMark(keys: [["return"]], r, run) {
+                run.pageMark = mark
+            }
             try await typeText(text, r)
+            if let field {
+                let shows = try await readBack(field, text, whole: false, r)
+                VerifyEdit.typed(field, expected: expected, shows: shows)
+            }
         case "keypress", "key", "press_key", "hotkey":
             let seq = Keys.sequence(a["keys"] ?? a["key"] ?? a["text"])
             guard !seq.isEmpty else {
@@ -1131,6 +1830,8 @@ enum Handlers {
             let held = run.heldKeys.map(\.name)
             try Policy.checkShortcuts(a, seq.map { held + $0 }, r.pid)
             if foreground { prepareForeground(r) }
+            // Return in a page's field (a form sent), or on a link there: the batch waits for the page it goes to.
+            if held.isEmpty, let mark = pageMark(keys: seq, r, run) { run.pageMark = mark }
             var pressed = 0
             for _ in 0..<times {
                 for combo in seq {
@@ -1208,6 +1909,7 @@ enum Handlers {
         case "navigate", "goto", "go_to":
             try await navigate(a, run)
         case "open", "open_url", "launch":
+            if let app = openApp(a) { try checkLaunch(app, a) }  // the app it starts or uses, before it does
             try await open(a, run)
         case "wait_for", "waitfor":
             try await waitFor(a, run)
@@ -1217,11 +1919,12 @@ enum Handlers {
                 Clipboard.set(text)
                 notes.append("clipboard set (\(text.count) characters; what was there is replaced)")
             } else {
-                let limit = min(max(1, int(a["limit"], Clipboard.readLimit)), Clipboard.maxRead)
-                let (text, note) = Clipboard.read(offset: max(0, int(a["offset"], 0)), limit: limit)
+                let (text, note) = Clipboard.read(a)  // offset (below 0: from the end), limit, query
                 run.clipboard = text
                 if let note { notes.append(note) }
             }
+        case "read":  // text, for the reply's reads (ReadText.swift)
+            Session.current.reads.append(try await readStep(a, t))
         case "paste":
             guard let text = a["text"] as? String, !text.isEmpty else { throw HelperError("paste needs text") }
             let r = try route(t, at: nil, foreground: foreground)
@@ -1243,6 +1946,7 @@ enum Handlers {
                 await pointer.move(to: c, try route(t, at: c, foreground: false))
             }
             if !AX.setValue(n, text) { throw HelperError("the \(n.name) did not accept a value") }
+            VerifyEdit.valueSet(n, text)  // when the act checks its edits
         case "focus":
             guard let n = try elementNode(a, t) else { throw HelperError("focus needs element or target") }
             _ = try await reveal(n, aimName(a))
@@ -1253,6 +1957,8 @@ enum Handlers {
             let idx = num(a["element"]) ?? 0
             if ["press", "axpress", "confirm", "axconfirm", "pick", "axpick"].contains(name.lowercased()), let pid = pid(t) {
                 try Policy.checkPress(a, node: n, at: nil, pid: pid)
+                // A link followed or a form sent by the press: the batch waits for the page it goes to.
+                if run.pageMark == nil, let mark = pageMark(at: n.element, run) { run.pageMark = mark }
             }
             let shown = try await reveal(n, aimName(a))
             if shown != nil, ["scrolltovisible", "scrollto", "scrollintoview", "reveal"].contains(name.lowercased().filter(\.isLetter)) {
@@ -1354,12 +2060,18 @@ enum Handlers {
                 throw HelperError("your other \(what) has \(app)'s keyboard, and it couldn't be moved to #\(r.wid): the "
                     + "action didn't run. Work in #\(key), or close it if you're done with it")
             }
-            throw HelperError("another window of \(app) has the keyboard (\(what), not the agent's #\(r.wid)): "
-                + "it would act on that one instead, so the action didn't run. Wait until the keyboard is back in "
-                + "#\(r.wid) (the user may be using \(app)), then try again")
+            throw keyboardElsewhere("another window of \(app) has the keyboard (\(what), not the agent's #\(r.wid)), so the "
+                + "action didn't run: keys and menu commands would act there", app: app, wait: "it's back in #\(r.wid)", wid: r.wid)
         }
-        throw HelperError("\(app)'s keyboard may be in a window other than the agent's #\(r.wid): the action didn't "
-            + "run, since it would act there. Wait until the user is out of \(app), then try again")
+        throw keyboardElsewhere("\(app)'s keyboard may be in a window other than the agent's #\(r.wid), so the action "
+            + "didn't run: it would act there", app: app, wait: "they're out of \(app)", wid: r.wid)
+    }
+
+    /// The error for keys the user's window of the app would get (`what`): wait for the keyboard and retry; never take
+    /// it from them. Clicks without keys aren't held up.
+    nonisolated static func keyboardElsewhere(_ what: String, app: String, wait until: String, wid: CGWindowID) -> HelperError {
+        HelperError("\(what). The user may be using \(app): wait until \(until), then retry, and don't work around it "
+            + "(no foreground, activate or click to take the keyboard). Clicks without keys still reach #\(wid)")
     }
 
     /// Press a shortcut or key. Chromium ignores key equivalents while in the background, so there the
@@ -1514,7 +2226,8 @@ enum Handlers {
         case "menu", "menu_item":
             return "menu " + AX.menuPath(a["item"] ?? a["path"] ?? a["text"]).joined(separator: " > ")
         case "fill":
-            return "filled \((a["fields"] as? [Any])?.count ?? 0) fields" + (a["submit"] != nil ? " and submitted" : "")
+            let count = (a["fields"] as? [Any])?.count ?? (a["fields"] as? [String: Any])?.count ?? 0
+            return "filled \(count) fields" + (a["submit"] != nil ? " and submitted" : "")
         case "navigate", "goto", "go_to":
             return "went to " + AX.clip(a["url"] as? String ?? "", 60)
         default:
@@ -1562,26 +2275,50 @@ enum Handlers {
     }
 
     static func act(_ p: [String: Any]) async throws -> [String: Any] {
-        let t = try resolve(p["window"])
-        current = t.key
-        let o = Opts(p)
+        let given = p["actions"] as? [[String: Any]] ?? []
+        // An action as the agent gave it that can't run that way (a kind no action has, a key its kind doesn't
+        // read, a scroll of 0 px) runs nothing, numbered as it gave them, before any window is looked up (or a
+        // browser started for navigate). Not a saved macro's steps: the macro ran to its end when it was saved,
+        // and replays as it did. Nor the rest of a batch carried on after the user's OK (`first`): checked as
+        // the batch began (a macro's steps may be in it).
+        if p["first"] == nil {
+            for (i, a) in given.enumerated() {
+                if let why = invalid(a) { throw HelperError("nothing was run: action \(i + 1) (\(kind(a))) \(why)") }
+            }
+        }
+        // Begun with open and no window: the batch works in the window open brings up. Until then it has
+        // none (`.screen` stands in, and is never captured, activated, locked or checked against).
+        let opening = opensFirst(p)
+        let t: Target
+        if opening { t = .screen } else { t = try await actTarget(p) }
+        if !opening { current = t.key }
         guard AXIsProcessTrusted() else {
             throw HelperError("Accessibility permission missing for PuterUse (run: puter-use setup)")
         }
         // A macro step runs as the steps it saved.
-        let (actions, expanded) = try Macros.expand(p["actions"] as? [[String: Any]] ?? [], pid: pid(t))
+        let (actions, expanded) = try Macros.expand(given, pid: pid(t))
         let saveAs = p["save_as"].flatMap { $0 is NSNull ? nil : $0 }
         if let saveAs { _ = try Macros.check(saveAs) }
         let base = max(int(p["first"], 1), 1) - 1  // a batch continued after the user's OK numbers on from there
         // The policy first: an app the agent may not act in isn't activated, captured or described on the
-        // way to a refusal, and a batch with a refused action doesn't half run.
-        try Policy.checkLook(pid(t))
+        // way to a refusal, and a batch with a refused action doesn't half run. Begun with open: the app it
+        // starts or uses, by its bundle id, before it's started (the rest once its window is there).
+        if opening {
+            if let app = openApp(actions[0]) {
+                do { try checkLaunch(app, actions[0]) } catch {
+                    throw HelperError("nothing was run: action \(base + 1) (\(kind(actions[0]))) is \(error)")
+                }
+            }
+        } else {
+            try Policy.checkLook(pid(t))
+        }
         for (i, a) in actions.enumerated() {
-            do { try Policy.checkAction(a, pid: pid(t)) } catch {
+            do { try Policy.checkAction(a, pid: opening ? nil : pid(t)) } catch {
                 throw HelperError("nothing was run: action \(base + i + 1) (\(kind(a))) is \(error)")
             }
-            if let why = unknownKeys(a) { throw HelperError("nothing was run: action \(base + i + 1) (\(kind(a))) \(why)") }
         }
+        // (With `detail: "low"`, its scale from the window's text, asked once the policy lets the agent look at it.)
+        let o = detailed(Opts(p), t)
         // Continuing after the user's OK: the steps recorded before the stop (never with a confirm).
         var recorded: [[String: Any]] = (p["recorded"] as? [[String: Any]] ?? []).map { step in
             var s = step
@@ -1590,31 +2327,55 @@ enum Handlers {
         }
         let wantShot = p["screenshot"] as? Bool != false
         let always = wantShot && p["always_image"] as? Bool == true
+        // Only reads (text, the clipboard) and clipboard writes: nothing on screen changes, so no picture is
+        // taken before or after (none is kept as what the agent saw), and the app isn't activated for them.
+        let readsOnly = onlyClipboard(actions, always: always)
+        // Told nothing about a picture: how the agent last chose to look at this window decides (`ViewMode`).
+        // After a screenshot without an image, the outline's changes stand in for one (`outlined`: interactive
+        // or not; an outline asked for here sets which). Told "always", it's back to pictures.
+        let shotGiven = shotMode(p)
+        var outlined: Bool?
+        if !opening, case .window(let w) = t {
+            if shotGiven == .always { Session.current.modes[w.id] = .visual }
+            outlined = outlineKind(given: shotGiven, mode: Session.current.modes[w.id], p)
+            if let kind = outlined { Session.current.modes[w.id] = .outline(interactive: kind) }
+        }
         // Coordinates with no screenshot of this window to refer to (none yet in this session, or the helper
         // restarted since): they were read off a picture that may be out of date, so the batch stops
-        // before them.
-        let firstLook = meta[t.key] == nil
+        // before them. (Begun with open, the window it moves to hasn't been looked at: that stops them too.)
+        // The picture find took to place what it listed counts for coordinates (its x,y came from it), but
+        // the agent hasn't seen it (`unseen`).
+        let (firstLook, unseen) = startLook(meta[t.key], opening: opening)
         var shownAtStart = false
         if case .window(let w) = t { shownAtStart = Windows.info(w.id)?.onScreen == true }
         let blind = firstLook && p["guard"] as? Bool != false && actions.contains(where: aimsByCoordinates)
         var firstShot: (plan: CapturePlan, basis: PlanBasis?, shot: Shot)?  // shown if the first action fails (`ending`)
-        if firstLook && (wantShot || actions.contains(where: needsCoordinates)) {
+        // (Going by the outline, none to show: a failed first action takes one then, if it comes to that.)
+        if firstLook && !readsOnly && ((wantShot && outlined == nil) || actions.contains(where: needsCoordinates)) {
             // Establish the coordinate mapping (for actions that need one, like a scroll in the middle).
             let basis = PlanBasis.of(t)  // read before planning, as `settle` does
             let start = try await plan(t, region: nil, o)
             let shot = try await start.run()
-            remember(t, shot, Signature(shot.image))
+            remember(t, shot, Signature(shot.image), shown: false)
             firstShot = (start, basis, shot)
         }
-        // A picture the agent hasn't seen isn't a "before": on a first look, the result shows the window.
-        var before = firstLook ? nil : meta[t.key]?.sig
-        let caretThen = firstLook ? nil : meta[t.key]?.caret  // the text cursor in that picture
+        // A picture the agent hasn't seen isn't a "before": until it's seen one, the result shows the window.
+        var before = unseen || opening ? nil : meta[t.key]?.sig
+        let caretThen = unseen || opening ? nil : meta[t.key]?.caret  // the text cursor in that picture
+        // What the end is compared with, moved past the window's own change of look as the act makes its app
+        // active or the window key, when nothing else has changed it (`Baseline`; the primer's click too).
+        let baseline = readsOnly || t.key == 0 ? nil : before.map {
+            Baseline(sig: $0, target: t, opts: o, caretThen: caretThen, typed: meta[t.key]?.typedSince == true)
+        }
+        Session.current.baseline = baseline
+        defer { Session.current.baseline = nil }
         let foreground = p["foreground"] as? Bool == true
         let run = Run(target: t, foreground: foreground, guarded: p["guard"] as? Bool != false, box: o.windowBox)
         Run.active[ObjectIdentifier(run)] = (run, Session.current)
         defer { Run.active[ObjectIdentifier(run)] = nil }
-        // One session drives an app at a time; another's act on it waits for this one to finish.
-        if let pid = pid(t) {
+        // One session drives an app at a time; another's act on it waits for this one to finish. (Begun
+        // with open: the app whose window it moves to, then.)
+        if !opening, let pid = pid(t) {
             run.pidAtStart = pid
             try await AppLocks.acquire(pid)
             run.locked.insert(pid)
@@ -1634,34 +2395,52 @@ enum Handlers {
         Session.current.acts += 1
         Connection.current?.work.first = base
         notes = expanded
+        Session.current.reads = []
+        Session.current.scrolled = nil
         // Background apps drop clicks (as "activation clicks") and key equivalents. Tell the target's AppKit
         // layer it is active (and keep it so between calls, see `Hold`); the user's real focus is untouched.
         try Connection.check()
-        if !foreground, case .window(let w) = t, !Hold.isFront(w.pid) {
+        if readsOnly || opening {
+            // Nothing to make active: reads don't need the app active, and open's window is held once it's there
+            // (`Run.moveTo`). The session's holds stay as they are.
+        } else if !foreground, case .window(let w) = t, !Hold.isFront(w.pid) {
             // Held on this window since an earlier call: the app has taken the record already, so it's sent
             // again (it's cheap) without waiting for it.
             let wasHeld = Hold.heldSettled(pid: w.pid, wid: w.id)
-            if Hold.activate(pid: w.pid, wid: w.id), !wasHeld { try await Task.sleep(nanoseconds: 30_000_000) }
-            // Keyboard input (and key equivalents like cmd+a) only reach a window AppKit considers key.
-            if actions.contains(where: { actsOnKeyboardFocus($0) }) {
+            // Keyboard input (and key equivalents like cmd+a) only reach a window AppKit considers key. A batch
+            // that only brings the window forward makes it key here too.
+            let keys = actions.contains(where: { actsOnKeyboardFocus($0) }) || activatesOnly(actions)
+            let heldHere = Hold.held[w.pid] == w.id
+            let activation: () async throws -> Void = {
+                if Hold.activate(pid: w.pid, wid: w.id), !wasHeld { try await Task.sleep(nanoseconds: 30_000_000) }
+                guard keys else { return }
                 // Held here and key already: sent again too, with no wait (and nothing to move).
                 let wasKey = wasHeld && AX.focusedWindow(pid: w.pid) == w.id
                 SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
-                if !wasKey {
-                    try await Task.sleep(nanoseconds: 30_000_000)
-                    switch keyPrimer(focused: AX.focusedWindow(pid: w.pid), wid: w.id, fresh: Hold.fresh.contains(w.pid),
-                                     agentWindows: agentWindows) {
-                    case .fromAgentWindow:
-                        // Not taken (Firefox ignores it) while another of the agent's own windows has the keyboard: a
-                        // click just outside this one's content moves it, as a click on the window would. Never from
-                        // a window of the user's: their keyboard stays where they left it (guardKeyboard says so).
-                        await Input.primer(try route(t, at: nil, foreground: false), force: true)
-                        await Input.afterPrimer()  // the keyboard gets the primer's whole gap and the pause to move
-                        try await Run.pause(0.1)
-                    case .freshHold, .none:
-                        break  // a new hold's click waits for the first key or menu command (`primeKeys`)
-                    }
+                guard !wasKey else { return }
+                try await Task.sleep(nanoseconds: 30_000_000)
+                switch keyPrimer(focused: AX.focusedWindow(pid: w.pid), wid: w.id, fresh: Hold.fresh.contains(w.pid),
+                                 agentWindows: agentWindows) {
+                case .fromAgentWindow:
+                    // Not taken (Firefox ignores it) while another of the agent's own windows has the keyboard: a
+                    // click just outside this one's content moves it, as a click on the window would. Never from
+                    // a window of the user's: their keyboard stays where they left it (guardKeyboard says so).
+                    await Input.primer(try route(t, at: nil, foreground: false), force: true)
+                    await Input.afterPrimer()  // the keyboard gets the primer's whole gap and the pause to move
+                    try await Run.pause(0.1)
+                case .freshHold, .none:
+                    break  // a new hold's click waits for the first key or menu command (`primeKeys`)
                 }
+            }
+            // Becoming active or key changes how the window looks (its title bar, what's selected): with a
+            // picture to compare the end with, that's taken apart from what the act does. Paid only when it
+            // changes something: not again for a window held (and key) since an earlier act. (On a new hold AX
+            // may name the window before AppKit has made it key: not key yet.)
+            if let baseline, probesFlip(seen: true, onScreen: shownAtStart, heldHere: heldHere, keys: keys,
+                                        keyHere: wasHeld && AX.focusedWindow(pid: w.pid) == w.id) {
+                try await baseline.flip(activation)
+            } else {
+                try await activation()
             }
         } else {
             Hold.release(for: Session.current)
@@ -1683,8 +2462,28 @@ enum Handlers {
         if case .window(let w) = t, actions.contains(where: waitsForChange) {
             run.changeBase = (try? await changeLook(t)).map { (wid: w.id, sig: $0) }
         }
+        // Going by the outline: what's over the window as the batch begins (a sheet or popover that comes is shown).
+        var overAtStart: WindowSet?
+        if outlined != nil, case .window(let w) = t { overAtStart = WindowSet.of(w) }
+        // And a frame of it as the batch begins (made active by now), for when its outline doesn't change: what
+        // changed may be what the outline leaves out (`outlineMissed`). It's what the primer's click is taken
+        // apart from, in place of the agent's image (`Baseline`, not kept as that image).
+        var outlineStart: Baseline?
+        if outlined != nil, !readsOnly, case .window = t, let shot = try? await plan(t, region: nil, o).run() {
+            outlineStart = Baseline(sig: Signature(shot.image), target: t, opts: o, caretThen: caret(t), kept: false)
+            Session.current.baseline = outlineStart
+        }
+        // Told to check its edits (verify_edits): each as it's made, and the window as the batch begins, for the
+        // verdict at its end (`VerifyEdit`).
+        if p["verify_edits"] as? Bool == true, !opening, !readsOnly, case .window(let w) = t {
+            Session.current.edits = VerifyEdit.Collector(given, window: w)
+        }
+        defer { Session.current.edits = nil }
         var stopped: String?
         var confirm: [String: Any]?
+        // Begun with open, which hasn't (yet) moved the batch to a window: there's no target to act in, look
+        // at or check against (`.screen` only stands in for one).
+        func noWindow() -> Bool { opening && !run.moved }
         for (i, a) in actions.enumerated() {
             if Connection.hungUp {  // the client gave up: nothing more runs
                 cancelled = true
@@ -1693,6 +2492,19 @@ enum Handlers {
             Connection.current?.work.typed = 0
             Connection.current?.work.did = []
             Connection.current?.work.fields = nil
+            if opening, i == 1 {
+                guard case .window(let w) = run.target, !noWindow() else {
+                    errors.append("action \(base + 2) (\(kind(a))): there's no window to do it in: open brought up no "
+                        + "window of its own (pass window; windows lists the app's)")
+                    break
+                }
+                // Its app is known now: the policy for the rest, before any of it runs.
+                run.pidAtStart = w.pid
+                if let refused = refusal(actions, from: 1, pid: w.pid, base: base) {
+                    errors.append(refused)
+                    break
+                }
+            }
             // A macro step by position means the same only with the same things open over the window as
             // when it was saved.
             if run.guarded, !foreground, Macros.positional(a), case .window(let w) = run.target {
@@ -1708,16 +2520,31 @@ enum Handlers {
             }
             // Coordinates come from the last screenshot: if a sheet, dialog or menu has opened (or closed)
             // over the window since, they may point at something else now. Stop and let the agent look.
-            if aimsByCoordinates(a), let why = blind && !run.moved ? "there's no earlier screenshot of this window to read them from"
-                + " (puter-use may have restarted)" : run.staleCoordinates() {
+            let unseenWindow = blind && !run.moved
+            var why: String? = !aimsByCoordinates(a) ? nil : unseenWindow
+                ? "there's no earlier screenshot of this window to read them from (puter-use may have restarted)"
+                : run.staleCoordinates()
+            // A suggestions or saved-data list that the last action's typing opened: closed, and if the window is as
+            // the agent saw it again, its coordinates hold (they can't be aimed at a list it hasn't seen).
+            if why != nil, !unseenWindow, i > 0, !foreground, let pid = pid(run.target), typedIntoField(actions[i - 1], pid),
+               AX.openMenu(pid: pid) != nil {
+                await closeSuggestions(pid, before: "action \(base + i + 1)", route: try? route(run.target, at: nil, foreground: false))
+                why = run.staleCoordinates()
+            }
+            if let why {
                 let rest = i + 1 == actions.count ? "it was" : "actions \(base + i + 1)-\(base + actions.count) were"
                 stopped = "stopped before action \(base + i + 1) (\(kind(a)) by coordinates): \(why); \(rest) not run. "
+                    + (!unseenWindow && run.onlyPopupsOpened() ? "If it's a pop-up you don't want, keypress Escape closes it. " : "")
                     + (wantShot ? "Look at the new screenshot, then continue." : "Take a screenshot, then continue.")
                 break
             }
             defer { notes += AX.remarks; AX.remarks.removeAll() }
+            // An optional step's lookups say whether its target was found: a miss only before that skips it.
+            let lookup = optionalStep(a) ? TargetLookup() : nil
+            run.pageMark = nil
+            Session.current.edits?.begin()  // what it edits is its own (verify_edits)
             do {
-                try Policy.checkAction(a, pid: pid(run.target))
+                try Policy.checkAction(a, pid: noWindow() ? nil : pid(run.target))  // (open's app: `checkLaunch`)
                 try await Policy.$running.withValue(a) {
                     // Saved as it stands now: element numbers and pixels only mean something until the window changes.
                     let step = saveAs == nil ? nil : Macros.record(external(a), run.target)
@@ -1732,10 +2559,18 @@ enum Handlers {
                     }
                     // What's over the window before it, so `settle` sees a sheet the action made at once.
                     let overBefore = i < actions.count - 1 && mayOpen(a) ? run.baseline() : nil
-                    try await perform(marked(a, last: i == actions.count - 1, menuLook: !foreground && pid(run.target) != nil), run)
+                    try await TargetLookup.$current.withValue(lookup) {
+                        try await perform(marked(a, last: i == actions.count - 1, menuLook: !foreground && pid(run.target) != nil), run)
+                    }
+                    // A link followed or a form sent: the next action (or the batch's picture) meets the new page.
+                    if let mark = run.pageMark {
+                        run.pageMark = nil
+                        try await awaitPage(after: mark, run)
+                    }
                     try Connection.check()  // given up partway: whether this one took effect isn't known
                     if let step { recorded.append(Macros.ran(step, menu: run.ranMenu)) }
                     done += 1
+                    if !CaretShape.leavesTextAlone(a) { baseline?.typed = true }  // (a later key's change of look)
                     Connection.current?.work.done = done
                     Connection.current?.work.steps.append(brief(a))
                     if i < actions.count - 1 {
@@ -1744,7 +2579,7 @@ enum Handlers {
                         } else if mayOpen(a) {
                             try await run.settle(since: overBefore)
                             // A menu left open would take the next actions' keys (and the user's): closed now.
-                            if !foreground, let pid = pid(run.target) {
+                            if !foreground, !noWindow(), let pid = pid(run.target) {
                                 await closeLeftOpenMenu(pid: pid, wait: false, afterKeys: typedIntoField(a, pid),
                                                         route: try? route(run.target, at: nil, foreground: false))
                             }
@@ -1770,6 +2605,22 @@ enum Handlers {
                            "app": run.pidAtStart > 0 ? Policy.appName(run.pidAtStart) : ""]
                 if saveAs != nil { confirm?["recorded"] = recorded }  // to save the whole batch once it's carried on
                 break
+            } catch let miss as Missing where !Connection.hungUp && skipsOptional(a, miss, found: lookup?.found ?? true) {
+                // Optional, and nothing shows what it names: nothing of it was done, and the batch goes on. A macro
+                // saved from the batch keeps it, optional, for when it's there.
+                notes.append("skipped optional action \(base + i + 1) (\(kind(a))): \(miss)")
+                if saveAs != nil { recorded.append(Macros.record(external(a), run.target)) }
+                done += 1
+                Connection.current?.work.done = done
+                Connection.current?.work.steps.append(brief(a) + " (skipped: not there)")
+            } catch let miss as NotReached where !Connection.hungUp && i == actions.count - 1 {
+                // A scroll until, last in the batch, that didn't find its text: nothing after it depends on it, so
+                // it's a note, and the end shows where it stopped. (Before other actions, it stops the batch.)
+                notes.append("action \(base + i + 1) (\(kind(a))): \(miss)")
+                if saveAs != nil { recorded.append(Macros.record(external(a), run.target)) }
+                done += 1
+                Connection.current?.work.done = done
+                Connection.current?.work.steps.append(brief(a))
             } catch {
                 if error is Cancelled || Connection.hungUp {
                     cancelled = true
@@ -1783,13 +2634,15 @@ enum Handlers {
                 break
             }
         }
+        // Begun with open: the batch's app is the one whose window it moved to (a macro saved from it is that app's).
+        if opening, run.pidAtStart == 0, !noWindow(), case .window(let w) = run.target { run.pidAtStart = w.pid }
         if cancelled || Connection.hungUp {
             // The client gave up: let go of what's held and close a menu left open (cleanup always runs),
             // then stop. No settle, screenshot or record of what was shown: no one would see it.
             if let w = Connection.current?.work { Connection.current?.work.opened += openedBy(run).filter { !w.opened.contains($0) } }
             await Connection.ungated {
                 _ = await run.releaseAll(clickTiming, cancelled: true)
-                if !foreground, let pid = pid(run.target) {  // not remembered: the agent never hears of it
+                if !foreground, !noWindow(), let pid = pid(run.target) {  // not remembered: the agent never hears of it
                     await closeLeftOpenMenu(pid: pid, wait: cancelWait(actions, done: done),
                                             route: try? route(run.target, at: nil, foreground: false), remember: false)
                 }
@@ -1800,7 +2653,7 @@ enum Handlers {
         // The last input: settle_ms counts from here (the menu check and the work below are part of it), or
         // from a menu closed just now.
         var quiet = ProcessInfo.processInfo.systemUptime
-        if !foreground, let pid = pid(run.target) {
+        if !foreground, !noWindow(), let pid = pid(run.target) {
             let last = done > 0 && actions.indices.contains(done - 1) ? actions[done - 1] : nil
             let typed = typedIntoField(last, pid)
             // A web page's combo box (a search box with suggestions) shows its list a moment after the keys: wait for it.
@@ -1826,8 +2679,11 @@ enum Handlers {
         }
         // An action may have opened a window in this app (cmd+n, a link, a dialog): it becomes the target.
         var target = run.target
+        if let baseline { before = baseline.sig }  // (past the window's own change of look, if that was all)
         if run.moved { before = nil }
+        var onNewWindow = false  // one window at most: once followed, it's the one shown
         func followNewWindow() async -> Bool {
+            guard !onNewWindow else { return true }
             guard done > 0, case .window(let w) = target,
                   let found = await follow(w, visibleBefore: run.visibleBefore, existedBefore: run.existedBefore,
                                            box: o.windowBox, arrange: run.arrange(w.pid))  // only w.pid's windows
@@ -1843,11 +2699,34 @@ enum Handlers {
             Connection.current?.work.opened.append(nw.id)
             current = nw.id
             before = nil
+            onNewWindow = true
             return true
         }
         var out: [String: Any] = ["done": done, "total": actions.count]
+        // Where the agent is in the window it's shown, beside the picture (`orient`), as what ran makes worth
+        // saying: the actions done, and one that failed partway (it may have done something).
+        let ran = Array(actions.prefix(done < actions.count && !errors.isEmpty ? done + 1 : done))
+        func oriented(_ r: [String: Any]) -> [String: Any] { readsOnly ? r : orient(r, target, ran: ran) }
+        // Keys, typing or a click went to the window (`CaretShape`). Ending with no new picture of it, that's kept:
+        // a change shaped like a text cursor isn't taken for one blinking until the agent has seen the window again.
+        let typedHere = !ran.allSatisfy(CaretShape.leavesTextAlone)
+        func noPicture() {
+            guard typedHere else { return }
+            meta[t.key]?.typedSince = true
+            meta[target.key]?.typedSince = true
+        }
+        // Where the picture of `w` just sent changed (`c`, in the capture's pixels), in the picture's: through the
+        // margins left out of it. Nothing to point at when all of it is in what was left out. `picture`: the record of
+        // a picture withheld from the agent (marked verified), which isn't the one kept.
+        func reportChange(_ c: (box: CGRect, fraction: Double), _ w: Target, picture: Meta? = nil) {
+            var box: CGRect? = c.box
+            if let m = picture ?? meta[w.key] { box = m.pictureBox(c.box) }  // (in a crop, from its origin)
+            if let box { out["change_box"] = [Int(box.minX), Int(box.minY), Int(box.maxX), Int(box.maxY)] }
+            out["change_fraction"] = c.fraction
+        }
         if !errors.isEmpty { out["errors"] = errors }
         if let c = run.clipboard { out["clipboard"] = c }
+        if !Session.current.reads.isEmpty { out["reads"] = Session.current.reads }  // each marked as data by the client
         if case .window(let w) = run.target, let card = AppCards.card(pid: w.pid) { out["card"] = card }
         if let stopped { out["stopped"] = stopped }
         if let confirm { out["confirm"] = confirm }
@@ -1861,35 +2740,131 @@ enum Handlers {
                 return out
             }
         }
-        let end = ending(wantShot: wantShot, always: always, done: done, stopped: stopped != nil,
-                         failed: !errors.isEmpty, firstLook: firstLook, moved: run.moved)
-        if end == .firstLook, let first = firstShot {
+        // Begun with open, which brought up no window of its own (or didn't run): nothing of the batch's to
+        // show, and the session's window may be anyone's. Nor a window of an app the policy keeps agents out of.
+        if noWindow() || (opening && Policy.level(pid(run.target) ?? 0) == .deny) {
+            if !notes.isEmpty { out["notes"] = notes }
+            return out
+        }
+        // Going by the window's outline (`outlined`): what changed in it, and no image, unless the outline can't
+        // stand in for one. Then the window is shown as "auto" would show it, saying why (`escalation`).
+        var escalationNote: String?
+        // Not shown after all, as "auto" would (the window is as the agent last saw it): the note saying why there's
+        // no outline would promise a picture that isn't there.
+        func noEscalation() {
+            guard let e = escalationNote else { return }
+            notes = Self.dropping(e, from: notes)
+            if let n = out["notes"] as? [String] {
+                let kept = Self.dropping(e, from: n)
+                out["notes"] = kept.isEmpty ? nil : kept
+            }
+        }
+        if let interactive = outlined, !readsOnly {
+            var escalation = outlineEscalation(failed: !errors.isEmpty, stopped: stopped != nil, confirm: confirm != nil,
+                                               moved: run.moved)
+            if escalation == nil {
+                do { try await Run.pause(followWait(actions, done: done, failed: false)) } catch {
+                    // The client gave up meanwhile: the note for its lost result names what opened.
+                    if let w = Connection.current?.work { Connection.current?.work.opened += openedBy(run).filter { !w.opened.contains($0) } }
+                    throw error
+                }
+                if await followNewWindow() {
+                    escalation = "a new window opened"
+                } else if case .window(let w) = target, let then = overAtStart, let change = WindowSet.of(w).change(since: then) {
+                    escalation = change  // a sheet, dialog or popover came (or went)
+                } else {
+                    var oo = o
+                    oo.interactive = interactive
+                    let look = outlineLook(target, oo, diff: true)
+                    escalation = look.problem
+                    // The outline says nothing changed: the window may have all the same (a display, a status text
+                    // or a picture the outline leaves out). One frame tells, against the batch's first.
+                    var cursorNote: String?
+                    if escalation == nil, look.unchanged, done > 0, let start = outlineStart, target.key == t.key {
+                        let missed = await outlineMissCheck(start, target, o)
+                        if let why = missed.why {
+                            escalation = why
+                            before = start.sig  // what changed is shown against the window as the batch began
+                        }
+                        cursorNote = missed.note
+                    }
+                    if escalation == nil {
+                        look.keep()
+                        if firstLook { meta[t.key] = nil }  // no image: coordinates stay unanchored, as with "never"
+                        noPicture()
+                        if let cursorNote { notes.append(cursorNote) }
+                        if !notes.isEmpty { out["notes"] = notes }
+                        out["window"] = describe(target)
+                        return oriented(out.merging(look.out, uniquingKeysWith: { _, new in new }))
+                    }
+                }
+            }
+            if let escalation {
+                escalationNote = "no outline this time: \(escalation)"
+                notes.append("no outline this time: \(escalation)")
+            }
+        }
+        let end = ending(wantShot: wantShot, always: always, done: done, stopped: stopped != nil, confirm: confirm != nil,
+                         failed: !errors.isEmpty, firstLook: unseen, moved: run.moved, clipboardOnly: readsOnly)
+        if end == .firstLook {
             // Taken again (one capture): the failed action, or a wait_for that timed out, may have changed the
             // window since. With the start's plan, unless something opened over the window or it moved: then
-            // a new plan, which the mapping (`result`) follows.
-            let again = PlanBasis.of(t) == first.basis ? first.plan : try? await plan(t, region: nil, o)
-            let shot = (try? await again?.run()) ?? first.shot
-            if let res = try? await result(t, shot, o, zoom: false, text: p["text"] as? Bool == true, diff: true) {
+            // a new plan, which the mapping (`result`) follows. None was taken at the start when find's picture
+            // was there to aim from: one now.
+            let shot: Shot?
+            if let first = firstShot {
+                let again = PlanBasis.of(t) == first.basis ? first.plan : try? await plan(t, region: nil, o)
+                shot = (try? await again?.run()) ?? first.shot
+            } else {
+                shot = try? await plan(t, region: nil, o).run()
+            }
+            if let shot, let res = try? await result(t, shot, o, zoom: false, text: p["text"] as? Bool == true, diff: true,
+                                                     trim: true) {
                 if !notes.isEmpty { out["notes"] = notes }
                 out.merge(res) { _, new in new }
                 if let note = partShown(t, shot) { out["notes"] = (out["notes"] as? [String] ?? []) + [note] }
                 out["changed"] = true
-                return out
+                return oriented(out)
             }
         }
+        if end == .check, let b = before {
+            // Nothing ran, but the window may have changed by itself since the agent's last image (a page
+            // loaded, a dialog came up): one quick look, with no settling, sent only if it did.
+            // (The text cursor blinking, told by its shape where accessibility can't: not after keys or a click.)
+            let typed = typedHere || meta[t.key]?.typedSince == true
+            let blink = { (sig: Signature, shot: Shot) -> Bool in
+                guard let d = CellDiff(sig, from: b) else { return false }
+                return cursorBlinked(d, then: caretThen, now: caretThen == nil ? nil : caret(target), shot, target, typed: typed)
+            }
+            let look = try? await quickLook(before: b, capture: { try await plan(target, region: nil, o).run() }, blinked: blink)
+            if let look, let c = look.change,
+               let res = try? await result(target, look.shot, o, zoom: false, text: p["text"] as? Bool == true, diff: true,
+                                           trim: true) {
+                if !notes.isEmpty { out["notes"] = notes }
+                out.merge(res) { _, new in new }
+                if let note = partShown(target, look.shot) { out["notes"] = (out["notes"] as? [String] ?? []) + [note] }
+                out["changed"] = true
+                reportChange(c, target)
+                return oriented(out)
+            }
+            if look != nil { out["changed"] = false }  // the agent's last image still holds
+        }
         if end != .settled {
-            // No image: the agent still hasn't seen the window, so its coordinates stay unanchored.
+            // No image: the agent still hasn't seen the window, so its coordinates stay unanchored (a picture find
+            // took stays: the x,y it gave came from it).
             if firstLook { meta[t.key] = nil }
-            do { try await Run.pause(followWait(actions, done: done, failed: !errors.isEmpty)) } catch {
+            do { try await Run.pause(readsOnly ? 0 : followWait(actions, done: done, failed: !errors.isEmpty)) } catch {
                 // The client gave up meanwhile: as above, the note for its lost result names what opened.
                 if let w = Connection.current?.work { Connection.current?.work.opened += openedBy(run).filter { !w.opened.contains($0) } }
                 throw error
             }
-            _ = await followNewWindow()
+            if !readsOnly { _ = await followNewWindow() }  // (reads open no window)
+            noPicture()
+            noEscalation()
             if !notes.isEmpty { out["notes"] = notes }
             out["window"] = describe(target)
             if p["text"] as? Bool == true { out.merge(accessibility(target, o, diff: true)) { _, new in new } }
-            return out
+            return oriented(out)  // (with "never", the only word of where the focus went)
         }
 
         // settle_ms after the last input, then still frames. Ones that show a change from what the agent last
@@ -1916,10 +2891,11 @@ enum Handlers {
         }
         let followed = await followNewWindow()
         var shot: Shot, sig: Signature
+        var motion = Motion()  // what moved between its frames, nothing being done (`Ambient`)
         var watched: Double?  // how long it went on looking for a new window after an early end (trace)
         do {
             let e = early()
-            (shot, sig) = try await settledShot(target, o, early: e)
+            (shot, sig, motion) = try await settledShot(target, o, early: e)
             if !followed {  // slower apps
                 var found = await followNewWindow()
                 // An early end comes before the wait used to look again: after an action that may open a window
@@ -1929,7 +2905,7 @@ enum Handlers {
                     found = try await watchForWindow(until: e.lookedAgain, look: followNewWindow, pause: { try await Run.pause(0.05) })
                     watched = ProcessInfo.processInfo.systemUptime - began
                 }
-                if found { (shot, sig) = try await settledShot(target, o, early: early()) }
+                if found { (shot, sig, motion) = try await settledShot(target, o, early: early()) }
             }
         } catch {
             if case .window(let w) = target, Windows.info(w.id) != nil { throw error }
@@ -1950,13 +2926,55 @@ enum Handlers {
             Trace.log(line)
         }
         if !notes.isEmpty { out["notes"] = notes }
-        var change = before.flatMap { sig.diff($0, outW: shot.image.width, outH: shot.image.height) }
-            ?? (before == nil ? (CGRect(x: 0, y: 0, width: shot.image.width, height: shot.image.height), 1) : nil)
         let caretNow = caretThen != nil && target.key == t.key ? caret(target) : nil
-        // The text cursor blinked, and that's all: nothing the agent needs to see.
-        if change != nil, let b = before, let then = caretThen, let now = caretNow, blinked(sig, from: b, then: then, now: now, shot, target) {
-            change = nil
-            Trace.log(["k": "blink"])
+        let perPoint = cellScale(sig.w, sig.h, shot, target).perPoint
+        // What kept moving by itself in these frames: kept with the picture, if it's sent (`Meta.ambient`).
+        var moving: [CGRect] { motion.w == sig.w && motion.h == sig.h ? Ambient.regions(motion, perPoint: perPoint) : [] }
+        var change: (box: CGRect, fraction: Double)? = before == nil
+            ? (CGRect(x: 0, y: 0, width: shot.image.width, height: shot.image.height), 1) : nil
+        // Nothing but waiting since the agent's last image (nothing typed or clicked in between): what changed since
+        // then changed by itself, and is kept with the picture too (`Ambient.record`).
+        let idle = before != nil && outlined == nil && target.key == t.key && meta[t.key]?.typedSince != true && !ran.isEmpty
+            && ran.allSatisfy { ["wait", "sleep"].contains(kind($0)) }
+        if let b = before {
+            // Nothing the agent needs to see: only what keeps moving by itself changed (left out only after a
+            // batch that otherwise left the window alone, waiting, scrolling or moving the pointer, and away from
+            // where it aimed), or the text cursor blinked (told by its shape where accessibility can't, not once
+            // keys or a click went to the window). Neither when the outline's check asked for this picture: that
+            // goes by the frames as they are.
+            let byPicture = outlined == nil, same = target.key == t.key
+            var mask: [CGRect] = [], known: [CGRect] = [], touched: [CGRect] = []
+            if byPicture, same, !typedHere, let k = meta[t.key]?.ambient, !k.isEmpty, let aimed = aimedPoints(ran, t) {
+                known = k
+                touched = Ambient.touched(points: aimed, frames: [], perPoint: perPoint, offset: shot.rect.origin)
+                mask = Ambient.mask(known: known, moving: moving, touched: touched, maxSide: Ambient.maxCells(perPoint: perPoint))
+            }
+            let typed = !byPicture || typedHere || meta[t.key]?.typedSince == true
+            func shownWith(_ mask: [CGRect]) -> (change: (box: CGRect, fraction: Double)?, leftOut: Bool, blinked: Bool) {
+                shownChange(sig, from: b, outW: shot.image.width, outH: shot.image.height, mask: mask) { rest in
+                    cursorBlinked(rest, then: caretThen, now: caretNow, shot, target, typed: typed)
+                }
+            }
+            var shown = shownWith(mask)
+            // A part that moves only now and then (a clock ticking once a second) may not have between these frames:
+            // when all that's left is in what was moving before, it's watched a moment longer (`Ambient.watch`).
+            if shown.change != nil, !known.isEmpty {
+                let basis = PlanBasis.of(target)
+                var again: CapturePlan?  // (made at the first frame it takes)
+                mask = try await Ambient.watch(known: known, touched: touched, perPoint: perPoint, motion: &motion, last: sig,
+                                               quiet: { shownWith($0).change == nil }, frame: {
+                    guard PlanBasis.of(target) == basis else { return nil }
+                    if again == nil { again = try? await plan(target, region: nil, o) }
+                    return (try? await again?.run()).map { Signature($0.image) }
+                }, pause: { try await Run.pause(0.15) }, clock: { ProcessInfo.processInfo.systemUptime })
+                shown = shownWith(mask)
+            }
+            change = shown.change
+            if shown.blinked { Trace.log(["k": "blink"]) }
+            if change == nil, shown.leftOut {
+                out["notes"] = (out["notes"] as? [String] ?? []) + ["only what keeps moving by itself changed (a spinner or a clock, say)"]
+                Trace.log(["k": "ambient", "regions": mask.count])
+            }
         }
         // The cursor moved (a click in the text, an arrow key) but shows in neither picture, being between
         // blinks: say so rather than drop it. (When it shows, that's a change, with the picture.)
@@ -1964,23 +2982,257 @@ enum Handlers {
             out["notes"] = (out["notes"] as? [String] ?? []) + ["the text cursor moved: it's now \(now.at) characters into the text"]
             meta[t.key]?.caret = now  // the agent knows: its blinking there isn't a change
         }
-        if change == nil && !always && stopped == nil {
+        // A stop that guards coordinates or a macro's positions (something opened over the window, or the agent
+        // hasn't seen it) shows the window whatever. One for the user's OK only if the window changed: the
+        // agent has the picture it chose the press from.
+        if change == nil && !always && (stopped == nil || confirm != nil) {
             Run.look(target)  // what the agent last saw still holds
+            noPicture()
+            noEscalation()
             out["changed"] = false
             out["window"] = describe(target)
             if p["text"] as? Bool == true { out.merge(accessibility(target, o, diff: true)) { _, new in new } }
-            return out
+            return oriented(out)
         }
-        let res = try await result(target, shot, o, zoom: false, text: p["text"] as? Bool == true, diff: true)
+        // With crop_changes: only the part round what changed, when that's a small part of a window the agent has
+        // seen whole lately and nothing about the batch calls for all of it (`ChangeCrop`). All of what changed is
+        // in it (one box round every change).
+        var crop: CGRect?
+        var cropText: String??  // its outline, when it was read to decide (`result` reads it otherwise)
+        if o.cropChanges, let c = change, case .window(let w) = target {
+            let m = meta[w.id]
+            let reshaped = m?.captured != shot.rect || Run.seen[w.id].map { WindowSet.of(w).change(since: $0) != nil } ?? true
+            let agreed = ran.contains { a in  // a press the user agreed to: its outcome is looked at whole
+                a["confirm"] as? Bool == true || (a["fields"] as? [[String: Any]])?.contains { $0["confirm"] as? Bool == true } == true
+            }
+            if !ChangeCrop.keyframe(seen: before != nil && m?.shown == true, crops: m?.crops ?? 0,
+                                    newWindow: run.moved || onNewWindow || target.key != t.key, reshaped: reshaped,
+                                    failed: !errors.isEmpty, stopped: stopped != nil || confirm != nil, irreversible: agreed,
+                                    outlined: outlined != nil, always: always) {
+                let size = CGSize(width: shot.image.width, height: shot.image.height)
+                crop = ChangeCrop.decide(changeBox: c.box, fraction: c.fraction, picture: size, perPoint: Double(shot.scale),
+                                         tile: o.sizing.tile)
+                // The outline of what's in it goes with it (no marks, no outline asked for): counted too, or the
+                // whole window it is.
+                if let part = crop, !o.marks, p["text"] as? Bool != true {
+                    let text = cropOutline(w, within: ChangeCrop.points(part, of: shot))
+                    crop = ChangeCrop.decide(changeBox: c.box, fraction: c.fraction, picture: size, perPoint: Double(shot.scale),
+                                             tile: o.sizing.tile, outline: text?.count ?? 0)
+                    cropText = .some(text)
+                }
+            }
+        }
+        // Told to check its edits (verify_edits): only routine field edits that accessibility confirms, nothing else
+        // changed, and nothing about the batch ruling it out (`VerifyEdit`). Then the reply is marked verified, and
+        // its picture, which the agent isn't shown, isn't kept as what it saw (`result`'s withhold): the next reply
+        // is compared with the last one it was shown.
+        let part = partShown(target, shot)
+        var verified = false
+        if let edits = Session.current.edits, target.key == t.key {
+            let ending = VerifyEdit.Ending(failed: !errors.isEmpty, stopped: stopped != nil || confirm != nil,
+                                           noted: !notes.isEmpty || part != nil, firstLook: unseen,
+                                           newWindow: run.moved || onNewWindow)
+            verified = edits.verdict(actions, now: sig, before: before, capture: shot.rect, ending: ending)
+        }
+        var withheld: Meta?  // that picture's own record
+        var withhold: ((Meta) -> Void)?
+        if verified { withhold = { withheld = $0 } }
+        let res = try await result(target, shot, o, zoom: false, text: p["text"] as? Bool == true, diff: true, trim: true,
+                                   ambient: Ambient.record(moving, now: sig, before: before, idle: idle, perPoint: perPoint),
+                                   crop: crop, cropOutline: cropText, withhold: withhold)
         if firstLook, target.key != t.key { meta[t.key] = nil }  // it was shown the window it moved to instead
         out.merge(res) { _, new in new }
-        if let note = partShown(target, shot) { out["notes"] = (out["notes"] as? [String] ?? []) + [note] }
+        if let part { out["notes"] = (out["notes"] as? [String] ?? []) + [part] }
         out["changed"] = change != nil
-        if let c = change {
-            out["change_box"] = [Int(c.box.minX), Int(c.box.minY), Int(c.box.maxX), Int(c.box.maxY)]
-            out["change_fraction"] = c.fraction
+        if let c = change { reportChange(c, target, picture: withheld) }
+        if verified {
+            out["verified"] = true
+            Session.current.edits?.withhold()  // its edits are judged again with the next act's here
+            noPicture()  // (the agent has no new picture after the typing)
         }
+        return oriented(out)
+    }
+
+    // MARK: - where the agent is
+
+    /// A reply (`out`) with where the agent is in `t`'s window, beside the picture, as the batch's actions
+    /// (`ran`) make worth saying, each field only when there's news (`Session.told`, per window):
+    /// - `url`: the page's address (`shortURL`), after an action that may go to another page (`mayNavigate`),
+    ///   in a browser's window, when it isn't the one the agent was last told;
+    /// - `focus`: what has the keyboard focus (`AX.focusedSummary`: role and label, or "in another window
+    ///   (#N)"), after keys, a click or a press (`movesFocus`), when it changed; an outline's own focus line
+    ///   (`focused`) has said it already;
+    /// - `selected`: what's selected (`selectedText`), after a gesture that selects text (`selects`);
+    /// - `scroll`: where the batch's last scroll left the scroll bar (`ScrollWatch.place`).
+    /// A password field's text is never in it: the focus is named by role and label, and a selection there
+    /// isn't read. A browser's or Electron app's accessibility tree isn't switched on for these (`treeReady`).
+    static func orient(_ out: [String: Any], _ t: Target, ran: [[String: Any]]) -> [String: Any] {
+        var out = out
+        if let s = Session.current.scrolled { out["scroll"] = s }
+        guard case .window(let w) = t else { return out }
+        var told = Session.current.told[w.id] ?? Orientation()
+        let ready = treeReady(w.pid)
+        if ready, isBrowser(w.pid), ran.contains(where: mayNavigate),
+           let url = AX.pageURL(pid: w.pid, wid: w.id).map(shortURL), url != told.url {
+            out["url"] = url
+            told.url = url
+        }
+        if let f = out["focused"] as? String {
+            told.focus = f
+        } else if ready, ran.contains(where: movesFocus), let f = AX.focusedSummary(pid: w.pid, wid: w.id), f != told.focus {
+            out["focus"] = f
+            told.focus = f
+        }
+        if ready, ran.contains(where: selects), let s = AX.selection(pid: w.pid, wid: w.id) {
+            out["selected"] = selectedText(s.text, count: s.count)
+        }
+        Session.current.told[w.id] = told
         return out
+    }
+
+    /// A screenshot's reply (`out`) with the page's address in a browser's window, whatever the agent was told
+    /// before: a screenshot is how it gets its bearings again (after its context was cut short, too). What the
+    /// reply tells, the address and an outline's focus line, is what it was last told (`Session.told`).
+    static func bearings(_ out: [String: Any], _ t: Target) -> [String: Any] {
+        guard case .window(let w) = t else { return out }
+        var out = out
+        var told = Session.current.told[w.id] ?? Orientation()
+        if isBrowser(w.pid), treeReady(w.pid), let url = AX.pageURL(pid: w.pid, wid: w.id).map(shortURL) {
+            out["url"] = url
+            told.url = url
+        }
+        if let f = out["focused"] as? String { told.focus = f }
+        Session.current.told[w.id] = told
+        return out
+    }
+
+    /// Whether asking `pid`'s accessibility about its page or its focus won't be what switches on its tree:
+    /// apps other than Chromium's and Gecko's always have theirs; those have it once a look that needs it has
+    /// switched it on (`AX.appElement`), never for a reply's extras (as a picture never does, see `caret`).
+    static func treeReady(_ pid: pid_t) -> Bool {
+        if Windows.isGecko(pid) { return AX.enhanced.contains(pid) }
+        if Windows.isChromium(pid) { return AX.treeAsked[pid] != nil }
+        return true
+    }
+
+    /// How long a page's address may be in a reply, and its query (with its fragment) within that.
+    nonisolated static let urlClip = 120, queryClip = 40
+
+    /// A page's address as a reply gives it: scheme, host and path, then its query and fragment clipped to
+    /// about `queryClip` characters (a token in one is cut short), the whole to `urlClip`; never the user name
+    /// or password an address may carry.
+    nonisolated static func shortURL(_ s: String) -> String {
+        func clip(_ s: String, _ n: Int) -> String { s.count > n ? String(s.prefix(n - 1)) + "…" : s }
+        guard let c = URLComponents(string: s), let scheme = c.scheme else { return clip(s, urlClip) }
+        var base = c.host.map { scheme + "://" + $0 + (c.port.map { ":\($0)" } ?? "") } ?? scheme + ":"
+        base += c.percentEncodedPath
+        let rest = (c.percentEncodedQuery.flatMap { $0.isEmpty ? nil : "?" + $0 } ?? "")
+            + (c.percentEncodedFragment.flatMap { $0.isEmpty ? nil : "#" + $0 } ?? "")
+        return clip(base + clip(rest, queryClip + 1), urlClip)
+    }
+
+    /// Whether action `a` may take a browser's window to another page: a click (not a right-click, which opens
+    /// a menu), Return or a shortcut with cmd (back, forward, reload, a bookmark), a submit, a menu command, an
+    /// accessibility press, a pop-up's choice, navigate and open; and a wait for the page, which may be loading
+    /// from an action in an earlier call.
+    nonisolated static func mayNavigate(_ a: [String: Any]) -> Bool {
+        switch kind(a) {
+        case "click", "left_click", "double_click", "triple_click", "middle_click", "mouse_up", "navigate", "goto", "go_to",
+             "open", "open_url", "launch", "menu", "menu_item", "ax", "secondary", "perform", "select", "choose",
+             "wait_for", "waitfor":
+            return true
+        case "type", "type_text":
+            return mayOpen(a)  // ends with Return
+        case "fill":
+            if let submit = a["submit"] as? Bool { return submit }
+            return a["submit"] != nil
+        case "keypress", "key", "press_key", "hotkey", "key_up", "keyup", "hold_key", "hold":
+            let keys = Keys.sequence(a["keys"] ?? a["key"] ?? a["text"]).flatMap { $0 }.map(Keys.normalize)
+            return keys.contains { ["return", "enter", "kpenter"].contains($0) || Keys.modifiers[$0] == .maskCommand }
+        default:
+            return false
+        }
+    }
+
+    /// Whether action `a` may move the keyboard focus: keys and typing, a click, drag or press, focus,
+    /// set_value, a pop-up's choice, a menu command (Find puts it in a search field), open, activate.
+    nonisolated static func movesFocus(_ a: [String: Any]) -> Bool {
+        let k = kind(a)
+        return keyboardActions.contains(k) || [
+            "click", "left_click", "double_click", "triple_click", "right_click", "middle_click", "mouse_down", "mouse_up",
+            "drag", "left_click_drag", "focus", "set_value", "select", "choose", "menu", "menu_item", "ax", "secondary",
+            "perform", "open", "open_url", "launch", "activate", "raise", "focus_window",
+        ].contains(k)
+    }
+
+    /// Keys that, with shift, move one end of a selection.
+    nonisolated static let selectionKeys: Set<String> = ["left", "right", "up", "down", "home", "end", "pageup", "pagedown",
+                                                         "prior", "next"]
+
+    /// Whether action `a` selects text: a double or triple click (or a click counting 2 or 3), a shift-click, a
+    /// drag, shift with an arrow, Home, End or a page key, cmd+a, the Select All menu command.
+    nonisolated static func selects(_ a: [String: Any]) -> Bool {
+        switch kind(a) {
+        case "double_click", "triple_click", "drag", "left_click_drag":
+            return true
+        case "click", "left_click":
+            if let n = num(a["count"] ?? a["clicks"]), n >= 2 { return true }
+            return Keys.splitCombo(modifierKeys(a)).contains { Keys.normalize($0) == "shift" }
+        case "keypress", "key", "press_key", "hotkey":
+            return Keys.sequence(a["keys"] ?? a["key"] ?? a["text"]).contains { combo in
+                let keys = combo.map(Keys.normalize)
+                if keys.contains("shift"), keys.contains(where: { selectionKeys.contains($0) }) { return true }
+                return keys.count == 2 && keys.contains("a") && keys.contains { Keys.modifiers[$0] == .maskCommand }
+            }
+        case "menu", "menu_item":
+            return AX.menuPath(a["item"] ?? a["path"] ?? a["text"]).last.map { Policy.phrase($0) == "select all" } ?? false
+        default:
+            return false
+        }
+    }
+
+    /// How much of a selection's text a reply shows.
+    nonisolated static let selectedClip = 60
+
+    /// What's selected (`text`, `count` characters long), as a reply says it: the text in quotes, on one line
+    /// and clipped to `selectedClip` characters, then its length (`"…" (N chars)`, about 80 characters at
+    /// most). With no text to show (the app gave only where it is), the length alone.
+    nonisolated static func selectedText(_ text: String, count: Int) -> String {
+        let n = "\(count) char" + (count == 1 ? "" : "s")
+        let one = text.prefix(selectedClip * 4).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard !one.isEmpty else { return "(\(n))" }
+        return "\"" + (one.count > selectedClip ? String(one.prefix(selectedClip - 1)) + "…" : one) + "\" (\(n))"
+    }
+
+    /// After an act going by the outline whose outline didn't change: one frame of the window, against the
+    /// batch's first (`start`, past a primer click's change of look). Why the window is shown after all
+    /// (`outlineMissed`), or nil; and, when the text cursor only moved in its field, a note saying where to.
+    static func outlineMissCheck(_ start: Baseline, _ t: Target, _ o: Opts) async -> (why: String?, note: String?) {
+        guard let shot = try? await plan(t, region: nil, o).run(), shot.rect.width > 0, shot.rect.height > 0 else { return (nil, nil) }
+        let sig = Signature(shot.image)
+        guard let box = sig.diff(start.sig, outW: sig.w, outH: sig.h)?.box else { return (nil, nil) }
+        let then = start.caretThen, now = then == nil ? nil : caret(t)
+        if let then, let now, blinked(sig, from: start.sig, then: then, now: now, shot, t) { return (nil, nil) }
+        var field: CGRect?  // the field the cursor stayed in, in the signature's cells
+        if let then, let now, Caret.near(now.field, then.field) {
+            let at = origin(t), sx = Double(sig.w) / shot.rect.width, sy = Double(sig.h) / shot.rect.height
+            field = CGRect(x: (now.field.minX - (shot.rect.minX - at.x)) * sx, y: (now.field.minY - (shot.rect.minY - at.y)) * sy,
+                           width: now.field.width * sx, height: now.field.height * sy)
+        }
+        if let why = outlineMissed(box: box, cursorField: field) { return (why, nil) }
+        guard let then, let now, now.moved(from: then) else { return (nil, nil) }
+        return (nil, "the text cursor moved: it's now \(now.at) characters into the text")
+    }
+
+    /// Whether an act going by the outline shows the window after all, though its outline didn't change, from
+    /// the cells of its picture that differ from the batch's first frame (`box`, at the signature's size; nil
+    /// when none do): not when they all lie in the text field the cursor stayed in (`cursorField`, in the same
+    /// cells), which is the cursor moving (no outline shows it). Else the change is in something the outline
+    /// leaves out (a display, a status text, a picture), and this says so.
+    nonisolated static func outlineMissed(box: CGRect?, cursorField: CGRect?) -> String? {
+        guard let box else { return nil }
+        if let f = cursorField, f.insetBy(dx: -1, dy: -1).contains(box) { return nil }
+        return "the window changed but its outline didn't (what changed isn't in it: a display or a status text, say)"
     }
 
     /// A window partly off screen (or across two displays) is captured only where it's on the display
@@ -1998,10 +3250,13 @@ enum Handlers {
     /// blips like a caret), for at most ~0.9 s. A window that opens over it meanwhile (a dialog, panel or
     /// popover), or the window moving, gets a new capture plan: the old one would leave it out. With
     /// `early`, frames that show no change from `before` take longer to count as settled (see `settle`).
-    static func settledShot(_ t: Target, _ o: Opts, early: Early? = nil) async throws -> (Shot, Signature) {
-        try await settle(basis: { PlanBasis.of(t) }, makePlan: { try await plan(t, region: nil, o) },
-                         capture: { try await $0.run() }, pause: { try await Task.sleep(nanoseconds: 150_000_000) },
-                         early: early)
+    /// With what moved between its frames of one plan, nothing being done (`Motion`: what keeps moving by itself).
+    static func settledShot(_ t: Target, _ o: Opts, early: Early? = nil) async throws -> (Shot, Signature, Motion) {
+        var motion = Motion()
+        let (shot, sig) = try await settle(basis: { PlanBasis.of(t) }, makePlan: { try await plan(t, region: nil, o) },
+                                           capture: { try await $0.run() }, pause: { try await Task.sleep(nanoseconds: 150_000_000) },
+                                           early: early, moved: { motion.add($0, $1) })
+        return (shot, sig, motion)
     }
 
     /// `act`'s early end, for `settle`.
@@ -2029,10 +3284,11 @@ enum Handlers {
     /// second frame: `start`, plus what this first plan and capture took, plus 0.15 s. Until then it keeps
     /// looking, past the usual seven frames if need be, with a frame timed to land right then (the pause
     /// before it stretched to at most 0.3 s). So "no visible change", or a frame only a caret tells from
-    /// `before`, comes no sooner than it did.
+    /// `before`, comes no sooner than it did. `moved` gets each two frames in a row of one plan (not across a
+    /// new plan): what differs between them moved by itself (`Motion`).
     static func settle<Plan, Basis: Equatable>(
         basis: () -> Basis, makePlan: () async throws -> Plan, capture: (Plan) async throws -> Shot,
-        pause: () async throws -> Void, early: Early? = nil,
+        pause: () async throws -> Void, early: Early? = nil, moved: (Signature, Signature) -> Void = { _, _ in },
         clock: () -> Double = { ProcessInfo.processInfo.systemUptime }
     ) async throws -> (Shot, Signature) {
         let began = clock()
@@ -2059,6 +3315,7 @@ enum Handlers {
             let taken = clock()
             guard let next = try? await capture(plan) else { break }
             let nsig = Signature(next.image)
+            if !replanned { moved(sig, nsig) }
             let new = shows(sig) && shows(nsig)
             let held = still(sig, nsig)
             (shot, sig, at) = (next, nsig, taken)

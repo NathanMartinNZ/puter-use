@@ -35,6 +35,23 @@ extension Handlers {
         return first
     }
 
+    /// A click on web page pop-up `el` in window `t`, posted as a click action posts one where the page really
+    /// shows it (`webAim`): Firefox opens a page's `<select>` list in a window that hasn't had a click yet only for
+    /// a click (`AX.clicksOpen`). False when there's no spot of it to click (covered, clipped away, another of the
+    /// app's windows over it): nothing was clicked.
+    static func clickToOpen(_ el: AXUIElement, _ t: Target) async throws -> Bool {
+        guard case .window(let w) = t,
+              case .post(let p)? = try await webAim(AX.Node(element: el, frame: AX.frame(el)), w.id, pid: w.pid) else { return false }
+        let r = try route(t, at: p, foreground: false)
+        guard r.wid == w.id else { return false }  // a pop-up or window of the app there would take it
+        await Input.primer(r)
+        await pointer.move(to: p, r)
+        await Input.sleep(clickTiming.aim())
+        pointer.click()
+        await Input.press(p, r, typist: clickTiming)
+        return true
+    }
+
     /// The part of `n` that's on screen: inside its window and every page it's nested in (a frame shows
     /// only part of its page, the page only part of the frame). Nil if less than 4x4 points of it are.
     static func visiblePart(_ n: AX.Node, _ wid: CGWindowID) -> CGRect? {

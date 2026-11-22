@@ -8,7 +8,7 @@ defaults are:
 |---|---|
 | **off limits** (`deny`) | password managers: 1Password, Bitwarden, Keychain Access, Passwords, LastPass, KeePassXC, Dashlane, Enpass, Proton Pass. They aren't listed by `windows` or captured, even in a whole-screen screenshot |
 | **clicks only** (`click`) | terminals: Terminal, iTerm2, Warp, Ghostty, Alacritty, kitty, WezTerm. The pointer works, but typing, keys, menu commands and pasting (a context menu's Paste included) don't, since one typed line can run anything |
-| **asks first** (`confirm`) | a press on a control (a click, a drag on it, `perform`), a menu item or option chosen (`menu`, `item`, `select`), or a key that does the same (a menu command's shortcut, Return on a default button, Space on a focused button, however it's sent), whose label has one of: delete, remove, erase, discard, don't save, revert, move to trash, send, pay, buy, purchase, place order, checkout, check out, transfer, publish, post, empty trash, uninstall, deactivate |
+| **asks first** (`confirm`) | a press on a control (a click, a drag on it, `perform`), a menu item or option chosen (`menu`, `item`, `select`), or a key that does the same (a menu command's shortcut, Return on a default button, Space on a focused button, however it's sent), whose label has one of: delete, remove, erase, discard, don't save, revert, move to trash, send, pay, buy, purchase, place order, checkout, check out, transfer, publish, post, empty trash, uninstall, deactivate. A button named only by the words in it goes by them. Never a checkbox, switch, radio button, disclosure triangle or text field, which only set something ("Save my card to pay faster"): the button or Return that commits it still asks |
 | **won't type** (`secure_fields`) | into password fields (typing, pasting, `set_value`, or a `cmd+v`), including one a Tab moves into partway through the text |
 
 ```json
@@ -20,15 +20,21 @@ defaults are:
 ```
 
 - `apps` takes bundle ids or app names. The levels are `deny`, `view` (screenshots, `find` and `menus`,
-  plus scrolling and hovering to read; no clicks, typing or commands), `click` or `full`. `windows`
+  reading text, plus scrolling and hovering to read; no clicks, typing or commands), `click` or `full`. `windows`
   marks each window that's `view` or `click`, and names the `deny` apps it leaves out.
 - `confirm` replaces the word list; `[]` turns confirmation off. Words match whole words of a label,
   ignoring case and punctuation ("don't save" matches "Don't Save…").
 - `"secure_fields": "allow"` lets the agent type into password fields.
 
 The file is re-read whenever it changes. A batch with an action the level doesn't allow is refused
-before any of it runs. An entry that can't be understood is reported by `windows` and read the safe
-way (an unknown level is `deny`); a file that isn't JSON at all leaves the defaults in force.
+before any of it runs. In a `click` app that includes a `fill` whose fields are given as an object of
+labels and values (`{"Size": "L"}`) when any value isn't `true` or `false`: its text could be typed,
+and which control each label names isn't known until it runs. Give the fields as a list there, with
+`option` for a pop-up's choice (`[{"target": "Size", "option": "L"}]`) and `checked` for a checkbox. `open` and `navigate` check the app they'd start or use first, before it's
+launched: by its bundle id's entry, else the strictest entry for any of its names. `open` needs
+`click` or `full`, and `navigate` (which types the address) needs `full`. An entry that can't be
+understood is reported by `windows` and read the safe way (an unknown level is `deny`); a file that
+isn't JSON at all leaves the defaults in force.
 
 **Confirmation.** A press that needs your OK stops the batch before anything happens:
 

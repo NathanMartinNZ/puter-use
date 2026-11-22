@@ -158,9 +158,10 @@ enum Policy {
         "type", "type_text", "keypress", "key", "press_key", "hotkey", "key_down", "keydown", "key_up", "keyup",
         "hold_key", "hold", "paste", "set_value", "navigate", "goto", "go_to", "menu",
     ]
-    /// What `view` still allows: nothing the app acts on (scrolling and hovering only change what's shown).
+    /// What `view` still allows: nothing the app acts on (scrolling and hovering only change what's shown;
+    /// read only reads text, as a screenshot's read does).
     static let looking: Set<String> = ["wait", "sleep", "wait_for", "waitfor", "clipboard", "scroll", "move", "mouse_move", "hover",
-                                       "screenshot"]
+                                       "screenshot", "read"]
 
     /// The action being run (set by act), for routes that only find their app at the point (`.screen`).
     /// Task-local: a request of another session, run while this one waits, doesn't see it (or its confirm).
@@ -173,12 +174,30 @@ enum Policy {
         let kind = Handlers.kind(a)
         if looking.contains(kind) && l >= .view { return }
         if l <= .view { throw refusal(pid, l, doing: kind) }
-        if l == .click {
-            let typing = keyboard.contains(kind)
-                || kind == "fill" && (a["fields"] as? [[String: Any]] ?? []).contains { $0["text"] != nil || $0["value"] != nil }
-                || kind == "fill" && a["submit"] as? Bool == true
-            if typing { throw refusal(pid, l, doing: kind) }
+        if l == .click, typing(a) {
+            // Text in fill's object form may be meant for a pop-up: the list form says so (option), and picks it.
+            let byLabel = kind == "fill" && a["submit"] as? Bool != true && a["fields"] is [String: Any]
+            throw refusal(pid, l, doing: byLabel ? "fill with text, which may be typed; to pick a pop-up's option, give fields "
+                + "as a list: [{\"target\": …, \"option\": …}]" : kind)
         }
+    }
+
+    /// Whether action `a` types, presses keys or runs a menu command: what `click` doesn't allow. A fill does when
+    /// a field of its list form has text (`text` or `value`: an `option` is picked and `checked` ticked with the
+    /// pointer), when it submits with Return, or when any value of its object form ({"Email": "ada@example.com",
+    /// "Agree": true}) isn't true or false. That form's text (or number) is typed into a field or picked from a
+    /// pop-up, as the control its label names says; that's looked up only as the fill runs, after the batch's
+    /// earlier actions, so before the batch any of it counts as typing. Its true and false only tick and untick,
+    /// as checked does. 1 and 0 are numbers: text.
+    static func typing(_ a: [String: Any]) -> Bool {
+        let kind = Handlers.kind(a)
+        if keyboard.contains(kind) { return true }
+        guard kind == "fill" else { return false }
+        if a["submit"] as? Bool == true { return true }
+        if let byLabel = a["fields"] as? [String: Any] {
+            return byLabel.values.contains { CFGetTypeID($0 as CFTypeRef) != CFBooleanGetTypeID() }
+        }
+        return (a["fields"] as? [[String: Any]] ?? []).contains { $0["text"] != nil || $0["value"] != nil }
     }
 
     /// Input to whichever app is at a point of the screen (or the frontmost, for keys).
@@ -207,14 +226,89 @@ enum Policy {
     }
 
     /// A press on `node` (or on whatever control is at `p`) needs the user's OK first, unless the action
-    /// says it has it (`confirm: true`).
+    /// says it has it (`confirm: true`). Judged by `pressLabel`: a button named only by the text in it stops
+    /// as one with that name would. Never a press that only sets something (`settingOnly`), whatever its label.
     @MainActor
     static func checkPress(_ a: [String: Any], node: AX.Node?, at p: CGPoint?, pid: pid_t) throws {
         guard a["confirm"] as? Bool != true, !config.confirm.isEmpty else { return }
         var label: String?
-        if let node { label = AX.label(node.element) ?? node.label }
-        if label == nil, let p, let el = Macros.control(pid, at: p) { label = AX.label(el) }
+        if let node {
+            let role = AX.value(node.element, kAXRoleAttribute) as? String ?? node.role
+            if !asksOK(role: role) { return }
+            label = pressLabel(node)
+        }
+        if label == nil, let p, let el = Macros.control(pid, at: p) {
+            let role = AX.value(el, kAXRoleAttribute) as? String ?? ""
+            if !asksOK(role: role) { return }
+            label = pressLabel(own: AX.label(el), role: role, numbered: nil, shown: nil, inside: { innerWords(el) },
+                               inControl: { false })
+        }
         if let label, let word = riskyWord(label) { throw NeedsOK(label: label, word: word) }
+    }
+
+    /// Controls a press only sets, and a press sets back (a checkbox, switch, radio button, disclosure triangle),
+    /// and text inputs (a click there puts the caret in): what follows them (a button's press, Return) is what
+    /// commits, and that still asks. So a checkbox "Send me updates" or "Save my card to pay faster" doesn't.
+    static let settingOnly: Set<String> = ["AXCheckBox", "AXSwitch", "AXToggle", "AXRadioButton", "AXDisclosureTriangle",
+                                           "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+
+    /// Whether a press on a control with accessibility role `role` can need the user's OK (`checkPress`).
+    static func asksOK(role: String) -> Bool { !settingOnly.contains(role) }
+
+    /// Controls whose press acts at once (a button, a link, a menu item): one with no name of its own goes by
+    /// the words in it (`pressLabel`).
+    static let pressNamedByText: Set<String> = ["AXButton", "AXLink", "AXMenuItem"]
+
+    /// What a press on `node` is judged by (`checkPress`), from the element now and what was kept of it.
+    static func pressLabel(_ node: AX.Node) -> String? {
+        let el = node.element
+        let role = node.role.isEmpty ? AX.value(el, kAXRoleAttribute) as? String ?? "" : node.role
+        return pressLabel(own: AX.label(el), role: role, numbered: node.label, shown: node.shown,
+                          inside: { innerWords(el) }, inControl: { inPressControl(el) })
+    }
+
+    /// What a press is judged by: the element's own name (`own`: title, description, placeholder or help), or
+    /// the one it was numbered with (`numbered`), as ever. With neither, a button, link or menu item (`role`,
+    /// `pressNamedByText`) goes by what the outline called it (`shown`: the text that titles it, or the words
+    /// in it), else the words of the texts in it now (`inside`): a button named only by the text in it
+    /// ("Delete") is judged by that. A text goes by its words (`shown`, else `inside`) only inside such a
+    /// control (`inControl`): a click on a button's words presses the button, while a click on a text
+    /// elsewhere (a file name, a subject line) presses nothing. Nil: nothing to judge it by.
+    static func pressLabel(own: String?, role: String, numbered: String?, shown: String?,
+                           inside: () -> String?, inControl: () -> Bool) -> String? {
+        func some(_ s: String?) -> String? { s.flatMap { $0.allSatisfy(\.isWhitespace) ? nil : $0 } }
+        if let l = some(own) ?? some(numbered) { return l }
+        if role == "AXStaticText" { return inControl() ? some(shown) ?? some(inside()) : nil }
+        guard pressNamedByText.contains(role) else { return nil }
+        return some(shown) ?? some(inside())
+    }
+
+    /// The words in `el`: for a text, what it says; else what the texts directly in it say (four at most, of
+    /// six children at most), side by side.
+    static func innerWords(_ el: AXUIElement) -> String? {
+        func says(_ e: AXUIElement) -> String? {
+            for attr in [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute] {
+                if let s = AX.value(e, attr) as? String, !s.allSatisfy(\.isWhitespace) { return s }
+            }
+            return nil
+        }
+        if AX.value(el, kAXRoleAttribute) as? String == "AXStaticText" { return says(el) }
+        let kids = AX.value(el, kAXChildrenAttribute) as? [AXUIElement] ?? []
+        guard !kids.isEmpty, kids.count <= 6 else { return nil }
+        let words = kids.filter { AX.value($0, kAXRoleAttribute) as? String == "AXStaticText" }.prefix(4).compactMap(says)
+        let s = words.joined(separator: " ").split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return s.isEmpty ? nil : s
+    }
+
+    /// Whether `el` is inside a button, link or menu item (`pressNamedByText`), a few levels up at most.
+    static func inPressControl(_ el: AXUIElement) -> Bool {
+        var cur = el
+        for _ in 0..<4 {
+            guard let p = AX.value(cur, kAXParentAttribute), CFGetTypeID(p) == AXUIElementGetTypeID() else { return false }
+            cur = p as! AXUIElement
+            if pressNamedByText.contains(AX.value(cur, kAXRoleAttribute) as? String ?? "") { return true }
+        }
+        return false
     }
 
     /// Choosing a menu item or option: the same OK, by its title.

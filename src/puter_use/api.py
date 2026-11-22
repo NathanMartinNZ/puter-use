@@ -20,8 +20,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .client import Helper, HelperError
-from .present import summarize
-from .settings import act_params, capture_params, outline_params, session
+from .present import summarize, until_missed
+from .settings import (act_params, capture_params, detail_param, element_number, element_numbers, outline_params,
+                       session)
 
 __all__ = ["Computer", "Result", "ActionError", "HelperError"]
 
@@ -70,12 +71,13 @@ class Result:
         return self.text
 
 
-Aim = str | int | dict | None  # "Save" (what it shows), 14 (its number), or {text, role, nth}
+Aim = str | int | dict | None  # "Save" (what it shows), 14 or "#14" (its number), or {text, role, nth}
 
 
 def _aim(a: dict, target: Aim, x: float | None = None, y: float | None = None) -> dict:
     if isinstance(target, bool):
         raise TypeError("target is text, an element number, or {text, role, nth}")
+    target = element_number(target)
     if isinstance(target, int):
         a["element"] = target
     elif target is not None:
@@ -123,12 +125,16 @@ class Computer:
             raise
 
     def act(self, actions: list[dict] | dict, *, check: bool = True, screenshot: str | None = None,
-            text: bool | str = False, save_as: str | dict | None = None) -> Result:
-        """Run actions (act's JSON form) on the current window. Raises ActionError if one fails."""
+            text: bool | str = False, save_as: str | dict | None = None, crop_changes: bool | None = None,
+            detail: str | None = None) -> Result:
+        """Run actions (act's JSON form) on the current window. Raises ActionError if one fails.
+        crop_changes=True: when little changed, the image shows only that part; detail="low": a sparser image
+        that keeps text readable. Left out, each goes by PUTER_USE_CROP_CHANGES / PUTER_USE_DETAIL."""
         if isinstance(actions, dict):
             actions = [actions]
-        raw = self._call("act", window=self.window, actions=actions, save_as=save_as,
-                         **outline_params(text), **act_params(screenshot or self.screenshot_mode, None, self.guard),
+        raw = self._call("act", window=self.window, actions=[element_numbers(a) for a in actions], save_as=save_as,
+                         **outline_params(text),
+                         **act_params(screenshot or self.screenshot_mode, None, self.guard, crop_changes, detail),
                          **capture_params())
         if w := raw.get("window", {}).get("id"):
             self.window = w  # it may have moved to a window the actions opened
@@ -159,34 +165,49 @@ class Computer:
         self.window = window
         return self
 
-    def screenshot(self, *, text: bool | str = False, marks: bool = False, region: list[int] | None = None) -> Result:
+    def screenshot(self, *, text: bool | str = False, marks: bool = False, region: list[int] | None = None,
+                   detail: str | None = None) -> Result:
+        """detail="low": a sparser image that keeps text readable (a screenshot is at the usual detail otherwise)."""
         raw = self._call("screenshot", window=self.window, region=region, **outline_params(text, marks),
-                         **capture_params())
+                         **capture_params(), **detail_param(detail))
         self.window = raw.get("window", {}).get("id", self.window)
         return Result(raw, summarize(raw))
 
     def outline(self, interactive: bool = False) -> str:
-        """The window's numbered accessibility outline (`[n] role "label"`)."""
+        """The window's accessibility outline: `#12 button "Save"`, plain text unnumbered, links in it as
+        `[label](#12)`."""
         raw = self._call("screenshot", window=self.window, image=False,
                          **outline_params("interactive" if interactive else True), **capture_params())
         return raw.get("text", "")
 
-    def read(self, what: list[int] | Aim | bool = True, *, offset: int = 0, limit: int | None = None) -> str:
+    def read(self, what: list[int] | Aim | bool = True, *, offset: int = 0, limit: int | None = None,
+             query: str | None = None) -> str:
         """With a box [x0, y0, x1, y1] of the last full screenshot: the text in it (or read off the screen).
         Otherwise the whole text of a text area or field, scrolled-out parts too: what is its number, what
         it shows ("Notes" or {text, role, nth}), or True (the focused one, else the window's only text
-        area). From offset, limit characters (default: all of it, fetched 50000 at a time)."""
+        area). A web page (True in a browser, unless a text area has the focus) comes whole as Markdown,
+        its links and controls numbered as `[label](#12)` for click(12). From offset (below 0: that many characters from the end), limit characters (default: all of
+        it, fetched 50000 at a time). With query: where that text is in it instead (case-insensitive), a
+        line per match, `@offset: …the text around it…`, from offset on; read(what, offset=…) reads there."""
         if isinstance(what, list):
+            if query is not None:
+                raise TypeError("query searches an element's whole text, not a box's")
             return self._call("screenshot", window=self.window, region=what, image=False,
                               **capture_params()).get("text", "")
         if what is False or what is None:
             raise TypeError("read takes a box [x0, y0, x1, y1], an element's number, what it shows, or True")
+        what = element_number(what)
+        if query is not None:
+            return self._call("screenshot", window=self.window, read=what, offset=offset, limit=limit,
+                              query=query).get("read", "")
         parts, pos = [], offset
         while limit is None or pos < offset + limit:
             want = 50000 if limit is None else min(50000, offset + limit - pos)
             raw = self._call("screenshot", window=self.window, read=what, offset=pos, limit=want)
             parts.append(raw.get("read", ""))
-            end, total = raw.get("read_range", [pos, pos, 0])[1:]
+            start, end, total = raw.get("read_range", [pos, pos, 0])
+            if pos == offset:  # a negative offset came to `start`, counted from the beginning: go on from there
+                offset = pos = start
             if end <= pos or end >= total:
                 break
             pos = end
@@ -194,17 +215,43 @@ class Computer:
 
     _FOUND = re.compile(r'^\[(\d+)\] (\S+) "(.*)"(?: at \((-?\d+),(-?\d+)\))?')
 
-    def find(self, query: str, role: str | None = None) -> list[dict]:
-        """Elements showing `query`: [{element, role, label, x, y}, …] (x, y in screenshot pixels)."""
-        text = self._call("find", window=self.window, query=query, role=role, **capture_params()).get("text", "")
+    @classmethod
+    def _found(cls, line: str) -> dict | None:
+        """The element on one of find's lines, `[n] role "label" at (x,y)` (no place: off screen)."""
+        if not (m := cls._FOUND.match(line)):
+            return None
+        return {"element": int(m[1]), "role": m[2], "label": m[3],
+                "x": int(m[4]) if m[4] else None, "y": int(m[5]) if m[5] else None}
+
+    def find(self, query: str | list[str] = "", role: str | None = None) -> list[dict]:
+        """Elements showing `query`: [{element, role, label, x, y}, …] (x, y in screenshot pixels; None for
+        one scrolled out of view). With role and no query: the elements of that role. A list of texts (at
+        most 10) is looked up in one call, and each match also has the `query` it was found for."""
+        many = not isinstance(query, str)
+        texts = [q for i, q in enumerate(query) if q.strip() and q not in query[:i]] if many else [query]
+        asked = {"queries": texts} if many else {"query": query or None}
+        text = self._call("find", window=self.window, **asked, role=role, **capture_params()).get("text", "")
         out = []
+        if len(texts) <= 1:  # one text (or a role alone): its matches, then those that only contain it
+            if text.startswith("(nothing shows "):  # what's listed under it is only similar
+                return out
+            for line in text.splitlines():
+                if found := self._found(line):
+                    out.append({**found, "query": texts[0]} if many and texts else found)
+            return out
+        # Several: a part for each text in turn, begun by its header ('"Email":') or by one line saying it
+        # wasn't found (or looked for).
+        at = -1
         for line in text.splitlines():
-            if m := self._FOUND.match(line):
-                out.append({"element": int(m[1]), "role": m[2], "label": m[3],
-                            "x": int(m[4]) if m[4] else None, "y": int(m[5]) if m[5] else None})
+            if found := self._found(line):
+                if 0 <= at < len(texts):
+                    out.append({**found, "query": texts[at]})
+            elif line.startswith("(nothing shows ") or "wasn't looked for:" in line or (
+                    line.endswith(":") and not line.startswith("partial matches")):
+                at += 1
         return out
 
-    def exists(self, query: str, role: str | None = None) -> bool:
+    def exists(self, query: str | list[str] = "", role: str | None = None) -> bool:
         return bool(self.find(query, role))
 
     def menus(self, query: str | None = None) -> str:
@@ -260,19 +307,42 @@ class Computer:
     def select(self, target: Aim, option: str, *, confirm: bool = False) -> Result:
         return self.act(_ok(_aim({"type": "select", "option": option}, target), confirm))
 
-    def fill(self, fields: dict[str, str | bool] | list[dict], submit: bool | str = False, *,
+    def fill(self, fields: dict[str, str | bool | int | float] | list[dict], submit: bool | str | int = False, *,
              confirm: bool = False) -> Result:
-        """fields: {"Name": "Ada", "Subscribe": True} (by what each shows; text, or checked for a bool),
-        or act's own list form for pop-ups ({target, option})."""
-        if isinstance(fields, dict):
-            fields = [{"target": k, ("checked" if isinstance(v, bool) else "text"): v} for k, v in fields.items()]
-        a: dict[str, Any] = {"type": "fill", "fields": fields}
+        """fields: {"Name": "Ada", "Size": "L", "Subscribe": True}, each key the label of a field, pop-up or
+        checkbox: text is typed into a field or picks a pop-up's option, True/False ticks or unticks (give
+        phone numbers and IDs as strings). Every key is looked up before anything is filled, and the fields
+        are filled from the top of the form down. Or act's own list form ([{target, text|option|checked},
+        …]), which also takes element numbers and `clear`. submit: True presses Return, or the button's text
+        or number."""
+        a: dict[str, Any] = {"type": "fill", "fields": dict(fields) if isinstance(fields, dict) else fields}
         if submit:
             a["submit"] = submit
         return self.act(_ok(a, confirm))
 
-    def scroll(self, dy: int = 0, dx: int = 0, at: Aim = None) -> Result:
-        return self.act(_aim({"type": "scroll", "scroll_y": dy, "scroll_x": dx}, at))
+    def scroll(self, dy: int = 0, dx: int = 0, at: Aim = None, *, until: str | dict | None = None,
+               max_scrolls: int | None = None) -> Result:
+        """dy, dx: pixels, positive = down/right; at least one of them (a scroll of 0 px is refused).
+        until: the text to scroll to ("Total", or {"text": …, "role": …}) instead: it scrolls a screenful at a
+        time (or dy/dx at a time) until an element showing it is in view, at most max_scrolls times (default
+        10, at most 15), and the result's note names what it found, numbered for element. Not found (the
+        end reached, or max_scrolls used up), it raises ActionError."""
+        a: dict[str, Any] = {"type": "scroll"}
+        if until is None:
+            if max_scrolls is not None:
+                raise TypeError("max_scrolls goes with until")
+            if not dy and not dx:
+                raise ValueError("scroll needs dy and/or dx (pixels, positive = down/right), or until")
+            a.update(scroll_y=dy, scroll_x=dx)
+        else:
+            a["until"] = until
+            a.update({k: v for k, v in (("scroll_y", dy), ("scroll_x", dx)) if v})  # (none: a screenful)
+            if max_scrolls is not None:
+                a["max_scrolls"] = max_scrolls
+        res = self.act(_aim(a, at))
+        if until is not None and until_missed(res.raw):  # (alone in its batch, the helper only notes it)
+            raise ActionError(res)
+        return res
 
     def wait_for(self, text: str | None = None, *, gone: bool = False, role: str | None = None, change: bool = False,
                  timeout_ms: int = 5000) -> Result:
@@ -290,10 +360,14 @@ class Computer:
             a["role"] = role
         return self.act(a)
 
-    def navigate(self, url: str, new_window: bool | None = None) -> Result:
+    def navigate(self, url: str, new_window: bool | None = None, *, timeout_ms: int | None = None) -> Result:
+        """timeout_ms: how long to wait for the page to load (default 10000, at most 30000); a note says if
+        it was still loading."""
         a: dict[str, Any] = {"type": "navigate", "url": url}
         if new_window is not None:
             a["new_window"] = new_window
+        if timeout_ms is not None:
+            a["timeout_ms"] = timeout_ms
         return self.act(a)
 
     def open(self, target: str | None = None, app: str | None = None) -> Result:

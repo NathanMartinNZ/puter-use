@@ -30,7 +30,7 @@ final class NearMatchTests: XCTestCase {
         let none = NSNull()
         return [f.role as NSString, none, (f.title as NSString?) ?? none, none, none, f.kids.map(\.element) as NSArray,
                 AXValueCreate(.cgPoint, &pos)!, AXValueCreate(.cgSize, &size)!, none, kCFBooleanTrue, none, none,
-                (f.help as NSString?) ?? none]
+                (f.help as NSString?) ?? none, none]
     }
 
     func make(_ role: String, _ title: String?, y: CGFloat = 10, help: String? = nil, _ kids: [Fake] = []) -> Fake {
@@ -196,10 +196,10 @@ final class NearMatchTests: XCTestCase {
         let w = WinInfo(id: 424_401, pid: 424_401, app: "Probe", title: "", frame: .zero, layer: 0, onScreen: true)
         let e = Handlers.NotFound(description: "nothing shows \"Note pad\" in the window", offScreen: "; off screen: [3] …",
                                   near: "; similar: [4] textarea \"Notes\" (…)")
-        XCTAssertEqual(try Handlers.missError(e, "Note pad", .window(w)).description,
+        XCTAssertEqual("\(try Handlers.missError(e, "Note pad", .window(w)))",
                        "nothing shows \"Note pad\" in the window; off screen: [3] …; similar: [4] textarea \"Notes\" (…)")
         let bare = Handlers.NotFound(description: "nothing shows \"X\" in the window")
-        XCTAssertEqual(try Handlers.missError(bare, "X", .window(w)).description, "nothing shows \"X\" in the window")
+        XCTAssertEqual("\(try Handlers.missError(bare, "X", .window(w)))", "nothing shows \"X\" in the window")
     }
 
     /// A label's tooltip counts too, but the label is what's listed when it's the nearer.

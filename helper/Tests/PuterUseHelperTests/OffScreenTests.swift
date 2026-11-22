@@ -29,7 +29,7 @@ final class OffScreenTests: XCTestCase {
         var pos = f.frame.origin, size = f.frame.size
         let none = NSNull()
         return [f.role as NSString, none, (f.title as NSString?) ?? none, none, none, f.kids.map(\.element) as NSArray,
-                AXValueCreate(.cgPoint, &pos)!, AXValueCreate(.cgSize, &size)!, none, kCFBooleanTrue, none, none, none]
+                AXValueCreate(.cgPoint, &pos)!, AXValueCreate(.cgSize, &size)!, none, kCFBooleanTrue, none, none, none, none]
     }
 
     /// A 400 pt window: buttons "Row 1"…"Row 20" every 30 pt (rows 1–13 inside it), a "Save draft" button
@@ -73,6 +73,41 @@ final class OffScreenTests: XCTestCase {
         XCTAssertTrue(away.complete)
     }
 
+    /// A list scrolled partway, inside a window: rows in the window but outside the list's scroll area (above
+    /// or below its visible part) are found by the on-screen search, tagged off screen (find lists them so, after
+    /// those shown, with no place in the window: theirs would land on other controls); the off-screen search still
+    /// finds only what's outside the window. So does a role-only search.
+    func testRowsScrolledOutOfAListInsideTheWindowAreTaggedOffScreen() {
+        var id = 100
+        func make(_ role: String, _ title: String?, _ frame: CGRect, _ kids: [Fake] = []) -> Fake {
+            id += 1
+            return Fake(id, role, title: title, frame: frame, kids: kids)
+        }
+        // Rows every 30 pt from y 10: the list shows y 110-250 (rows 4-8, row 4 partly); rows 9-13 are below it, in the
+        // 380 pt window.
+        let rows = (1...20).map { make("AXButton", "Row \($0)", CGRect(x: 300, y: CGFloat($0) * 30 - 20, width: 60, height: 22)) }
+        let list = make("AXScrollArea", nil, CGRect(x: 300, y: 110, width: 80, height: 140), rows)
+        let win = make("AXWindow", "W", CGRect(x: 0, y: 0, width: 400, height: 380),
+                       [make("AXButton", "Sheet Later", CGRect(x: 100, y: 40, width: 100, height: 30)), list])
+        var all: [Fake] = []
+        func collect(_ f: Fake) { all.append(f); f.kids.forEach(collect) }
+        collect(win)
+        byElement = Dictionary(uniqueKeysWithValues: all.map { ($0.element, $0) })
+
+        let shown = search(win, "Row", offScreen: false).matches
+        XCTAssertEqual(shown.map(\.label), (1...13).map { "Row \($0)" })
+        XCTAssertEqual(shown.filter { !$0.offScreen }.map(\.label), (4...8).map { "Row \($0)" })
+        XCTAssertEqual(Handlers.shownFirst(shown).map(\.label), ([4, 5, 6, 7, 8, 1, 2, 3, 9, 10, 11, 12, 13]).map { "Row \($0)" })
+        XCTAssertEqual(search(win, "Row", offScreen: true).matches.map(\.label), (14...20).map { "Row \($0)" })
+        let byRole = AX.search(in: [(win.element, win.frame)], menus: [], query: "", role: "button", limit: 50, budget: 1.5,
+                               offScreen: false, now: { self.clock }, read: read).matches
+        XCTAssertEqual(byRole.filter { !$0.offScreen }.map(\.label), ["Sheet Later"] + (4...8).map { "Row \($0)" })
+        let row1 = byRole.first { $0.label == "Row 1" }!
+        XCTAssertEqual(Handlers.describe(row1, id: 9, .screen), "[9] button \"Row 1\" (off screen)")
+        // A row half shown at the list's edge is shown (4 pt of it each way, as acting on it goes by).
+        XCTAssertFalse(shown.first { $0.label == "Row 4" }!.offScreen)
+    }
+
     /// What's in a container outside the window counts as off screen, even where its own frame says otherwise
     /// (the on-screen search never looks inside it).
     func testInsideAContainerOutsideTheWindowIsOffScreen() {
@@ -100,6 +135,34 @@ final class OffScreenTests: XCTestCase {
         let slow = search(win, "Save", offScreen: true, budget: 0.1)  // 10 reads
         XCTAssertFalse(slow.complete)
         XCTAssertTrue(slow.matches.isEmpty)
+    }
+
+    /// Nothing off screen shows it either: a clean miss (an optional step is skipped for it) only when that search
+    /// looked everywhere. One that ran out of time with nothing found says so, and is an error, never skipped.
+    func testAMissAfterAnOffScreenSearchThatStoppedEarlyIsntClean() throws {
+        let sp = Handlers.Spec(text: "Accept all")
+        let step: [String: Any] = ["type": "click", "target": "Accept all", "optional": true]
+        let whole = Handlers.offScreenMiss(sp, complete: true, near: "")
+        XCTAssertTrue(whole.clean)
+        XCTAssertEqual(whole.description, "nothing shows \"Accept all\" in the window")
+        let skipped = try Handlers.missError(whole, "Accept all", .screen)
+        XCTAssertTrue(skipped is Handlers.Missing)
+        XCTAssertTrue(Handlers.skipsOptional(step, skipped, found: false))
+
+        let win = window()
+        clock = 0
+        let slow = search(win, "Accept all", offScreen: true, budget: 0.1)  // out of time, nothing found
+        XCTAssertTrue(slow.matches.isEmpty)
+        let cut = Handlers.offScreenMiss(sp, complete: slow.complete, near: "; similar (…): [3] button \"Allow\"")
+        XCTAssertFalse(cut.complete)
+        XCTAssertFalse(cut.clean)
+        let e = try Handlers.missError(cut, "Accept all", .screen)
+        XCTAssertTrue(e is HelperError, "not everything was looked at")
+        XCTAssertFalse(Handlers.skipsOptional(step, e, found: false))
+        XCTAssertEqual("\(e)", "nothing shows \"Accept all\" in the window; the search off screen stopped early (the app "
+            + "answered slowly), so part of the window wasn't looked at; similar (…): [3] button \"Allow\"")
+        // The flag alone is enough.
+        XCTAssertFalse(Handlers.NotFound(description: "nothing shows \"X\" in the window", complete: false).clean)
     }
 
     // MARK: - what a target takes off screen

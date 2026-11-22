@@ -15,8 +15,9 @@ import time
 from pathlib import Path
 
 from .client import Helper, HelperError, app_path
-from .present import image_bytes, summarize, window_list
-from .settings import act_params, capture_params, outline_params, session
+from .present import HIDDEN_CAP, image_bytes, summarize, until_missed, window_list
+from .settings import (act_params, capture_params, detail_param, element_number, element_numbers, outline_params,
+                       session)
 
 SHOTS = Path(os.environ.get("PUTER_USE_SHOTS") or Path.home() / "Library/Caches/puter-use/shots")
 
@@ -29,18 +30,22 @@ def save_image(res: dict) -> str | None:
     ext = {"image/png": "png", "image/webp": "webp"}.get(img[1], "jpg")
     path = SHOTS / f"{time.strftime('%H%M%S')}-{time.monotonic_ns() % 10**6:06d}.{ext}"
     path.write_bytes(img[0])
-    for old in sorted(SHOTS.iterdir(), key=lambda p: p.stat().st_mtime)[:-40]:
-        old.unlink(missing_ok=True)
+    try:  # the oldest go; only files (a folder someone put there stays)
+        for old in sorted((p for p in SHOTS.iterdir() if p.is_file()), key=lambda p: p.stat().st_mtime)[:-40]:
+            old.unlink(missing_ok=True)
+    except OSError:  # (another process clearing up at the same time): next time
+        pass
     return str(path)
 
 
-def report(res: dict) -> int:
-    """Print the result; the exit status is 1 if an action failed or the batch stopped early."""
+def report(res: dict, missed: bool = False) -> int:
+    """Print the result; the exit status is 1 if an action failed or the batch stopped early (`missed`: the
+    command's own scroll until a text shows didn't find it, `until_missed`)."""
     print(summarize(res))
     path = save_image(res)
     if path:
         print(f"image: {path}")
-    return 1 if res.get("errors") or res.get("stopped") else 0
+    return 1 if res.get("errors") or res.get("stopped") or (missed and until_missed(res)) else 0
 
 
 def parse_region(s: str | None) -> list[int] | None:
@@ -65,6 +70,18 @@ def parse_vars(items: list[str] | None) -> dict[str, str]:
         if not sep or not k:
             raise SystemExit(f"variables are NAME=VALUE, not {item!r}")
         out[k] = v
+    return out
+
+
+def parse_fields(items: list[str]) -> dict:
+    """fill's LABEL=VALUE arguments as act's fields object: true or false ticks or unticks a checkbox; any
+    other value is text, typed into a field or picked from a pop-up (a field to type "true" into needs act)."""
+    out: dict = {}
+    for item in items:
+        k, sep, v = item.partition("=")
+        if not sep or not k.strip():
+            raise SystemExit(f"fill's fields are LABEL=VALUE, not {item!r}")
+        out[k] = {"true": True, "false": False}.get(v.strip().lower(), v)
     return out
 
 
@@ -122,22 +139,38 @@ def run_script(args: argparse.Namespace) -> int:
 
 
 def element_arg(v: str | None) -> dict:
-    """-e 14 is element 14; -e Save is the element showing "Save" (looked up when the action runs)."""
+    """-e 14 (or #14) is element 14; -e Save is the element showing "Save" (looked up when the action runs)."""
     if v is None:
         return {}
-    return {"element": int(v)} if v.strip().isdigit() else {"target": v}
+    v = element_number(v)
+    return {"element": v} if isinstance(v, int) else {"element": int(v)} if v.strip().isdigit() else {"target": v}
 
 
 def read_arg(v: str | bool) -> int | str | bool:
-    """--read alone is the focused text; --read 12 is element 12; --read Notes what shows "Notes"."""
+    """--read alone is the focused text; --read 12 (or #12) is element 12; --read Notes what shows "Notes"."""
     if v is True:
         return True
-    return int(v) if v.strip().isdigit() else v
+    v = element_number(v)
+    return v if isinstance(v, int) else int(v) if v.strip().isdigit() else v
+
+
+def find_args(texts: list[str]) -> dict:
+    """find's texts: one is the query, several are looked for at once (at most 10); none, with --role,
+    lists the elements of that role."""
+    if len(texts) > 1:
+        return {"queries": texts}
+    return {"query": texts[0]} if texts else {}
 
 
 def outline_args(args: argparse.Namespace, force: bool = False) -> dict:
     text = "interactive" if getattr(args, "interactive", False) else args.text or force
     return outline_params(text, getattr(args, "marks", False))
+
+
+def act_args(args: argparse.Namespace) -> dict:
+    """act's params for how it observes the window: --screenshot, --settle-ms, --no-guard, and the opt-in
+    --crop-changes and --detail low (each left to its environment setting when not given)."""
+    return act_params(args.screenshot, args.settle_ms, not args.no_guard, args.crop_changes or None, args.detail)
 
 
 def build_action(args: argparse.Namespace) -> dict:
@@ -168,6 +201,13 @@ def build_action(args: argparse.Namespace) -> dict:
         return {"type": "menu", "item": args.item}
     elif cmd == "select":
         return {"type": "select", **element_arg(args.element), "option": args.option}
+    elif cmd == "fill":
+        a = {"type": "fill", "fields": parse_fields(args.fields)}
+        if args.submit is True:  # --submit alone: Return
+            a["submit"] = True
+        elif args.submit is not None:  # the button's number, or the text it shows
+            aim = element_arg(args.submit)
+            a["submit"] = aim.get("element", aim.get("target"))
     elif cmd == "navigate":
         a = {"type": "navigate", "url": args.url}
         if args.new_window is not None:
@@ -194,7 +234,17 @@ def build_action(args: argparse.Namespace) -> dict:
             a["timeout_ms"] = args.timeout_ms
         return a
     elif cmd == "scroll":
-        a = {"type": "scroll", "scroll_y": args.dy, "scroll_x": args.dx}
+        if args.until is None:
+            if args.role or args.max_scrolls is not None:
+                raise SystemExit("--role and --max-scrolls go with --until")
+            if not args.dy and not args.dx:
+                raise SystemExit("scroll needs --dy and/or --dx (pixels, positive = down/right), or --until TEXT")
+            a = {"type": "scroll", "scroll_y": args.dy, "scroll_x": args.dx}
+        else:  # a screenful at a time unless --dy/--dx say how far
+            a = {"type": "scroll", "until": {"text": args.until, "role": args.role} if args.role else args.until,
+                 **{k: v for k, v in (("scroll_y", args.dy), ("scroll_x", args.dx)) if v}}
+            if args.max_scrolls is not None:
+                a["max_scrolls"] = args.max_scrolls
     elif cmd == "drag":
         nums = [int(float(v)) for v in args.points]
         if len(nums) < 4 or len(nums) % 2:
@@ -244,19 +294,22 @@ async def run(args: argparse.Namespace) -> int:
             print(json.dumps(await h.call("status"), indent=1))
         elif args.cmd == "windows":
             print(window_list(await h.call("windows", app=args.app, launch=args.launch or None,
-                                           window_size=capture_params()["window_size"])))
+                                           window_size=capture_params()["window_size"]),
+                              hidden_cap=None if args.app else HIDDEN_CAP))
         elif args.cmd in ("shot", "screenshot") and args.read is not None:
             return report(await h.call("screenshot", window=window_arg(args.window or args.window_pos),
-                                       read=read_arg(args.read), offset=args.offset, limit=args.limit))
+                                       read=read_arg(args.read), offset=args.offset, limit=args.limit,
+                                       query=args.query))
         elif args.cmd in ("shot", "screenshot"):
-            if args.offset is not None or args.limit is not None:
-                raise SystemExit("--offset and --limit go with --read")
+            if args.offset is not None or args.limit is not None or args.query is not None:
+                raise SystemExit("--offset, --limit and --query go with --read")
             return report(await h.call("screenshot", window=window_arg(args.window or args.window_pos),
                                        region=parse_region(args.region), image=False if args.no_image else None,
-                                       **outline_args(args, args.no_image), **capture_params()))
+                                       **outline_args(args, args.no_image), **capture_params(),
+                                       **detail_param(args.detail)))
         elif args.cmd == "find":
-            print(summarize(await h.call("find", window=window_arg(args.window), query=args.query, role=args.role,
-                                         limit=args.limit, **capture_params())))
+            print(summarize(await h.call("find", window=window_arg(args.window), **find_args(args.query),
+                                         role=args.role, limit=args.limit, **capture_params())))
         elif args.cmd == "macros":
             print(summarize(await h.call("macros", window=window_arg(args.window), all=args.all or None,
                                          delete=args.delete)))
@@ -271,12 +324,13 @@ async def run(args: argparse.Namespace) -> int:
                 return 2
             if isinstance(actions, dict):
                 actions = [actions]
+            actions = [element_numbers(a) for a in actions] if isinstance(actions, list) else actions
             if args.confirm:
                 print('error: in act, put "confirm": true on the action the user OK\'d', file=sys.stderr)
                 return 2
             return report(await h.call("act", window=window_arg(args.window), actions=actions,
                                        foreground=args.fg or None, save_as=save_as_arg(args), **outline_args(args),
-                                       **act_params(args.screenshot, args.settle_ms, not args.no_guard),
+                                       **act_args(args),
                                        **capture_params()))
         elif args.cmd == "release":
             await h.call("release", autostart=False)
@@ -285,8 +339,8 @@ async def run(args: argparse.Namespace) -> int:
         else:
             return report(await h.call("act", window=window_arg(args.window), actions=[build_action(args)],
                                        foreground=args.fg or None, **outline_args(args),
-                                       **act_params(args.screenshot, args.settle_ms, not args.no_guard),
-                                       **capture_params()))
+                                       **act_args(args),
+                                       **capture_params()), missed=getattr(args, "until", None) is not None)
         return 0
     except HelperError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -311,6 +365,10 @@ def parser() -> argparse.ArgumentParser:
         sp.add_argument("--settle-ms", type=int, help="check for changes at least this long after the last input (default 250)")
         sp.add_argument("--no-guard", action="store_true",
                         help="don't stop before coordinate actions when something opened over the window")
+        sp.add_argument("--crop-changes", action="store_true",
+                        help="when little changed, the image shows only that part (default: PUTER_USE_CROP_CHANGES)")
+        sp.add_argument("--detail", choices=["low"],
+                        help="low: a sparser image that keeps text readable (default: PUTER_USE_DETAIL)")
         sp.add_argument("--confirm", action="store_true",
                         help="the user has OK'd this press (Delete, Send, Pay, … stop to ask otherwise)")
         return sp
@@ -330,15 +388,20 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("--text", action="store_true", help="add the numbered accessibility outline")
     sp.add_argument("--interactive", action="store_true", help="--text, listing only what can be acted on")
     sp.add_argument("--marks", action="store_true", help="number the controls on the image (as in the outline)")
+    sp.add_argument("--detail", choices=["low"], help="low: a sparser image that keeps text readable")
     sp.add_argument("--no-image", action="store_true",
                     help="accessibility outline only (with --region: just the text in that area)")
     sp.add_argument("--read", nargs="?", const=True, metavar="ELEMENT",
                     help="instead of an image, the whole text of a text area or field, scrolled-out parts too: its "
                          "number or the text it shows (alone: the focused one)")
-    sp.add_argument("--offset", type=int, help="with --read: start at this character (default 0)")
+    sp.add_argument("--offset", type=int,
+                    help="with --read: start at this character (default 0; below 0, that many from the end)")
     sp.add_argument("--limit", type=int, help="with --read: this many characters (default 10000, at most 50000)")
+    sp.add_argument("--query", help="with --read: where this text is in it instead (case-insensitive), a line per "
+                                    "match with its offset")
     sp = sub.add_parser("find", help="find elements by the text they show; prints their numbers")
-    sp.add_argument("query")
+    sp.add_argument("query", nargs="*", metavar="text",
+                    help="what it shows; several (up to 10) are looked for at once; none with --role lists that role")
     sp.add_argument("--role", help="e.g. button, field, checkbox, link")
     sp.add_argument("--limit", type=int)
     sp.add_argument("-w", "--window", help="window id, app name, or 'screen' (default: last used)")
@@ -391,6 +454,11 @@ def parser() -> argparse.ArgumentParser:
     sp = target(sub.add_parser("select", help="pick an option of a pop-up or combo box"))
     sp.add_argument("element", help="its number, or the text it shows")
     sp.add_argument("option")
+    sp = target(sub.add_parser("fill", help="fill in a form by its labels: fill Email=ada@example.com 'I agree=true'"))
+    sp.add_argument("fields", nargs="+", metavar="LABEL=VALUE",
+                    help="true/false ticks or unticks a checkbox; other text is typed, or picked from a pop-up")
+    sp.add_argument("--submit", nargs="?", const=True, metavar="BUTTON",
+                    help="then press Return (alone), or the button showing BUTTON (or element number)")
     sp = target(sub.add_parser("navigate", help="go to a URL in a browser (in the agent's own window)"))
     sp.add_argument("url")
     nw = sp.add_mutually_exclusive_group()
@@ -411,6 +479,10 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("y", type=float, nargs="?")
     sp.add_argument("--dy", type=int, default=0, help="pixels, positive = down")
     sp.add_argument("--dx", type=int, default=0, help="pixels, positive = right")
+    sp.add_argument("--until", metavar="TEXT",
+                    help="scroll (a screenful at a time, or --dy/--dx) until an element showing TEXT is in view")
+    sp.add_argument("--role", help="with --until: of this role (button, link, …)")
+    sp.add_argument("--max-scrolls", type=int, help="with --until: scroll at most this many times (default 10, up to 15)")
     sp = target(sub.add_parser("drag"))
     sp.add_argument("points", nargs="+")
     sp = target(sub.add_parser("set", help="set an element's value"))

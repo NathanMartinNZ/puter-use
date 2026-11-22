@@ -13,7 +13,7 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
     }
     var meta: Store<CGWindowID, Meta> { view.meta }
     var seen: Store<CGWindowID, WindowSet> { view.seen }
-    var outlines: Store<CGWindowID, (interactive: Bool, lines: [(Int, String)])> { view.outlines }
+    var sentOutlines: Store<CGWindowID, OutlineDiff.Outline> { view.sentOutlines }  // what outline changes are against
     var carded: Store<String, Bool> { view.carded }
     let turns = Turns()  // its requests run one at a time
     var ledger: [(key: RequestKey, work: Work)] = []  // requests whose delivery isn't known yet, oldest first
@@ -37,6 +37,18 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
     var clickGroup: Int64 = 0
     var holding = Set<pid_t>()  // apps kept AppKit-active for it (`Hold`)
     var lastUse = Date()
+    var modes: [CGWindowID: ViewMode] = [:]  // how it last chose to look at each window (none: by pictures)
+    var reads: [[String: Any]] = []  // what the act under way's read actions read, in order
+    var baseline: Handlers.Baseline?  // what the act under way compares its end with
+    var told: Store<CGWindowID, Orientation> { view.told }  // where it was last told it is in each window, beside the picture
+    var scrolled: String?  // where the act under way's last scroll left its scroll bar (`ScrollWatch.place`)
+    var edits: VerifyEdit.Collector?  // the act under way's field edits, when it checks them (act's verify_edits)
+    // Where each window's last click went: the frame of the control it hit, from the window's top-left corner
+    // (points). A clicked control can keep its hover shade until a click elsewhere clears it (`VerifyEdit.clicking`).
+    var lastClicked: [CGWindowID: CGRect] = [:]
+    // Edits confirmed in each window by replies whose picture was withheld (marked verified), since the last picture
+    // of it the agent was shown: read again, and allowed to show, when a later act there is judged.
+    var withheld: [CGWindowID: [(element: AXUIElement?, edit: VerifyEdit.Edit)]] = [:]
     private var _pointer: Pointer?
 
     init(id: String, ordinal: Int) {
@@ -90,6 +102,23 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
         if hasPointer { pointer.hide() }
         current = nil
     }
+}
+
+/// How the agent looks at a window when an act isn't told whether to send a picture: by pictures
+/// (`visual`), or by the window's accessibility outline (`outline`; `interactive`: only what can be acted
+/// on). Its last screenshot of the window sets it: without an image, the outline; with one, pictures. An
+/// act told to send a picture always goes back to pictures too.
+enum ViewMode: Equatable {
+    case visual
+    case outline(interactive: Bool)
+}
+
+/// What the agent was last told about where it is in a window, beside what a picture shows (`Handlers.orient`):
+/// the address of the page it shows, and what has the keyboard focus (as `AX.focusedSummary` words it). Each
+/// is said again only once it has changed, so a reply carries it when it matters and costs nothing otherwise.
+struct Orientation: Equatable {
+    var url: String?
+    var focus: String?
 }
 
 /// One session drives an app at a time: another session's act on the same app waits its turn (two

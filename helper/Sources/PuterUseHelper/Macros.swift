@@ -26,7 +26,8 @@ enum Macros {
         let url = try file(name)
         guard let data = try? Data(contentsOf: url) else {
             let known = list(pid: pid).map { $0.name }
-            throw HelperError("no macro \"\(name)\"" + (known.isEmpty ? "" : " (saved for this app: \(known.joined(separator: ", ")))"))
+            throw HelperError("no macro \"\(name)\""
+                + (known.isEmpty ? "" : " (saved for this app: \(AX.optionList(known, near: name, clip: 60)))"))
         }
         guard let m = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw HelperError("macro \"\(name)\" is not a JSON object (\(url.path))")
@@ -36,8 +37,20 @@ enum Macros {
 
     struct Entry {
         let name: String
-        let line: String
+        var app = ""  // the name of the app it was saved in
+        var steps = 0
         var vars: [String] = []
+        var about = ""  // its description
+
+        /// "export pdf (Preview, 3 steps, vars: file): saves it as a PDF". `app` false: without the app's name (a
+        /// list of one app's); `clip`: the description cut to that many characters.
+        func line(app withApp: Bool = true, clip: Int = .max) -> String {
+            var s = "\(name) (" + (withApp && !app.isEmpty ? "\(app), " : "") + (steps == 1 ? "1 step" : "\(steps) steps")
+            if !vars.isEmpty { s += ", vars: \(vars.joined(separator: ", "))" }
+            s += ")"
+            if !about.isEmpty { s += ": " + AX.clip(about, clip) }
+            return s
+        }
     }
 
     /// Whether macro `m` was saved in the app running as `pid`: by bundle id, or by name for an app that
@@ -59,14 +72,10 @@ enum Macros {
             guard let data = try? Data(contentsOf: url),
                   let m = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
             if let pid, !sameApp(m, pid) { return nil }
-            let app = m["app"] as? String ?? ""
             let name = m["name"] as? String ?? url.deletingPathExtension().lastPathComponent
-            var line = "\(name) (\(m["app_name"] as? String ?? app)"
-            line += ", \(stepCount((m["steps"] as? [Any])?.count ?? 0))"
-            if let vars = m["vars"] as? [String], !vars.isEmpty { line += ", vars: \(vars.joined(separator: ", "))" }
-            line += ")"
-            if let d = m["description"] as? String, !d.isEmpty { line += ": \(d)" }
-            return Entry(name: name, line: line, vars: m["vars"] as? [String] ?? [])
+            return Entry(name: name, app: m["app_name"] as? String ?? m["app"] as? String ?? "",
+                         steps: (m["steps"] as? [Any])?.count ?? 0, vars: m["vars"] as? [String] ?? [],
+                         about: m["description"] as? String ?? "")
         }
     }
 
@@ -88,8 +97,19 @@ enum Macros {
         let entries = list(pid: pid)
         let whose = pid == nil ? "" : " for this app (all=true lists every app's)"
         out["text"] = entries.isEmpty ? "(no macros saved\(whose))"
-            : entries.map(\.line).joined(separator: "\n") + "\nrun one: act [{type: macro, name, vars: {…}}]"
+            : listing(entries, oneApp: pid != nil) + "\nrun one: act [{type: macro, name, vars: {…}}]"
         return out
+    }
+
+    /// `macros`' lines: the first 30 in full, descriptions clipped, then the rest by name. One app's (the window's,
+    /// which the reply names) without the app's name on each.
+    nonisolated static func listing(_ entries: [Entry], oneApp: Bool) -> String {
+        let cap = 30
+        var lines = entries.prefix(cap).map { $0.line(app: !oneApp, clip: 80) }
+        if entries.count > cap {
+            lines.append("+\(entries.count - cap) more by name: " + AX.listed(entries.dropFirst(cap).map(\.name), max: 40, clip: 60))
+        }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - replay
@@ -138,7 +158,8 @@ enum Macros {
         return (out, notes)
     }
 
-    /// `v` with each `{{name}}` replaced by its value.
+    /// `v` with each `{{name}}` replaced by its value: in its text, its lists' and its objects' values (a fill's
+    /// fields as an object too, not their keys, which name the fields); true, false and numbers as they are.
     static func fill(_ v: Any, _ vars: [String: String]) -> Any {
         if let s = v as? String {
             var r = s
@@ -352,32 +373,12 @@ enum Macros {
     static let content: Set<String> = ["text", "value", "option", "item", "url", "path"]
 
     /// Save `steps` (a batch that ran to the end) as macro `spec`: a name, or {name, vars, description}.
-    /// Each var's value, where it appears in what the steps type, choose or open, becomes `{{var}}`: a
-    /// value of 3 characters or more wherever it appears in one, a shorter one only as the whole of one.
+    /// Each var's value, where it appears in what the steps type, choose or open, becomes `{{var}}` (`templated`).
     static func save(_ spec: Any, steps: [[String: Any]], pid: pid_t?) throws -> String {
         let d = spec as? [String: Any] ?? [:]
         let (name, url, vars) = try check(spec)
-        // Longest values first, so one that contains another is replaced whole.
-        let order = vars.sorted { $0.value.count > $1.value.count }
-        var unused = Set(vars.keys)
-        func templ(_ s: String) -> String {
-            var s = s
-            for (k, val) in order where val.count >= 3 ? s.contains(val) : s == val {
-                s = s.replacingOccurrences(of: val, with: "{{\(k)}}")
-                unused.remove(k)
-            }
-            return s
-        }
-        func step(_ a: [String: Any]) -> [String: Any] {
-            var out = a
-            for (k, v) in a {
-                if content.contains(k), let str = v as? String { out[k] = templ(str) }
-                if k == "fields", let fields = v as? [[String: Any]] { out[k] = fields.map(step) }
-            }
-            return out
-        }
-        let saved = steps.map(step)
-        let used = vars.keys.filter { !unused.contains($0) }.sorted()
+        let (saved, used) = templated(steps, vars: vars)
+        let unused = Set(vars.keys).subtracting(used)
         let app = pid.flatMap { NSRunningApplication(processIdentifier: $0) }
         let m: [String: Any] = [
             "name": name, "app": app?.bundleIdentifier ?? "", "app_name": app?.localizedName ?? "",
@@ -398,5 +399,40 @@ enum Macros {
             note += ". Not in what the steps typed or chose, so not variables: \(unused.sorted().joined(separator: ", "))"
         }
         return note
+    }
+
+    /// `steps` as a macro saves them, with the vars that appear in them (sorted): each var's value (`vars`), where
+    /// it appears in what the steps type, choose or open (`content`, a fill's fields too), becomes `{{var}}`: a value
+    /// of 3 characters or more wherever it appears in one, a shorter one only as the whole of one. A fill's fields
+    /// as an object ({"Email": "ada@example.com", "Agree": true}): its text values, as the list form's text and
+    /// option; its keys name the fields, as a target does, and stay as they are, as do its true, false and numbers.
+    static func templated(_ steps: [[String: Any]], vars: [String: String]) -> (steps: [[String: Any]], used: [String]) {
+        // Longest values first, so one that contains another is replaced whole.
+        let order = vars.sorted { $0.value.count > $1.value.count }
+        var unused = Set(vars.keys)
+        func templ(_ s: String) -> String {
+            var s = s
+            for (k, val) in order where val.count >= 3 ? s.contains(val) : s == val {
+                s = s.replacingOccurrences(of: val, with: "{{\(k)}}")
+                unused.remove(k)
+            }
+            return s
+        }
+        func step(_ a: [String: Any]) -> [String: Any] {
+            var out = a
+            for (k, v) in a {
+                if content.contains(k), let str = v as? String { out[k] = templ(str) }
+                if k == "fields", let fields = v as? [[String: Any]] { out[k] = fields.map(step) }
+                if k == "fields", let byLabel = v as? [String: Any] {
+                    out[k] = byLabel.mapValues { value -> Any in
+                        if let str = value as? String { return templ(str) }
+                        return value
+                    }
+                }
+            }
+            return out
+        }
+        let saved = steps.map(step)
+        return (saved, vars.keys.filter { !unused.contains($0) }.sorted())
     }
 }

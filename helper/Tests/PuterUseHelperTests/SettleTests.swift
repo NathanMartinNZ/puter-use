@@ -314,6 +314,53 @@ final class SettleTests: XCTestCase {
         XCTAssertFalse(Handlers.waitsInFull(.window(w)))
     }
 
+    /// Each two frames in a row of one plan go to `moved` (what differs between them moved by itself); two across
+    /// a new plan don't (the first pictures less of the window).
+    @MainActor func testFramesInARowOfOnePlanAreReported() async throws {
+        var windows: Set<Int> = [1]
+        var captures = 0
+        var pairs: [(Signature, Signature)] = []
+        _ = try await Handlers.settle(
+            basis: { windows }, makePlan: { windows },
+            capture: { plan in
+                captures += 1
+                if captures == 1 { windows.insert(2) }
+                return SettleTests.frame(sheet: plan.contains(2))
+            },
+            pause: {}, moved: { pairs.append(($0, $1)) })
+        XCTAssertEqual(captures, 3)
+        XCTAssertEqual(pairs.count, 1, "the new plan's two frames, not the old plan's and the new one's")
+        XCTAssertEqual(pairs.first?.0, SettleTests.withSheet)
+        XCTAssertEqual(pairs.first?.1, SettleTests.withSheet)
+    }
+
+    /// The window with a spinner turning (a 16x16 square, a dark quarter going round) at (100, 50).
+    static func spinner(_ n: Int) -> Shot {
+        let ctx = CGContext(data: nil, width: 200, height: 150, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        ctx.setFillColor(gray: 0.9, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 200, height: 150))
+        ctx.setFillColor(gray: 0.2, alpha: 1)
+        let q = [(0, 0), (8, 0), (8, 8), (0, 8)][n % 4]
+        ctx.fill(CGRect(x: 100 + q.0, y: 150 - 50 - q.1 - 8, width: 8, height: 8))  // (CG's y goes up)
+        return Shot(image: ctx.makeImage()!, rect: CGRect(x: 0, y: 0, width: 200, height: 150))
+    }
+
+    /// Something that keeps moving keeps the loop from settling, to its seven frames; what moved between them, as
+    /// `Motion` gathers it, is where the spinner is and nowhere else.
+    @MainActor func testWhatMovesByItselfIsGathered() async throws {
+        var n = 0
+        var motion = Motion()
+        _ = try await Handlers.settle(
+            basis: { 1 }, makePlan: {}, capture: { _ in n += 1; return SettleTests.spinner(n) }, pause: {},
+            moved: { motion.add($0, $1) })
+        XCTAssertEqual(n, 7)
+        XCTAssertEqual(motion.pairs, 6)
+        let regions = motion.regions(maxSide: CGSize(width: 100, height: 100))
+        XCTAssertEqual(regions.count, 1)
+        XCTAssertEqual(regions.first, CGRect(x: 99, y: 49, width: 18, height: 18), "the spinner, grown by a cell")
+    }
+
     /// A new plan that can't be made (the window closed) ends the loop with the last frame and its own
     /// signature, from the plan before.
     @MainActor func testAFailedNewPlanKeepsTheLastFrame() async throws {

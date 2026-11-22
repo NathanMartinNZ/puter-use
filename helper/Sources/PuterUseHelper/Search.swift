@@ -6,7 +6,7 @@ extension AX {
     struct Match {
         let element: AXUIElement
         let role: String  // outline name: "button", "field", "text", …
-        let label: String  // the text that matched (title, description, value or placeholder)
+        let label: String  // the text that matched (title, description, value, placeholder, or the text titling it)
         let frame: CGRect?
         let exact: Bool  // the whole label equals the query
         var offScreen = false  // outside its window (scrolled out of view): found by an off-screen search
@@ -18,7 +18,10 @@ extension AX {
         return ["textfield": "field", "input": "field", "textbox": "field", "searchfield": "search",
                 "statictext": "text", "label": "text", "dropdown": "popup", "select": "popup",
                 "popupbutton": "popup", "menubutton": "menubutton", "radiobutton": "radio",
-                "toggle": "switch", "image": "image"][k] ?? k
+                "toggle": "switch", "image": "image",
+                // The accessibility names of the roles the outline calls by a shorter word.
+                "busyindicator": "busy", "relevanceindicator": "relevance", "timefield": "time", "helptag": "tooltip",
+                "rulermarker": "marker", "genericelement": "generic"][k] ?? k
     }
 
     static let leaves: Set<String> = [
@@ -75,10 +78,14 @@ extension AX {
         let wantRole = role.map(roleKey)
         var out: [Match] = []
         var cut = false
+        var said: [AXUIElement: String] = [:]  // the texts walked, and what they say: a label is met before its field
         for (win, wf) in roots {
             let visible = wf.insetBy(dx: -2, dy: -2)
-            // `outside`: something it's in is outside the window (`search` skips all of that).
-            func walk(_ el: AXUIElement, depth: Int, outside: Bool) {
+            // `outside`: something it's in is outside the window (`search` skips all of that). `view`: the part of the
+            // screen it can be seen in, its window clipped to the scroll areas and web pages it's in (as `AX.sight`
+            // says); `hidden`: something it's in is scrolled out of that view though inside the window (a list's rows
+            // above its visible part): found by `search`, but tagged off screen.
+            func walk(_ el: AXUIElement, depth: Int, outside: Bool, view: CGRect = wf, hidden: Bool = false) {
                 guard depth < 60, !cut else { return }
                 if out.count >= limit || now() >= end { cut = true; return }
                 guard let vals = read(el) else { return }
@@ -95,25 +102,41 @@ extension AX {
                     if !offScreen { return }
                     away = true
                 }
+                // In the window but scrolled out of the view it's in: not shown well enough to see or act on.
+                var clipped = hidden
+                if !away, !clipped, let rr = rect, r != "AXWindow", view != wf {
+                    clipped = Handlers.offScreen(Sight(frame: rr, view: view))
+                }
                 if r == "AXMenu", !menuOpen(rect, menus) { return }  // a pop-up's menu, closed
                 let subrole = vals[1] as? String
                 var name = roleNames[r] ?? String(r.dropFirst(2)).lowercased()
                 if subrole == "AXSearchField" { name = "search" }
                 if subrole == "AXSecureTextField" { name = "password" }
                 if subrole == "AXTabButton" { name = "tab" }
-                let texts = [2, 3, 10, 12].compactMap { vals[$0] as? String }
-                    + (subrole == "AXSecureTextField" ? [] : [vals[4] as? String].compactMap { $0 })
+                var texts = [2, 3].compactMap { vals[$0] as? String }
+                if r == "AXStaticText", let s = textSays(vals), !s.allSatisfy(\.isWhitespace) { said[el] = s }
+                // A control with no name of its own goes by what titles it (a form's "Email" beside its field), so a
+                // target naming the label finds the field too, and the field comes before the label (`narrowed`).
+                if texts.allSatisfy(\.isEmpty), r != "AXStaticText", r != "AXWindow", !name.isEmpty,
+                   wantRole == nil || roleKey(name) == wantRole, let te = titleElement(vals), !CFEqual(te, el),
+                   let t = said[te] ?? titleText(te, read: read) {
+                    texts.append(t)
+                }
+                texts += [10, 12].compactMap { vals[$0] as? String }
+                texts += subrole == "AXSecureTextField" ? [] : [vals[4] as? String].compactMap { $0 }
                 if r != "AXWindow", !name.isEmpty, wantRole == nil || roleKey(name) == wantRole,
                    let hit = texts.first(where: shows) ?? (q.isEmpty && wantRole != nil ? "" : nil) {
                     if away == offScreen {
                         out.append(Match(element: el, role: name, label: hit, frame: rect,
-                                         exact: whole(hit), offScreen: offScreen))
+                                         exact: whole(hit), offScreen: offScreen || clipped))
                     }
                     if leaves.contains(r) { return }  // its own text children would only repeat it
                 } else if let near, r != "AXWindow", !name.isEmpty {
-                    near.consider(el, role: name, texts: texts, frame: rect, offScreen: away)
+                    near.consider(el, role: name, texts: texts, frame: rect, offScreen: away || clipped)
                 }
-                for k in vals[5] as? [AXUIElement] ?? [] { walk(k, depth: depth + 1, outside: away) }
+                var inner = view
+                if r == "AXScrollArea" || r == "AXWebArea", let rr = rect, rr.width > 0, rr.height > 0 { inner = view.intersection(rr) }
+                for k in vals[5] as? [AXUIElement] ?? [] { walk(k, depth: depth + 1, outside: away, view: inner, hidden: clipped) }
             }
             walk(win, depth: 0, outside: false)
         }

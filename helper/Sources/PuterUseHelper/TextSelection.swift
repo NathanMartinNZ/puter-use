@@ -55,6 +55,23 @@ extension AX {
 
     static func selectedRange(_ el: AXUIElement) -> CFRange? { range(value(el, kAXSelectedTextRangeAttribute)) }
 
+    /// What's selected in the app's focused text element, when that's in window `wid`: the text (its start, for
+    /// a long selection: a select-all of a whole document isn't read through) and how many characters it is.
+    /// Nil when nothing is selected, the focus is elsewhere or isn't a native text element (a selection in a web
+    /// page's text, outside its fields, isn't read), or it's a password field, whose text is never read.
+    static func selection(pid: pid_t, wid: CGWindowID) -> (text: String, count: Int)? {
+        guard let el = focusedElement(pid: pid), isInWindow(el, wid), let role = value(el, kAXRoleAttribute) as? String,
+              textRoles.contains(role) || role == "AXSearchField", !Policy.isSecure(el),
+              let r = selectedRange(el), r.length > 0 else { return nil }
+        if r.length <= 2000 {
+            let text = value(el, kAXSelectedTextAttribute) as? String ?? ""
+            return (text, text.isEmpty ? r.length : text.count)
+        }
+        var start = CFRange(location: r.location, length: 400)
+        let text = AXValueCreate(.cfRange, &start).flatMap { param(el, kAXStringForRangeParameterizedAttribute, $0) as? String }
+        return (text ?? "", r.length)
+    }
+
     /// About where `el`'s text cursor is for an empty selection at `index` (global points, no width): the
     /// left edge of the character after it (on the cursor's line, even a newline), else the right edge of the
     /// one before it (at the end of the text), else the empty range's bounds (an empty field: AppKit reports

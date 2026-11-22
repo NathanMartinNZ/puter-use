@@ -57,12 +57,9 @@ extension AX {
     }
 
     static func matchItem(_ items: [(AXUIElement, String)], _ want: String) throws -> (AXUIElement, String) {
-        let k = menuKey(want)
-        var hits = items.filter { menuKey($0.1) == k }
-        if hits.isEmpty { hits = items.filter { menuKey($0.1).hasPrefix(k) } }
-        if hits.isEmpty { hits = items.filter { menuKey($0.1).contains(k) } }
+        let hits = menuMatches(items.map(\.1), want).map { items[$0] }
         guard hits.count == 1 else {
-            let names = (hits.isEmpty ? items : hits).prefix(30).map(\.1).joined(separator: ", ")
+            let names = optionList((hits.isEmpty ? items : hits).map(\.1), near: want)
             throw HelperError(hits.isEmpty ? "no \"\(want)\" in the menu (has: \(names))" : "\"\(want)\" is ambiguous: \(names)")
         }
         guard value(hits[0].0, kAXEnabledAttribute) as? Bool != false else { throw HelperError("\"\(hits[0].1)\" is disabled") }
@@ -287,23 +284,48 @@ extension Handlers {
         let titles = AX.menuTitles(menu).filter { AX.menuKey($0) != "services >" && AX.menuKey($0) != "services" }
         let closed = await dismiss(menu, pid: pid, r)
         Trace.log(["k": "menu", "open": !closed])
-        let list = titles.prefix(25).joined(separator: " · ") + (titles.count > 25 ? " · …" : "")
         if afterKeys {
-            notes.append("a suggestions list opened as you typed (\(list)); "
-                + (closed ? "it's closed again, so your keys stay in the field" : "it's still open: Down or Return may pick from it"))
+            notes.append(suggestionsNote(titles, closed: closed))
             return true
         }
         if !closed {
-            notes.append("a menu opened (\(list)) and couldn't be closed: it takes the keyboard until it is (Escape)")
+            notes.append(menuNote(titles, closed: false))
             return true
         }
         if chosen { return true }  // the pop-up's own, after its choice was made: nothing to tell or remember
         if remember, let wid = r?.wid ?? current {
-            Session.current.lastClosedMenu = (titles, wid, Session.current.acts)
+            Session.current.lastClosedMenu = (titles, wid, Session.current.acts)  // whole titles, for `menuHint`
         }
-        notes.append("a menu opened (\(list)); it's closed again, as an open menu takes the user's typing. Open it and "
-            + "choose in one step: the same click with item: \"…\" (\"Font > Bold\" for a submenu)")
+        notes.append(menuNote(titles, closed: true))
         return true
+    }
+
+    /// What a menu or a suggestions list showed, for a note: each title clipped, a suggestions list's first 8 (in
+    /// about 500 characters), a menu's first 25 (in about 900), then "+N more".
+    nonisolated static func menuList(_ titles: [String], suggestions: Bool) -> String {
+        AX.listed(titles, max: suggestions ? 8 : 25, chars: suggestions ? 500 : 900, separator: " · ")
+    }
+
+    /// The note for a menu a click left open (`closeLeftOpenMenu`): what it showed, and how to choose from it;
+    /// or that it couldn't be closed. (Why it's closed, an open menu taking the user's typing, `act` says.)
+    nonisolated static func menuNote(_ titles: [String], closed: Bool) -> String {
+        let list = menuList(titles, suggestions: false)
+        guard closed else { return "a menu opened (\(list)) and couldn't be closed: it takes the keyboard until it is (Escape)" }
+        return "a menu opened (\(list)) and was closed again; to choose from it, make the same click with item: \"…\""
+            + (titles.contains { $0.hasSuffix(" >") } ? " (\"Font > Bold\" for a submenu)" : "")
+    }
+
+    /// The note for a suggestions list: one open as the batch's typing ended (`before` nil), or one met before a
+    /// Return or a click into the next field (`before`: which). One closed before those took nothing: its
+    /// suggestions aren't listed.
+    nonisolated static func suggestionsNote(_ titles: [String], closed: Bool, before what: String? = nil) -> String {
+        let list = menuList(titles, suggestions: true)
+        guard let what else {
+            return "a suggestions list opened as you typed (\(list)); "
+                + (closed ? "it's closed again, so your keys stay in the field" : "it's still open: Down or Return may pick from it")
+        }
+        return closed ? "closed a suggestions list before \(what), so it didn't take it"
+            : "a suggestions list (\(list)) was open before \(what) and couldn't be closed: it may have taken it"
     }
 
     /// Close `menu`. Firefox's suggestions list ignores the accessibility cancel: then Escape, when keys
@@ -334,11 +356,7 @@ extension Handlers {
     static func closeSuggestions(_ pid: pid_t, before what: String, route r: Route?) async {
         guard let menu = AX.openMenu(pid: pid) else { return }
         let titles = AX.menuTitles(menu)
-        let list = titles.prefix(8).joined(separator: " · ") + (titles.count > 8 ? " · …" : "")
-        if await dismiss(menu, pid: pid, r) {
-            notes.append("closed a suggestions list (\(list)) before \(what), so it didn't take it")
-        } else {
-            notes.append("a suggestions list (\(list)) was open before \(what) and couldn't be closed: it may have taken it")
-        }
+        let closed = await dismiss(menu, pid: pid, r)
+        notes.append(suggestionsNote(titles, closed: closed, before: what))
     }
 }

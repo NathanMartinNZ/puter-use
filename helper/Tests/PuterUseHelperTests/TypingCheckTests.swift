@@ -84,4 +84,12 @@ import XCTest
         XCTAssertEqual(steps.filter { $0 == .check }.count, 2)
         XCTAssertTrue(Self.held(steps).isEmpty, "left held \(Self.held(steps))")
     }
+
+    /// A type that names no field reads what it typed back from the focused one (`Handlers.focusedField`), as a
+    /// type into a named field does, unless the text has a Return or Tab in it: those submit or move on, so the
+    /// field may rightly show something else.
+    func testOnlyTextWithoutAReturnOrTabIsReadBack() {
+        for s in ["hello", "a b, c!", "", "naïve café 😀", "https://example.com/a?b=c"] { XCTAssertTrue(Handlers.readsBack(s), s) }
+        for s in ["hi\n", "a\tb", "x\r", "line\r\nnext", "\n"] { XCTAssertFalse(Handlers.readsBack(s), s.debugDescription) }
+    }
 }

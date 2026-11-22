@@ -38,17 +38,38 @@ enum OCR {
         return hits.sorted { $0.rect.minY < $1.rect.minY }
     }
 
-    /// The text as lines of reading order, like `AX.text` gives (words on one visual line joined).
-    static func text(_ lines: [Line]) -> String {
+    /// The text as lines of reading order, like `AX.text` gives (words on one visual line joined), at most
+    /// `maxChars` characters. Doubtful marks are left out (`kept`), unless that would leave nothing.
+    static func text(_ lines: [Line], maxChars: Int = AX.textCap) -> String {
+        let sure = lines.filter(kept)
         var rows: [[Line]] = []
-        for l in lines {
+        for l in sure.isEmpty ? lines : sure {
             if let first = rows.last?.first, abs(first.rect.midY - l.rect.midY) < max(3, min(first.rect.height, l.rect.height) / 2) {
                 rows[rows.count - 1].append(l)
             } else {
                 rows.append([l])
             }
         }
-        return rows.map { $0.sorted { $0.rect.minX < $1.rect.minX }.map(\.text).joined(separator: "  ") }.joined(separator: "\n")
+        let all = rows.map { $0.sorted { $0.rect.minX < $1.rect.minX }.map(\.text).joined(separator: "  ") }.joined(separator: "\n")
+        return AX.capped(all, maxChars, note: capNote)
+    }
+
+    /// Text read off the screen has no element to `read` whole: a smaller area is the way to the rest.
+    static let capNote = "… (truncated; use a smaller region for the rest)"
+
+    /// Below this, Vision doubts a line. Its accurate reading (the one used for an area's text) scores
+    /// lines 1 or 0.5, and the doubtful ones 0.3; the fast one anywhere between.
+    static let doubtful: Float = 0.35
+
+    /// Whether a line is worth giving: any Vision is sure of, and a doubtful one with words in it (at least
+    /// two letters or digits, making up at least half of it). What goes is a doubtful short mark, mostly
+    /// punctuation: an icon, a divider or a bullet misread as "| O ." or "—". Never words on confidence
+    /// alone: small or low-contrast text can score low and still be right.
+    static func kept(_ l: Line) -> Bool {
+        if l.confidence >= doubtful { return true }
+        let marks = l.text.unicodeScalars.filter { !CharacterSet.whitespaces.contains($0) }
+        let words = marks.filter { CharacterSet.alphanumerics.contains($0) }.count
+        return words >= 2 && words * 2 >= marks.count
     }
 
     private static func recognize(_ shot: Shot, fast: Bool) async throws -> [(VNRecognizedTextObservation, VNRecognizedText)] {

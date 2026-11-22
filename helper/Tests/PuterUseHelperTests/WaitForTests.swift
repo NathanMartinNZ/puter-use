@@ -123,7 +123,7 @@ final class WaitForTests: XCTestCase {
         XCTAssertEqual(Handlers.unknownKeys(["type": "wait_for", "text": "Done", "timeout": 5000]),
                        "has an unknown key \"timeout\" (did you mean timeout_ms?)" + takes)
         XCTAssertEqual(Handlers.unknownKeys(["type": "wait_for", "text": "Done", "window": 3, "timeout": 5000]),
-                       "has unknown keys \"timeout\" (did you mean timeout_ms?), \"window\"" + takes)
+                       "has unknown keys \"timeout\" (did you mean timeout_ms?), \"window\" (that's act's own parameter)" + takes)
         let meant = ["timeoutMs": "timeout_ms", "timeout-ms": "timeout_ms", "timeout_s": "timeout_ms", "seconds": "timeout_ms",
                      "target": "text", "query": "text", "txt": "text", "texts": "text", "changed": "change", "gon": "gone",
                      "Role": "role"]
@@ -138,9 +138,9 @@ final class WaitForTests: XCTestCase {
         XCTAssertEqual(Handlers.unknownKeys(["type": "waitfor", "text": "x", "element": 2]), "has an unknown key \"element\"" + takes)
     }
 
-    /// Every wait_for form the docs, the CLI, api.py and macros send still runs, and other actions aren't
-    /// checked (their keys aren't listed anywhere).
-    func testValidWaitForsAndOtherActionsPass() {
+    /// Every wait_for form the docs, the CLI, api.py and macros send still runs. Other actions are checked the
+    /// same way, by their own keys (ActionKeysTests).
+    func testValidWaitForsPassAndOtherActionsAreCheckedByTheirOwnKeys() {
         let ok: [[String: Any]] = [
             ["type": "wait_for", "text": "Done"],
             ["type": "wait_for", "text": "Done", "role": "text", "gone": true, "timeout_ms": 900],
@@ -156,10 +156,12 @@ final class WaitForTests: XCTestCase {
             ["type": "click", "x": 10, "y": 20, "keys": ["shift"], "item": "Red"],
             ["action": "left_click", "coordinate": [10, 20]],
             ["type": "scroll", "scroll_direction": "down", "scroll_amount": 3],
-            ["type": "wait", "timeout": 5],
-            ["type": "fill", "fields": [["target": "Name", "text": "Ada", "whatever": 1]], "submit": true],
         ]
         for a in others { XCTAssertNil(Handlers.unknownKeys(a), "\(a)") }
+        XCTAssertEqual(Handlers.unknownKeys(["type": "wait", "timeout": 5]),
+                       "has an unknown key \"timeout\" (did you mean ms?): wait takes ms")
+        XCTAssertEqual(Handlers.unknownKeys(["type": "fill", "fields": [["target": "Name", "text": "Ada", "whatever": 1]], "submit": true]),
+                       "field 1 has an unknown key \"whatever\": a field takes element, target, text, option, checked, clear")
     }
 
     func testOnlyAChangeWaitTakesTheStartingPicture() {

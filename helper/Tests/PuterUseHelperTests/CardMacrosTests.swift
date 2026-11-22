@@ -5,7 +5,7 @@ import XCTest
 /// The app card's line listing the app's saved macros: names and vars only, nothing when there are none.
 final class CardMacrosTests: XCTestCase {
     func entry(_ name: String, _ vars: [String] = []) -> Macros.Entry {
-        Macros.Entry(name: name, line: "\(name) (App, 3 steps): does things", vars: vars)
+        Macros.Entry(name: name, app: "App", steps: 3, vars: vars, about: "does things")
     }
 
     func testNoMacrosNoLine() {

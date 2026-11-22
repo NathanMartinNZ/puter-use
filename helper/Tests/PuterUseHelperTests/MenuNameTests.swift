@@ -90,7 +90,8 @@ final class MenuNameTests: XCTestCase {
               File > Open Recent > Toggle Thing (full path only)
             """)
         XCTAssertTrue(AX.nameMiss("cmd+shift+e", in: Self.items(bar)).hasSuffix("\n  File > Export as PDF… · cmd+shift+e"))
-        XCTAssertEqual(AX.nameMiss("Frobnicate", in: Self.items(bar)), "nothing was run: no menu item matches \"Frobnicate\" (menus lists them all)")
+        XCTAssertEqual(AX.nameMiss("Frobnicate", in: Self.items(bar)),
+                       "nothing was run: no menu item matches \"Frobnicate\" (menus with a query searches every item: try another word)")
         // Capped, with how to see the rest.
         let many = AX.nameMiss("Page", in: Self.items((1...20).map { "Go > Page \($0)" }))
         XCTAssertEqual(many.split(separator: "\n").count, 1 + 12 + 1)

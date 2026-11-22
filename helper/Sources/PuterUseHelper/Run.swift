@@ -61,6 +61,11 @@ final class Run {
     var pidAtStart: pid_t = 0
     var locked = Set<pid_t>()  // apps this batch has the lock of (`AppLocks`)
     var changeBase: (wid: CGWindowID, sig: Signature)?  // the window before anything ran, for wait_for {change}
+    /// The web page the action under way may take the window away from (a link it follows, a form it sends), set
+    /// as it presses: the batch waits for the new page before going on (`Handlers.awaitPage(after:)`).
+    var pageMark: Handlers.PageMark?
+    /// The target window's Reload button, once looked for (`Handlers.reloadButton`): nil inside, none found.
+    var reload: (wid: CGWindowID, button: Handlers.ReloadButton?)?
 
     /// Batches under way, with their sessions: let go of if the helper is stopped mid-batch.
     nonisolated(unsafe) static var active: [ObjectIdentifier: (run: Run, session: Session)] = [:]
@@ -131,6 +136,25 @@ final class Run {
         guard case .window(let w) = target, let old = Run.seen[w.id] else { return nil }
         return WindowSet.of(w).change(since: old)
     }
+
+    /// Whether all that opened over the target since the agent last saw it are pop-ups (menus, suggestions or
+    /// saved-data lists: `popupLayer`), which Escape closes, and nothing else changed. For the stop's words.
+    func onlyPopupsOpened() -> Bool {
+        guard case .window(let w) = target, let old = Run.seen[w.id] else { return false }
+        let now = WindowSet.of(w)
+        let opened = now.over.subtracting(old.over)
+        guard !opened.isEmpty, old.over.isSubset(of: now.over), now.size == old.size else { return false }
+        return Run.onlyPopups(opened.map { Windows.info($0)?.layer })
+    }
+
+    /// Whether windows on these layers (nil: gone, or not known) are all pop-ups that Escape closes.
+    nonisolated static func onlyPopups(_ layers: [Int?]) -> Bool {
+        !layers.isEmpty && layers.allSatisfy { $0.map(popupLayer) == true }
+    }
+
+    /// The layers of menus and of pop-ups that behave like them (a page's suggestions or saved-data list): above
+    /// windows, panels and the menu bar, below the system's overlays. A sheet or dialog isn't one.
+    nonisolated static func popupLayer(_ layer: Int) -> Bool { layer >= 100 && layer < 1000 }
 
     /// The window set over the target just before an action that may open something, for `settle`.
     func baseline() -> (wid: CGWindowID, set: WindowSet)? {

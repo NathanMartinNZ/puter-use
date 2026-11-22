@@ -252,8 +252,9 @@ extension Session {
         view.current.forget(k)
         view.meta.forget(k)
         view.seen.forget(k)
-        view.outlines.forget(k)
+        view.sentOutlines.forget(k)
         view.carded.forget(k)
+        view.told.forget(k)
     }
 
     /// Returns whether the current window was kept because the one to go back to is gone.
@@ -261,8 +262,9 @@ extension Session {
         let stayed = !view.current.rollback(k, keep: { $0 == nil || $0 == 0 || Windows.info($0!) != nil }).isEmpty
         view.meta.rollback(k)
         view.seen.rollback(k)
-        view.outlines.rollback(k)
+        view.sentOutlines.rollback(k)
         view.carded.rollback(k)
+        view.told.rollback(k)
         return stayed
     }
 }
@@ -298,6 +300,12 @@ final class View: @unchecked Sendable {
     let current = Store<Int, CGWindowID>()  // key 0: the window it's on (0 = whole screen)
     let meta = Store<CGWindowID, Meta>()  // coordinate mapping from the last full screenshot of each window
     let seen = Store<CGWindowID, WindowSet>()  // what was over each window then (`Run.staleCoordinates`)
-    let outlines = Store<CGWindowID, (interactive: Bool, lines: [(Int, String)])>()  // the last outline it was sent
+    /// What each window's next outline changes are against (`OutlineDiff`): the last outline it was sent, with
+    /// its lines of no number, its kind and where it was cut; and, past where a cut one stopped, what the agent
+    /// still has of the one before.
+    let sentOutlines = Store<CGWindowID, OutlineDiff.Outline>()
     let carded = Store<String, Bool>()  // apps it has had an app card for
+    /// Where it was last told it is in each window, beside the picture (`Handlers.orient`): a reply that never
+    /// reached it takes its news back, so the next one says it again.
+    let told = Store<CGWindowID, Orientation>()
 }

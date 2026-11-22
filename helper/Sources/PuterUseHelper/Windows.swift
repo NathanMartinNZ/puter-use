@@ -132,10 +132,14 @@ enum Windows {
     }
 
     /// A menu, popover or sheet of `w`'s app lying over `p`; clicks there belong to it, not to `w`.
-    /// Mirrors what `Capture.planWindow` composites into `w`'s screenshot.
     static func popup(over w: WinInfo, at p: CGPoint) -> WinInfo? { popups(over: w).first { $0.frame.contains(p) } }
 
-    /// The app's menus, popovers and sheets over window `w`, front to back.
+    /// The app's menus, popovers and sheets over window `w`, front to back: every window of the app in front
+    /// of `w` on a higher layer, wherever it is, and those on its layer that lie inside it. Looser than what
+    /// `Capture.planWindow` composites into `w`'s screenshot (`Capture.related`: only what overlaps `w` or a
+    /// window already taken, nothing faint or tiny, and not the menu-bar or tooltip layers): a click or a
+    /// pointer move goes to whichever of the app's windows is really at its point, whether or not the picture
+    /// shows that window.
     static func popups(over w: WinInfo) -> [WinInfo] {
         let mine = all(onScreenOnly: true).filter { $0.pid == w.pid }  // front to back
         guard let i = mine.firstIndex(where: { $0.id == w.id }) else { return [] }

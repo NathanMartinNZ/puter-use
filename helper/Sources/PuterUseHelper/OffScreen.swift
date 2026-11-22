@@ -228,13 +228,23 @@ extension Handlers {
         return alone(el, shown: shown.matches, away: away.matches, complete: shown.complete && away.complete, sp)
     }
 
+    /// The miss when nothing off screen shows `sp`'s text either: clean (an optional step is skipped for it) only
+    /// when that search looked everywhere (`complete`). One that stopped early says so, and the step is an error
+    /// as ever: what it didn't look at may show the text.
+    static func offScreenMiss(_ sp: Spec, complete: Bool, near: String) -> NotFound {
+        NotFound(description: "nothing shows \(sp.description) in the window",
+                 offScreen: complete ? "" : "; the search off screen stopped early (the app answered slowly), so part of the "
+                     + "window wasn't looked at",
+                 near: near, complete: complete)
+    }
+
     /// For a target nothing on screen shows: the one element off screen that does, to be scrolled to before it's
     /// used. Anything else is a miss as before (`NotFound`), which says what's off screen, numbered.
     static func findOffScreen(_ sp: Spec, _ w: WinInfo) throws -> (Int, AX.Node) {
         let none = "nothing shows \(sp.description) in the window"
         let near = AX.Near(sp.text)
         let (all, complete) = offScreenCandidates(sp, w, limit: 30, near: near)
-        if all.isEmpty { throw NotFound(description: none, near: nearHint(near, w)) }
+        if all.isEmpty { throw offScreenMiss(sp, complete: complete, near: nearHint(near, w)) }
         let open = all.filter { AX.blockedBy($0.element) == nil }
         if open.isEmpty, let why = AX.blockedBy(all[0].element) {
             throw Behind(description: "\(sp.description) is behind \(why) that's open over the window: deal with that first")

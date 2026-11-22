@@ -22,13 +22,22 @@ Everything puter-use does, in more detail than the [README](../README.md).
     That's a few dozen tokens instead of a zoomed image.
   - To read a long document or text area, it asks for its whole text (`read`), the part scrolled out
     of view too, 10,000 characters at a time: one call instead of a scroll and a look per screenful.
+    It can start from the end, or search the text for where something is. A web page comes whole as
+    Markdown, its links and controls numbered so they can be clicked straight away. A `read` action
+    does the same in the middle of a batch.
+  - After a look without an image (just the outline), later actions on that window return what
+    changed in the outline instead of a picture, until a picture is needed.
   - The agent clicks in the screenshot's own pixels, and the helper maps them to the real window.
   - After actions you get a new screenshot **only if the window visibly changed**. Otherwise you get
-    one line of text.
-  - The accessibility outline (`[12] button "Save"`) is opt-in (`text=true`). It's useful for dense
-    forms, and elements can then be targeted by number. `text="interactive"` lists only what can be
-    acted on, and after the first outline of a window `act` sends just what changed in it. `marks=true`
-    draws the same numbers on the image instead.
+    one line of text. A blinking text cursor, or a spinner or clock that keeps moving by itself, isn't
+    a change. The image leaves out a page's blank margins (its empty sides and bottom). Opt-in, it can
+    show only the area that changed, or come at low detail.
+  - The accessibility outline (`#12 button "Save"`, plain text unnumbered, links in it as
+    `[label](#12)`) is opt-in. It's useful for dense forms, and elements can then be targeted by
+    number. `text="interactive"` lists only what can be acted on, fields named by their labels, with
+    headings, dialogs and alerts as landmarks; `text=true` lists everything. After the first outline
+    of a window `act` sends just what changed in it. `marks=true` draws the same numbers on the image
+    instead.
 - **Aim by what things say.** `target: "Save"` names the element showing that text. It's looked up
   as the action runs, so it can't miss when the window has shifted, and two matches fail with both
   numbers rather than a guess; a miss lists up to three similar labels (`"Log in"` for `"Login"`).
@@ -51,8 +60,10 @@ Everything puter-use does, in more detail than the [README](../README.md).
   and returns a single screenshot at the end. A model call costs far more than an action, so the
   action set is built to let one call do more:
   - key sequences (`"Tab Tab Return"`, `repeat`), held keys and buttons;
-  - compound steps: type into a field (click, clear, type, submit), fill a whole form, pick from a
-    pop-up, navigate a browser, open a file, wait for something to appear;
-  - menu commands by name, from a `menus` listing of every command and its shortcut;
+  - compound steps: type into a field (click, clear, type, submit), fill a whole form by its labels
+    (`{"Email": "…", "I agree": true}`), pick from a pop-up, navigate a browser, open a file, wait for
+    something to appear, scroll a long list until something shows;
+  - menu commands by name, from a `menus` listing of each menu's items and their shortcuts (a
+    search reaches every level);
   - a guard that stops the batch before a click aimed by coordinates once something has opened over
     the window, so a stale screenshot never clicks the wrong thing.

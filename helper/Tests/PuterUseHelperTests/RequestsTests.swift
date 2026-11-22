@@ -184,14 +184,14 @@ final class RequestsTests: XCTestCase {
         for i in 1...40 {
             let k = RequestKey(client: "c", id: i)
             s.enter(k)
-            with(k) { s.outlines[CGWindowID(i)] = (true, []) }
+            with(k) { s.sentOutlines[CGWindowID(i)] = OutlineDiff.Outline([], interactive: true) }
         }
         XCTAssertEqual(s.ledger.count, Session.ledgerCap)
         XCTAssertEqual(s.ledger.first?.key.id, 9)
         s.lost(RequestKey(client: "c", id: 1))  // aged out: counted as delivered
-        XCTAssertNotNil(s.outlines[1])
+        XCTAssertNotNil(s.sentOutlines[1])
         s.lost(RequestKey(client: "c", id: 40))
-        XCTAssertNil(s.outlines[40])
+        XCTAssertNil(s.sentOutlines[40])
     }
 
     /// A request that ages out of the ledger can't be known to have arrived: the notes it carried wait on.

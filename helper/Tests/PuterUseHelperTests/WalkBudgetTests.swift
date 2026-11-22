@@ -44,7 +44,7 @@ final class WalkBudgetTests: XCTestCase {
             let none = NSNull()
             return [f.role as NSString, none, (f.title as NSString?) ?? none, none, (f.value as NSString?) ?? none,
                     f.kids.map(\.element) as NSArray, AXValueCreate(.cgPoint, &pos)!, AXValueCreate(.cgSize, &size)!,
-                    none, kCFBooleanTrue, none, none, none]
+                    none, kCFBooleanTrue, none, none, none, none]
         }
     }
 
@@ -60,8 +60,8 @@ final class WalkBudgetTests: XCTestCase {
         let reg = AX.Registry()
         let lines = outline(window(100), reg, cost: 0.02)  // 2.02 s in all
         XCTAssertEqual(lines.count, 100)
-        XCTAssertEqual(lines.first, "[1] button \"B1\"")
-        XCTAssertEqual(lines.last, "[100] button \"B100\"")
+        XCTAssertEqual(lines.first, "#1 button \"B1\"")
+        XCTAssertEqual(lines.last, "#100 button \"B100\"")
         XCTAssertFalse(reg.cutShort)
         XCTAssertEqual(reg.lines.count, 100)
     }
@@ -73,7 +73,7 @@ final class WalkBudgetTests: XCTestCase {
         XCTAssertEqual(reads, 20)  // the window and 19 buttons: 2.5 s
         XCTAssertEqual(clock, 2.5)
         XCTAssertEqual(lines.count, 20)
-        XCTAssertEqual(lines[18], "[19] button \"B19\"")
+        XCTAssertEqual(lines[18], "#19 button \"B19\"")
         XCTAssertEqual(lines.last, cutNote)
         XCTAssertTrue(reg.cutShort)
         XCTAssertEqual(reg.lines.map(\.0), Array(1...19))  // the note isn't a numbered line
@@ -88,6 +88,7 @@ final class WalkBudgetTests: XCTestCase {
         let reg = AX.Registry()
         let lines = outline(window(100), reg, cost: 0.001, maxElements: 10)
         XCTAssertEqual(lines.last, "… (truncated; zoom with region or use a screenshot)")
+        XCTAssertEqual(lines.count, 11)  // the 10 it may have, then the note
         XCTAssertFalse(reg.cutShort)
     }
 

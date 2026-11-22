@@ -366,6 +366,139 @@ def test_the_instructions_name_every_tool_to_load_at_once():
     assert len(names) == 6 and sorted(hint.split(", ")) == sorted(names)
 
 
+# -- MCP: the tool schemas an agent reads before its first call
+
+
+def _schema_nodes(node):
+    """Every schema object in a JSON schema: not the names in properties/$defs, nor default/enum values."""
+    if isinstance(node, list):
+        for x in node:
+            yield from _schema_nodes(x)
+    elif isinstance(node, dict):
+        yield node
+        for key, value in node.items():
+            if key in ("properties", "$defs") and isinstance(value, dict):
+                for sub in value.values():
+                    yield from _schema_nodes(sub)
+            elif key not in ("default", "const", "enum"):
+                yield from _schema_nodes(value)
+
+
+def test_the_advertised_schemas_carry_nothing_only_pydantic_needs():
+    from puter_use import mcp_server
+
+    for tool in run(mcp_server.mcp.list_tools()):
+        schema = tool.input_schema
+        assert schema["type"] == "object" and "$defs" not in schema, tool.name
+        for node in _schema_nodes(schema):
+            assert "title" not in node and "$ref" not in node, (tool.name, node)
+            assert not ("default" in node and node["default"] is None), (tool.name, node)
+            types = node.get("type")
+            assert "null" not in (types if isinstance(types, list) else [types]), (tool.name, node)
+
+
+def test_the_advertised_schemas_keep_every_parameter_in_order():
+    from mcp.server.mcpserver.tools import Tool
+
+    from puter_use import mcp_server
+
+    tools = run(mcp_server.mcp.list_tools())
+    assert [t.name for t in tools] == ["windows", "screenshot", "find", "menus", "macros", "act"]
+    for t in tools:  # against the schema Pydantic makes for the same function
+        full = Tool.from_function(getattr(mcp_server, t.name), structured_output=False).parameters
+        assert list(t.input_schema["properties"]) == list(full["properties"]), t.name
+        assert t.input_schema.get("required") == full.get("required"), t.name
+    act = next(t for t in tools if t.name == "act").input_schema["properties"]
+    assert act["settle_ms"] == {"maximum": 10000, "minimum": 0, "type": "integer"}  # anyOf [T, null]: just T
+    assert act["window"] == {"anyOf": [{"type": "integer"}, {"type": "string"}]}  # only the null branch goes
+    assert act["guard"] == {"default": True, "type": "boolean"}  # real defaults stay
+    action = act["actions"]["items"]  # Action, inlined
+    assert action["type"] == "object" and action["required"] == ["type"] and action["additionalProperties"] is True
+    assert action["properties"]["x"] == {"type": "number"} and "hold_key" in action["properties"]["type"]["enum"]
+    text, target = action["properties"]["target"]["anyOf"]
+    assert text == {"type": "string"} and target["required"] == ["text"]
+    assert target["properties"]["nth"] == {"minimum": 1, "type": "integer"}
+
+
+def test_the_tool_list_is_the_same_every_time():
+    """A listing that changed would cost the client its prompt cache."""
+    from mcp.types import ListToolsResult
+
+    from puter_use import mcp_server
+
+    def wire():
+        tools = run(mcp_server.mcp.list_tools())
+        return ListToolsResult(tools=tools).model_dump_json(by_alias=True, exclude_unset=True)
+
+    assert wire() == wire()
+
+
+def test_slim_schema_leaves_names_and_data_alone_and_keeps_shared_definitions():
+    import copy
+
+    from puter_use.mcp_server import slim_schema
+
+    schema = {
+        "$defs": {
+            "Pair": {"properties": {"a": {"title": "A", "type": "integer"}}, "title": "Pair", "type": "object"},
+            "Once": {"properties": {"pair": {"$ref": "#/$defs/Pair"}}, "title": "Once", "type": "object"},
+        },
+        "properties": {
+            "title": {"default": {"title": "kept"}, "title": "Title", "type": "object"},  # a parameter named title
+            "first": {"$ref": "#/$defs/Pair"},
+            "once": {"anyOf": [{"$ref": "#/$defs/Once"}, {"type": "null"}], "default": None, "title": "Once"},
+            "wide": {"anyOf": [{"type": "integer"}, {"type": "string"}, {"type": "null"}], "default": None},
+        },
+        "title": "fArguments",
+        "type": "object",
+    }
+    before = copy.deepcopy(schema)
+    assert slim_schema(schema) == {
+        "$defs": {"Pair": {"properties": {"a": {"type": "integer"}}, "type": "object"}},  # used twice: kept
+        "properties": {
+            "title": {"default": {"title": "kept"}, "type": "object"},
+            "first": {"$ref": "#/$defs/Pair"},
+            "once": {"properties": {"pair": {"$ref": "#/$defs/Pair"}}, "type": "object"},
+            "wide": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+        },
+        "type": "object",
+    }
+    assert schema == before
+
+
+def test_calls_are_still_checked_against_the_full_models(monkeypatch):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from puter_use import mcp_server as m
+
+    seen = []
+
+    async def fake_consent(ctx, params):
+        seen.append(params)
+        return {"window": {"id": 1, "app": "X"}, "done": 1, "total": 1, "changed": False}
+
+    monkeypatch.setattr(m, "_run_with_consent", fake_consent)
+    monkeypatch.setattr(m, "helper", Helper("t"))
+    for name, args in [
+        ("act", {"actions": [{"type": "explode"}]}),
+        ("act", {"actions": [{"type": "wait", "ms": 40000}]}),
+        ("act", {"actions": [{"type": "hold_key", "keys": "a", "ms": 20000}]}),
+        ("act", {"actions": [{"type": "click", "target": {"text": "OK", "nth": 0}}]}),
+        ("act", {"actions": [{"type": "click"}], "settle_ms": 20000}),
+        ("act", {"window": "X"}),
+        ("screenshot", {"offset": -10**9 - 1}),
+        ("screenshot", {"limit": 50001}),
+    ]:
+        with pytest.raises(ToolError):
+            run(m.mcp.call_tool(name, args))
+    assert not seen
+    # An explicit null, which the advertised schema no longer mentions, is still accepted.
+    out = run(m.mcp.call_tool("act", {"actions": [{"type": "click", "target": "OK", "x": None}], "window": None,
+                                      "settle_ms": None, "save_as": None}))
+    assert out.is_error is False and out.content[0].text == "X #1 · no visible change"
+    assert seen[0]["actions"] == [{"type": "click", "target": "OK"}] and seen[0]["window"] is None
+
+
 # -- MCP: which tool calls' results reached the agent
 
 

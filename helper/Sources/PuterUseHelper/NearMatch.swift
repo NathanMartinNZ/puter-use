@@ -108,6 +108,49 @@ extension AX {
 
         func best(_ n: Int, ok: (Match) -> Bool = { _ in true }) -> [Match] { Near.best(seen, n, ok: ok) }
     }
+
+    /// `names` with those nearest `want` first: as `Near` ranks them, then by the longest start in common with
+    /// it (in a list of countries, "USA" brings up the U's). The rest, and ties, keep their order.
+    static func nearestFirst(_ names: [String], to want: String) -> [String] {
+        let near = Near(want)
+        guard !near.squashed.isEmpty else { return names }
+        let keys = names.map { name -> (rank: Near.Rank?, start: Int) in
+            (near.rank(name), zip(Near.parts(name).squashed, near.squashed).prefix { $0.0 == $0.1 }.count)
+        }
+        return names.indices.sorted { i, j in
+            let (a, b) = (keys[i], keys[j])
+            if let x = a.rank, let y = b.rank, x != y { return x < y }
+            if (a.rank == nil) != (b.rank == nil) { return a.rank != nil }
+            return a.start != b.start ? a.start > b.start : i < j
+        }.map { names[$0] }
+    }
+
+    /// `names` for a note or an error: each on one line and clipped to `clip` characters, as many as fit in `max`
+    /// of them and about `chars` characters, then "+N more". `quote`: each in quotes, a clipped one with its "…"
+    /// outside them, so what's quoted is the start of the name (which picks it, as a unique prefix does).
+    static func listed(_ names: [String], max: Int, chars: Int = .max, clip: Int = 45, separator: String = ", ",
+                       quote: Bool = false) -> String {
+        var out: [String] = []
+        var used = 0
+        for name in names {
+            guard out.count < max else { break }
+            let one = name.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+            let cut = one.count > clip ? String(one.prefix(clip - 1)).trimmingCharacters(in: .whitespaces) : nil
+            let s = quote ? (cut.map { "\"\($0)\"…" } ?? "\"\(one)\"") : (cut.map { $0 + "…" } ?? one)
+            let add = (out.isEmpty ? 0 : separator.count) + s.count
+            if !out.isEmpty, used + add > chars { break }
+            used += add
+            out.append(s)
+        }
+        let more = names.count - out.count
+        return (more > 0 ? out + ["+\(more) more"] : out).joined(separator: separator)
+    }
+
+    /// The options a pick that matched none, or several, lists (a pop-up's, a combo box's, a menu's items): up to
+    /// 20, the nearest to what was asked for first when there are more (`nearestFirst`), each clipped (`listed`).
+    static func optionList(_ names: [String], near want: String, quote: Bool = false, clip: Int = 45) -> String {
+        listed(names.count > 20 ? nearestFirst(names, to: want) : names, max: 20, clip: clip, quote: quote)
+    }
 }
 
 extension Handlers {

@@ -56,4 +56,29 @@ final class ReadTextTests: XCTestCase {
         XCTAssertEqual(Handlers.readName(7, "web", "Example Domain"), "[7] web area \"Example Domain\"")
         XCTAssertEqual(Handlers.readName(9, "text", String(repeating: "word ", count: 30)).count, "[9] text \"\"".count + 40)
     }
+
+    /// An element number as outlines write it (`#12`) names that element, for `read` and for the read action's
+    /// `element`, as `12` and `"12"` do. Anything more after it is a label, as is a `#` alone or before anything
+    /// but digits.
+    func testANumberAsOutlinesWriteIt() throws {
+        XCTAssertEqual(Handlers.elementNumber(NSNumber(value: 12)), 12)
+        XCTAssertEqual(Handlers.elementNumber("12"), 12)
+        XCTAssertEqual(Handlers.elementNumber(" 12 "), 12)
+        XCTAssertEqual(Handlers.elementNumber("#12"), 12)
+        XCTAssertEqual(Handlers.elementNumber("  #7 "), 7)
+        XCTAssertNil(Handlers.elementNumber("#12 open issues"))
+        XCTAssertNil(Handlers.elementNumber("#"))
+        XCTAssertNil(Handlers.elementNumber("# 12"))
+        XCTAssertNil(Handlers.elementNumber("#-3"))
+        XCTAssertNil(Handlers.elementNumber("#１２"), "digits in another script aren't a number")
+        XCTAssertNil(Handlers.elementNumber("Notes"))
+        XCTAssertNil(Handlers.elementNumber(kCFBooleanTrue))
+        XCTAssertNil(Handlers.elementNumber(NSNull()))
+        XCTAssertNil(Handlers.elementNumber(nil))
+        guard case .element(12) = try Handlers.readSource(["type": "read", "element": "#12"]) else {
+            return XCTFail("#12 is element 12")
+        }
+        guard case .element(4) = try Handlers.readSource(["type": "read", "element": 4]) else { return XCTFail("as before") }
+        XCTAssertThrowsError(try Handlers.readSource(["type": "read", "element": "#12 open issues"]))
+    }
 }

@@ -155,7 +155,13 @@ you're most likely to want:
 | `PUTER_USE_CURSOR` | `1` | `0` hides the agent cursor |
 | `PUTER_USE_TILE` | `28` | image tile size: 28 for Claude, 32 for OpenAI models |
 
-All settings: [docs/configuration.md](docs/configuration.md).
+Opt-in [leaner MCP profiles](docs/configuration.md#leaner-mcp-profiles) cut what the server puts in an
+agent's context: a thin `act` schema (`PUTER_USE_SCHEMA=thin`), no macros (`PUTER_USE_MACROS=0`),
+image metadata for clients that drop old screenshots (`PUTER_USE_IMAGE_META=1`), and act images of
+edits checked by accessibility saved to a file or left out (`PUTER_USE_IMAGE_DELIVERY=hybrid`,
+`PUTER_USE_OMIT_VERIFIED=1`). Two more make `act` images cheaper: only the area that changed
+(`PUTER_USE_CROP_CHANGES=1`) and low detail (`PUTER_USE_DETAIL=low`). All settings:
+[docs/configuration.md](docs/configuration.md).
 
 ## Troubleshooting
 
