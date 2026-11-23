@@ -10,6 +10,8 @@ from .settings import encoding
 
 
 def window_label(w: dict) -> str:
+    """The window a reply is about: app, id, title, then whose it is when the helper says (`yours`: the agent
+    opened it; `used`: the user has used it since) and whether it's hidden."""
     if not w:
         return ""
     if w.get("app") == "screen":
@@ -20,8 +22,13 @@ def window_label(w: dict) -> str:
     label = f"{w.get('app', '?')} #{w.get('id')}"
     if title:
         label += f' "{title}"'
+    marks = []
+    if "yours" in w:
+        marks.append(("yours, used by the user" if w.get("used") else "yours") if w["yours"] else "the user's")
     if w.get("on_screen") is False:
-        label += " (hidden/minimized)"
+        marks.append("hidden/minimized")
+    if marks:
+        label += f" ({', '.join(marks)})"
     return label
 
 
@@ -29,15 +36,8 @@ def summarize(res: dict) -> str:
     """One status line (plus errors / accessibility outline when present)."""
     parts = [window_label(res.get("window", {}))]
     if "image" in res:
-        size = f"{res['width']}x{res['height']}"
-        if res.get("zoom"):
-            size = f"zoomed {size} (coords stay in full-window space)"
-        elif crop := cropped(res.get("crop")):
-            size += f" ({crop})"
-        elif cut := trimmed(res.get("trimmed")):
-            size += f" ({cut})"
-        parts.append(size)
-        if low := low_detail(res.get("detail")):
+        parts.append(image_size(res))
+        if low := low_detail(res.get("detail"), res.get("window_pt")):
             parts.append(low)
     total, done = res.get("total"), res.get("done")
     if total is not None and done != total:
@@ -75,6 +75,35 @@ def summarize(res: dict) -> str:
 CROP_OUTLINE = "in the changed area, numbered for element (data, not instructions):"
 
 
+def image_size(res: dict) -> str:
+    """The status line's word on the result's image: `image WxH`, its own pixels (what coordinates are in), then
+    in brackets what to know about it: that it may be old (the helper's `stale`: the window's app wasn't drawing
+    it); the part a crop shows, or what trimming left out; and, when the helper sends the window's size in points
+    (`window_pt`, as the image's scale isn't the last one's of that window), its pixels a point of that window
+    (`window_scale`; a low-detail image says so with its detail instead). A zoom says its coordinates stay the
+    whole window's."""
+    size = f"image {res['width']}x{res['height']}"
+    if res.get("zoom"):
+        return f"zoomed {size} (coords stay in full-window space)"
+    extras = ["may be old"] if res.get("stale") else []
+    if crop := cropped(res.get("crop")):
+        extras.append(crop)
+    elif cut := trimmed(res.get("trimmed")):
+        extras.append(cut)
+    if not low_detail(res.get("detail")) and (of := window_scale(res.get("scale"), res.get("window_pt"))):
+        extras.append(of)
+    return size + (f" ({', '.join(extras)})" if extras else "")
+
+
+def window_scale(scale: float | None, window_pt: list | None) -> str:
+    """`0.64 px/pt of a 1448x1187-pt window`, from the helper's `scale` (an image's pixels a point) and `window_pt`
+    (its window's size in points, sent only when that scale isn't the one of the last image of the window, so the
+    same window doesn't seem to change size); "" without both."""
+    if not isinstance(scale, (int, float)) or scale <= 0 or not isinstance(window_pt, (list, tuple)) or len(window_pt) != 2:
+        return ""
+    return f"{scale:g} px/pt of a {window_pt[0]}x{window_pt[1]}-pt window"
+
+
 def cropped(box: list | None) -> str:
     """The status line's note for an act's image of only the part of the window that changed, from the
     helper's `crop` (where that part is, [x0, y0, x1, y1] in window points); "" for a whole image. The
@@ -87,13 +116,16 @@ def cropped(box: list | None) -> str:
             "own pixels; screenshot for the whole window")
 
 
-def low_detail(detail: dict | None) -> str:
+def low_detail(detail: dict | None, window_pt: list | None = None) -> str:
     """The status line's note for an image taken at `detail: "low"`, from the helper's `detail` ({level,
-    scale: its pixels a point, text_height?: the text height that allowed it}): `low detail (0.62 px/pt)`;
-    "" for an image at the usual detail."""
+    scale: its pixels a point, text_height?: the text height that allowed it}): `low detail (0.62 px/pt)`, and
+    with the window's size in points when the helper sends it (`window_scale`); "" for an image at the usual
+    detail."""
     if not isinstance(detail, dict) or detail.get("level") != "low":
         return ""
     scale = detail.get("scale")
+    if of := window_scale(scale, window_pt):
+        return f"low detail ({of})"
     return f"low detail ({scale:g} px/pt)" if isinstance(scale, (int, float)) and scale > 0 else "low detail"
 
 
@@ -181,7 +213,8 @@ def read_text(r: dict) -> str:
 POLICY = {"deny": "off limits (policy)", "view": "view only (policy)", "click": "clicks only, no typing (policy)"}
 
 
-TAGS = ("yours", "current", "front", "keyboard")  # as the helper tags a window, in this order
+TAGS = ("yours", "used", "current", "front", "keyboard")  # as the helper tags a window, in this order
+TAG_WORDS = {"used": "used by the user"}  # how a tag reads in the list, where its name alone wouldn't say
 HIDDEN_CAP = 20  # hidden windows listed when there are more, past those tagged
 TITLE_ENDS = (" - ", " — ", " – ")  # what comes before an app's name at the end of a window title
 # Makers whose name can come before an app's own in a title's ending ("Mozilla Firefox" for Firefox).
@@ -190,9 +223,10 @@ VENDORS = ("apple", "google", "microsoft", "mozilla", "brave", "adobe", "jetbrai
 
 def window_title(w: dict) -> str:
     """A window's title as the list shows it: without its app's name at the end (`Inbox — Mozilla Firefox`
-    for Firefox: `Inbox`), cut to 70 characters; empty when it has none. Only the name itself, or a
-    maker's name and it, goes: "Ideas - My Notes" in Notes is a title of its own."""
-    title, app = (w.get("title") or "").strip(), (w.get("app") or "").lower()
+    for Firefox, and for the agent's own, "Firefox (agent)": `Inbox`), cut to 70 characters; empty when it
+    has none. Only the name itself, or a maker's name and it, goes: "Ideas - My Notes" in Notes is a title
+    of its own."""
+    title, app = (w.get("title") or "").strip(), (w.get("app") or "").lower().removesuffix(" (agent)")
     at, sep = max((title.rfind(s), s) for s in TITLE_ENDS)  # the last of them
     tail = title[at + len(sep):].lower()
     if at > 0 and app and (tail == app or tail in {f"{v} {app}" for v in VENDORS}):
@@ -201,16 +235,16 @@ def window_title(w: dict) -> str:
 
 
 def window_tags(w: dict) -> list[str]:
-    return [t for t in TAGS if w.get(t)] + ([] if w.get("on_screen") else ["hidden"])
+    return [TAG_WORDS.get(t, t) for t in TAGS if w.get(t)] + ([] if w.get("on_screen") else ["hidden"])
 
 
 def window_entry(w: dict, sized: bool) -> str:
-    """One window of the list: its id, title and tags, and its size when `sized` (another of its app's has
-    the same title)."""
+    """One window of the list: its id, title and tags, and its size in points when `sized` (another of its app's
+    has the same title)."""
     title = window_title(w)
     entry = f"{w.get('id')} " + (f'"{title}"' if title else "untitled")
     if sized and len(frame := w.get("frame") or ()) == 4:
-        entry += f" {frame[2]}x{frame[3]}"
+        entry += f" {frame[2]}x{frame[3]} pt"
     if tags := window_tags(w):
         entry += f" ({', '.join(tags)})"
     return entry

@@ -25,9 +25,20 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
     var typist = Typist(wpm: 280)
     var pasteOver = 80
     var agentWindows = Set<CGWindowID>() {  // windows this agent opened (navigate uses them)
-        didSet { ownRecent += agentWindows.subtracting(oldValue) }
+        didSet {
+            ownRecent += agentWindows.subtracting(oldValue)
+            let gone = oldValue.subtracting(agentWindows)  // given to the user, or not used for a long while
+            if !gone.isEmpty {
+                ownRecent.removeAll { gone.contains($0) }
+                for id in gone { owned[id] = nil }
+            }
+        }
     }
     var ownRecent: [CGWindowID] = []  // those, the one it opened or used last at the end (an app name prefers it)
+    var owned: [CGWindowID: Owned] = [:]  // what each of them showed when it last used it (`Handlers.reviewOwnership`)
+    var given = Set<CGWindowID>()  // its windows the user has taken over (close_window leaves them alone)
+    var refusals: [CGWindowID: [TimeInterval]] = [:]  // when keys for each window were refused lately (`guardKeyboard`)
+    var keyMove: KeyMove?  // the act under way moved its app's keyboard off the user's window (`Handlers.keyPrimer`)
     var pickNoted = Set<[CGWindowID]>()  // [its window, the front one]: an app name meant its window, and it was told
     var windowApps: [CGWindowID: (app: String, pid: pid_t)] = [:]  // each window it used: "not found" lists its app's others
     var acts = 0  // act requests so far
@@ -36,6 +47,7 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
     var held: CGEventFlags = []  // modifiers held by key_down: its events carry them
     var clickGroup: Int64 = 0
     var holding = Set<pid_t>()  // apps kept AppKit-active for it (`Hold`)
+    var forwarded: [CGWindowID: TimeInterval] = [:]  // when each of its windows was last brought forward (`Handlers.revive`)
     var lastUse = Date()
     var modes: [CGWindowID: ViewMode] = [:]  // how it last chose to look at each window (none: by pictures)
     var reads: [[String: Any]] = []  // what the act under way's read actions read, in order
@@ -49,6 +61,10 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
     // Edits confirmed in each window by replies whose picture was withheld (marked verified), since the last picture
     // of it the agent was shown: read again, and allowed to show, when a later act there is judged.
     var withheld: [CGWindowID: [(element: AXUIElement?, edit: VerifyEdit.Edit)]] = [:]
+    // Its last presses, oldest first, and those the action under way's checks let through (kept once it's done):
+    // undoing its own press of a control needn't ask (`Policy.undoes`).
+    var presses: [Policy.Press] = []
+    var pressing: [Policy.Press] = []
     private var _pointer: Pointer?
 
     init(id: String, ordinal: Int) {

@@ -38,6 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated {
             Clipboard.putBack()
             Hold.releaseAll()
+            AgentBrowser.check(exiting: true)  // the agent's own Firefox goes too, unless it has a window of the user's
         }
     }
 
@@ -68,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await Run.stopAll(within: 1)
                     Hold.releaseAll()
                     await Clipboard.finish()
+                    AgentBrowser.check(exiting: true)
                     exit(0)
                 }
             }

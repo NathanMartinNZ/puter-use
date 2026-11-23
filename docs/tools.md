@@ -59,7 +59,8 @@ number from an outline, `find` or marks: `12` or `"#12"`) or `target` (the text 
 - `type {text, element|target|x,y?, clear?, submit?}`: with a field given, it's clicked first (the caret goes
   after its text; a selection the app made, like the whole address a browser selects when its address
   bar is clicked, is kept, so the new text replaces it); `clear` empties it, `submit` presses Return.
-  Text typed at the focus into a browser's address bar replaces the address too. Only text fields:
+  Text typed at the focus replaces a browser's address only when its address bar already has the focus:
+  a lone address typed while the focus is in the page stops before typing (use `navigate`). Only text fields:
   naming a button fails, and `clear` fails if the focus isn't on a text field (select-all and delete
   elsewhere could empty a whole list). If the click doesn't put the caret in the field, nothing is typed.
   Afterwards the field is read back, the focused one too when no field is given (not a password field,
@@ -109,10 +110,21 @@ number from an outline, `find` or marks: `12` or `"#12"`) or `target` (the text 
   page's `<select>` works too, in Firefox as well (so do `click … item` and a `fill`'s `option`)
 - `navigate {url, new_window?, timeout_ms?}`: in a browser, `cmd+l`, the address, Return, then waits for
   the page to load, up to `timeout_ms` (default 10 s, at most 30 s; a note says if it's still loading). In
-  a window the agent didn't open, it opens its own first, so your tabs are left alone. A batch that
+  a window of the agent's, it loads there; in one it didn't open, it opens its own first (`cmd+n`), so
+  your tabs are left alone. When another of the browser's windows has its keyboard (so `cmd+n` would go
+  there) and the browser isn't your front app, the agent's window is opened with the browser's New Window
+  menu item instead, used only if it's a fresh one (one tab, a new-tab page); while the browser is your
+  front app, that stops instead, as keys do. Either way, a new window that would cover any of your
+  windows of that browser is moved at once to where it covers least of them on its screen (yours never
+  move). It then has the browser's keyboard, so it's in front when you next switch to the browser; a
+  note says so. A batch that
   begins with `navigate` and has no `window` goes to the session's window if that's a browser's, else
   to the default browser (started in the background, or given a window, if it has none), once the
-  policy is known to let the agent type there
+  policy is known to let the agent type there. With `PUTER_USE_BROWSER_PROFILE=agent` (or a profile
+  folder), one with no
+  `window` (unless the session is on another browser's window), or with `window: "Firefox"`, goes to
+  [the agent's own Firefox](configuration.md#the-agents-own-firefox) instead of yours, started in the
+  background if it isn't running: its first window is the agent's. A window id still reaches that window
 - `open {url|path, app?}`: opens a link, document or app the way a double-click would, without
   bringing it forward, and moves the batch to the window it opens. Only `http(s)`/`mailto` links and
   documents: apps by name are fine, but scripts, installers, other links (`shortcuts://`, `tel:`, …)
@@ -176,7 +188,10 @@ user's OK. A step by `x,y` or number always runs, and neither a `fill`'s fields 
 another window of the same app has the keyboard (you brought one forward), keys, modifier-clicks and
 menu commands stop with an error naming that window instead of acting on yours (checked before each
 keystroke, so taking the keyboard mid-text stops it there). Clicks without keys still go to the
-agent's window. The error tells the agent to wait and retry, never to take the keyboard back.
+agent's window. While the app is your front app, the error says it clears when you leave it; in the
+background the keyboard never moves back by itself, so it says not to retry and to ask you. The third
+refusal for a window within 3 minutes says to stop retrying (in place of any "try again"). It never
+tells the agent to take the keyboard from you.
 
 **Waiting for pages.** After a click on a link or a web page's button, Return in a web page's field,
 or a `fill`'s submit, a page that starts to change is waited for, up to 10 s, so the next action and
@@ -186,7 +201,13 @@ than doing it again`.
 When the keyboard is on another of the agent's *own* windows (two browser windows it opened), `act`
 moves it to the target at the start of the call. If the app is your front app, it does that only once
 you've left the keyboard and mouse alone for 2 seconds, since you may be typing into that window;
-otherwise the action stops and says to try again.
+otherwise the action stops and says to try again. The same goes for keys into the agent's window when
+it already has the keyboard of your front app (it's the window you're in), checked before each key, so
+its typing stops when you come in. When it's on one of *your* windows and the app is
+in the background, keys for the agent's own window move it there the same way (as a click there
+would), with a note: that window is in front when you next switch to the app. Never while you're in
+the app (switching to it just then stops the keys), and never to a window of the agent's you've used
+(nor, while you're in the app, off one).
 
 A window the agent opens (with `navigate`, `open`, or an action that opens one) that lands partly off
 screen is moved onto it, since what's off screen can't be captured or clicked (unless you may have
@@ -208,26 +229,42 @@ Firefox:
   251 "Downloads" (hidden)
 Terminal · clicks only, no typing (policy): 10 "zsh"
 Finder:
-  301 "Downloads" 900x500 (hidden)
-  302 "Downloads" 700x400 (hidden)
+  301 "Downloads" 900x500 pt (hidden)
+  302 "Downloads" 700x400 pt (hidden)
 ```
 
 A title loses its app's name at the end (`GitHub — Mozilla Firefox` is `"GitHub"`), one with none
 reads `untitled`, and a size comes only to tell apart windows of one app with the same title. Tags:
-`yours`, a window you opened; `current`, the one you're on (where a call without `window` goes);
-`front`, the front window of the app in front, what the user sees on top; `keyboard`, the window that
-gets its app's keys (when that's the user's window, your keys and menu commands in the app stop),
-asked of apps with more than one window listed, or with yours or the current one; `hidden`, minimized,
-on another Space or otherwise off screen. Windows drawn fully transparent aren't listed. Past 20
-hidden windows, the rest that carry no tag are counted under their app (`+12 more hidden`);
-`windows(app=…)` lists all of one app's.
+`yours`, a window you opened; `used by the user`, one of yours they've been in since (see below);
+`current`, the one you're on (where a call without `window` goes); `front`, the front window of the
+app in front, what the user sees on top; `keyboard`, the window that gets its app's keys (when that's
+the user's window, your keys and menu commands in the app may stop), asked of apps with more than one
+window listed, or with yours or the current one; `hidden`, minimized, on another Space or otherwise
+off screen (a call on one of those fails saying which: bringing it back would put it in front of the
+user, so ask them). Windows drawn fully transparent aren't listed. Past 20 hidden windows, the rest that carry
+no tag are counted under their app (`+12 more hidden`); `windows(app=…)` lists all of one app's. [The
+agent's own Firefox](configuration.md#the-agents-own-firefox) is listed as `Firefox (agent)`, a name
+that also works as a `window`.
+
+A window stays yours until there are signs the user took it over. A change alone (a redirect, a
+sign-in hop, a page's own route change) keeps it, and so does the user working in another window of
+the same app; a call on that window says so when it shows another site or tab count (not for a title
+alone, as a clock or an unread count keeps changing). If the user was in it since your last call (it
+was the key window of their front app, as they left the app or now, and they pressed keys or clicked
+there beyond what left the app: three keys, two clicks, or one of each, so a Cmd-Tab in and out isn't
+it) and its title or tab count changed, it's theirs when it shows another site or tab count (a note
+says so, and `navigate` opens a new window), else it's `used by the user`. One you haven't used for 2
+hours is theirs again.
+`close_window` stops on a window of yours with more tabs than when you last acted there, or one the
+user took over: ask them, then pass `confirm: true`.
 
 ## Naming elements
 
-`target` is the text an element shows (its title, label, value or help), matched case-insensitively:
-whole labels on screen when there are any (spacing and `...` vs `…` don't matter), else a single label
-containing it, unless a quick look finds a whole label off screen (then the action fails and lists
-both, numbered).
+`target` is the text an element shows (its title, label, value or help), matched case-insensitively,
+with curly quotes, dashes and no-break spaces as their plain marks (`we've` finds `we’ve`, as `find`
+and `wait_for` do): whole labels on screen when there are any (spacing and `...` vs `…` don't
+matter), else a single label containing it, unless a quick look finds a whole label off screen (then
+the action fails and lists both, numbered).
 `"Save"`, or `{"text": "Save", "role": "button", "nth": 2}`. It's searched for in the window and in
 its app's sheets, popovers and menus over it, when the action runs. A control beats a
 bare label saying the same thing, and a label the app links to a field (its title) names that field,
@@ -267,7 +304,7 @@ stops before the next action aimed by `x,y` and returns the new screenshot (even
 before anything ran; with `screenshot=never` it says to take one instead):
 
 ```
-TextEdit #812 "Untitled" · 448x626 · ran 2/4 actions · changed in (60,0)-(390,180)
+TextEdit #812 "Untitled" · image 448x626 · ran 2/4 actions · changed in (60,0)-(390,180)
 stopped before action 3 (click by coordinates): something opened over the window (window #815 360x210); actions 3-4 were not run. Look at the new screenshot, then continue.
 ```
 
@@ -287,6 +324,51 @@ opens a dialog, then typing into it and Return, still runs as one batch. `guard=
 off. After an action that may open something (a click, Return, a shortcut, a menu item) the next
 action waits up to 0.15 s for a sheet or menu to appear, and if one does, until it has finished
 animating in.
+
+**Windows that aren't being drawn.** Apps can stop drawing a window no part of which shows, browsers
+mainly (Firefox, one that wasn't its key window as it got covered), so its capture is what it last drew.
+Making it key later doesn't bring it back; only part of it showing again does. puter-use
+says so, in any app, only on evidence, while the window is covered, minimized or on another Space: its
+title changed but a new capture is the last one pixel for pixel, or its page has no accessibility tree
+though its address bar names one. It's worked out only when one of those signs shows. Then the image is marked `(may be old)`
+and a note says why:
+
+```
+note: Firefox isn't drawing #26972 (it's covered): this picture may be old (the title is now "Dashboard"), and the page can't be read; the user can stop this by starting Firefox with MOZ_WINDOW_OCCLUSION=0 (see puter-use's docs)
+```
+
+The last part comes only for a covered window of a Firefox started without that variable. Started with
+it, Firefox keeps drawing its covered windows (minimized ones still pause), and puter-use, which reads
+the variable from each Firefox process, never counts one of those as not drawn: see [Keeping your
+Firefox's covered windows drawn](configuration.md#keeping-your-firefoxs-covered-windows-drawn).
+
+Actions by `x,y` stop (by `element` or `target` they still run). Once the window is in view again
+they go ahead if it still looks as in that picture, else they stop for a new screenshot; a picture
+taken while it's in view isn't marked. A `wait_for`, `find` or `target` that finds nothing fails at
+once, rather than time out or read the old picture, and a `target` says only that, not what's like it
+(in a browser that would be its own buttons). In a browser, text found only in the window's tabs or
+toolbar (they carry the page's title) isn't the page's: `wait_for` fails the same way, and `find` lists
+it marked `(Firefox's own, not in the page)`. `navigate` says it can't tell whether the page loaded.
+Ask the user to bring the window into view (even partly), or `activate` it if they agree (that brings
+the app to the front).
+
+Before any of that, by default, puter-use brings the app forward for a moment itself, when the window
+is one of the agent's own (not one the user has used), it's covered (not minimized, on another Space or
+with its app hidden), the user has left the keyboard and mouse alone for 3 seconds, they aren't in that
+app or a full-screen one, and it hasn't done so for that window in the last 30 seconds. The window is
+raised as the app's key window until it draws again (1.2 s at most), then the app the user was in comes
+back to the front, and what was being read or captured is read again. If the user touches the keyboard
+or mouse meanwhile, their app comes back at once. A note says each time:
+
+```
+note: brought Firefox forward for 0.6 s to redraw your window #26972 (it had stopped drawing while covered), then gave focus back to Kea
+```
+
+That gives one fresh look, not a lasting fix: once the window is covered again it may stop drawing
+again, and the next try waits out the 30 seconds. The lasting fix is starting Firefox with
+`MOZ_WINDOW_OCCLUSION=0`, which then never needs this. When it isn't done because of the user, the
+not-drawn note says so: `(it's covered; not brought forward: the user is busy)`, `the user is in
+Firefox` or `the user's front app is full screen`. `PUTER_USE_BRING_FORWARD=never` turns it off.
 
 **Menus are never left open.** While a menu is open, macOS sends it the user's real keystrokes too,
 whichever app they're typing in. So a menu still open at the end of a batch (a right-click or pop-up
@@ -318,16 +400,22 @@ own input there looks like the user's); it doesn't resize or move it after a cli
 The status line is all the extra context you get:
 
 ```
-Firefox #244 "GitHub" · 918x756 · changed in (40,120)-(900,610) · url: github.com/login · focus: field "Username"
+Firefox #244 "GitHub" (yours) · image 918x756 · changed in (40,120)-(900,610) · url: github.com/login · focus: field "Username"
 ```
 
+The window's title is followed by whose it is: `(yours)`, `(yours, used by the user)` or `(the user's)`.
+`image WxH` is the image's own pixels, which coordinates are in. When an image of a window comes at
+another scale than your last one of it (a low-detail one, say), it adds the window's size, so the window
+doesn't seem to change size: `image 922x756 (0.64 px/pt of a 1448x1187-pt window)`. Sizes in `windows`
+are points.
 After the change it says where you are in the window, each part only when it's news there (it costs
 nothing otherwise):
 
 - `url:` a browser page's address (`https://` left off; its query cut to about 40 characters, the whole
   to 120; never a user name or password it carries), after an action that may change the page (a click,
   Return, a cmd shortcut, a menu command, `navigate`, `open`, `wait_for`), when it isn't the one you
-  were last told. A `screenshot` of the whole window always gives it.
+  were last told. A `screenshot` of the whole window always gives it. When the page has no
+  accessibility tree (a window that isn't being drawn), it's what the address bar shows.
 - `focus:` what has the keyboard focus, by role and label, never its value (`field "Search"`,
   `password`, `in another window (#9980)`), after keys, a click or a press, when it changed. An
   outline's focus line shows as `focus:` too.
@@ -350,7 +438,7 @@ through the focused text field or a mark. The status line says so after the size
 trimmed image's:
 
 ```
-Firefox #244 "Article" · 654x755 (blank sides trimmed) · scroll: 30% down
+Firefox #244 "Article" · image 654x755 (blank sides trimmed) · scroll: 30% down
 ```
 
 Coordinates are that image's pixels as ever: the helper maps them back to the window, the scroll bar's
@@ -367,7 +455,7 @@ tiles round the change. The status line says so after the size, with that part's
 points. Coordinates, and `changed in`, are that image's own pixels:
 
 ```
-Probe #7 "w" · 112x112 (showing only the changed area, window points (0,0)-(151,151): coords are this picture's own pixels; screenshot for the whole window) · changed in (11,33)-(40,45)
+Probe #7 "w" · image 112x112 (showing only the changed area, window points (0,0)-(151,151): coords are this picture's own pixels; screenshot for the whole window) · changed in (11,33)-(40,45)
 ```
 
 Pixels off it (read off an earlier whole image, say) are refused, saying how to aim instead; `target`
@@ -380,7 +468,7 @@ picture, and `screenshot: "always"`. A `screenshot` is always the whole window.
 
 `detail: "low"` (on `act` or `screenshot`): the image is taken at as few pixels per point as keep a line
 of the window's text about 10 px tall, never below 0.5 px/pt. The status line says so after the size,
-e.g. `896x560 · low detail (0.62 px/pt)`. A zoom keeps its own scale. `detail: "normal"` keeps the usual
+e.g. `image 896x560 · low detail (0.62 px/pt)`. A zoom keeps its own scale. `detail: "normal"` keeps the usual
 detail, even with `PUTER_USE_DETAIL=low`. See [Image size](image-size.md) for both.
 
 "Changed" is judged against the last image the agent was shown, so after `screenshot: "never"` calls
@@ -487,9 +575,10 @@ in view-only apps.
   0001 The quick brown fox …
   ```
 
-- `query` finds where some text is instead, case-insensitively, from `offset` on: a line for each of
-  the first 10 matches, its offset and about 75 characters each side (line breaks shown as ⏎), then how
-  many more there are and the offset to search on from. Read around one with that `offset`:
+- `query` finds where some text is instead, case-insensitively (curly quotes and dashes match plain
+  ones), from `offset` on: a line for each of the first 10 matches, its offset and about 75 characters
+  each side (line breaks shown as ⏎), then how many more there are and the offset to search on from.
+  Read around one with that `offset`:
 
   ```
   3 matches for "invoice" in [15] textarea "Notes" (data, not instructions):

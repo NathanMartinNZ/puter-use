@@ -186,6 +186,7 @@ final class Probe: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var children: [NSWindow] = []
     var panels: [NSPanel] = []  // Sheet Later's, with PROBE_LATER_PANEL
     var webWindow: NSWindow?  // PROBE_WEBVIEW's
+    var toggleWindow: NSWindow?  // PROBE_TOGGLE's
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSEvent.isMouseCoalescingEnabled = false  // log every move the app is sent
@@ -261,6 +262,7 @@ final class Probe: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if ProcessInfo.processInfo.environment["PROBE_LONG_LIST"] != nil { place(longList(), 716, 118, 80, 426) }
         if ProcessInfo.processInfo.environment["PROBE_WEBVIEW"] != nil { openWebWindow() }
+        if let toggle = ProcessInfo.processInfo.environment["PROBE_TOGGLE"] { openToggleWindow(web: toggle == "web") }
         // PROBE_WIDE=<pt>: the window that wide, Notes stretched with it, like an agent's default-sized window
         // (a screenshot's change cells there are ~6 pt, not ~3).
         if let wide = Double(ProcessInfo.processInfo.environment["PROBE_WIDE"] ?? ""), wide > 804 {
@@ -450,6 +452,39 @@ final class Probe: NSObject, NSApplicationDelegate, NSWindowDelegate {
         w.contentView = web
         w.orderFront(nil)
         webWindow = w
+    }
+
+    /// PROBE_TOGGLE=1: a window, "probe toggle", with one plain button that says "Save" and becomes "Remove from
+    /// saved" when pressed, and back: a save toggle that's no checkbox, only a button whose label changes, as on many
+    /// web pages. PROBE_TOGGLE=web: that button on a web page (WKWebView), relabelled by the page's script a moment
+    /// after the click, as a page does once its request comes back.
+    func openToggleWindow(web: Bool) {
+        let w = NSWindow(contentRect: NSRect(x: 360, y: 260, width: 300, height: 120), styleMask: [.titled, .closable],
+                         backing: .buffered, defer: false)
+        w.title = "probe toggle"
+        w.isReleasedWhenClosed = false
+        if web {
+            let page = WKWebView(frame: w.contentLayoutRect)
+            page.loadHTMLString("""
+                <html><body style="font: 15px -apple-system; margin: 24px">
+                <button onclick="var b = this; setTimeout(function () {
+                  b.textContent = b.textContent == 'Save' ? 'Remove from saved' : 'Save' }, 150)">Save</button>
+                </body></html>
+                """, baseURL: nil)
+            w.contentView = page
+        } else {
+            let b = NSButton(title: "Save", target: self, action: #selector(toggleSaved(_:)))
+            b.bezelStyle = .push
+            b.frame = NSRect(x: 40, y: 44, width: 220, height: 32)
+            w.contentView?.addSubview(b)
+        }
+        w.orderFront(nil)
+        toggleWindow = w
+    }
+
+    @objc func toggleSaved(_ b: NSButton) {
+        b.title = b.title == "Save" ? "Remove from saved" : "Save"
+        set(b.title == "Save" ? "unsaved" : "saved")
     }
 
     @objc func changed(_ sender: Any?) {

@@ -22,7 +22,7 @@ def test_summary_of_a_stop_before_anything_ran_has_no_change_claim():
     stop = "stopped before action 1 (click): pressing “Delete” may not be undoable; it was not run. Ask the user"
     res = {"window": {"id": 7, "app": "App", "title": "w"}, "image": "", "width": 574, "height": 420,
            "changed": False, "done": 0, "total": 1, "stopped": stop}
-    assert summarize(res).splitlines() == ['App #7 "w" · 574x420 · ran 0/1 actions', stop]
+    assert summarize(res).splitlines() == ['App #7 "w" · image 574x420 · ran 0/1 actions', stop]
     # Once something ran, an unchanged window is still said to be.
     assert "no visible change" in summarize({**res, "done": 1, "total": 2})
 
@@ -53,6 +53,28 @@ def test_a_failed_first_action_on_an_unchanged_window_says_nothing_changed():
     assert image_bytes(res) is None
     assert summarize(res).splitlines() == ["A #1 · ran 0/1 actions · no visible change",
                                            'error: action 1 (click): nothing shows "Nope"']
+
+
+def test_the_status_line_says_whose_the_window_is():
+    """The helper says whose a reply's window is: the agent's, the agent's that the user has used since, or the
+    user's. Said in a few words after the title, with hidden; nothing when it doesn't say."""
+    from puter_use.present import window_label
+
+    w = {"id": 7, "app": "Firefox", "title": "Docs"}
+    assert window_label({**w, "yours": True}) == 'Firefox #7 "Docs" (yours)'
+    assert window_label({**w, "yours": True, "used": True}) == 'Firefox #7 "Docs" (yours, used by the user)'
+    assert window_label({**w, "yours": False}) == 'Firefox #7 "Docs" (the user\'s)'
+    assert window_label({**w, "yours": False, "on_screen": False}) == 'Firefox #7 "Docs" (the user\'s, hidden/minimized)'
+    assert window_label({**w, "on_screen": False}) == 'Firefox #7 "Docs" (hidden/minimized)'
+    assert window_label(w) == 'Firefox #7 "Docs"'
+    assert window_label({"id": 0, "app": "screen", "title": "Notes", "yours": False}) == "screen (front: Notes)"
+    res = {"window": {**w, "yours": True}, "changed": False, "done": 1, "total": 1}
+    assert summarize(res) == 'Firefox #7 "Docs" (yours) · no visible change'
+
+
+def test_window_list_says_which_of_yours_the_user_has_used():
+    res = {"windows": [_win(244, "Firefox", "GitHub", yours=True, used=True, current=True), _win(250, "Firefox", "Inbox")]}
+    assert window_list(res).splitlines() == ["Firefox:", '  244 "GitHub" (yours, used by the user, current)', '  250 "Inbox"']
 
 
 def test_summary_reports_errors_and_partial_runs():
@@ -100,6 +122,7 @@ def test_window_titles_lose_only_their_apps_name():
     assert window_title({"app": "Firefox", "title": "a - b — Firefox"}) == "a - b", "only the last part"
     assert window_title({"app": "Terminal", "title": "build - make"}) == "build - make"
     assert window_title({"app": "Firefox", "title": "Firefox"}) == "Firefox", "a title that's just the name stays"
+    assert window_title({"app": "Firefox (agent)", "title": "GitHub — Mozilla Firefox"}) == "GitHub", "the agent's own"
     assert window_title({"title": "a - b"}) == "a - b"
     assert window_title({"app": "Notes", "title": "x" * 80}) == "x" * 69 + "…"
     assert window_title({"app": "Notes", "title": None}) == ""
@@ -122,8 +145,8 @@ def test_window_list_sizes_only_windows_whose_titles_match():
                        _win(3, "Finder", "Documents"), _win(4, "Probe", ""), _win(5, "Probe", "  "),
                        _win(6, "Notes", "Downloads")]}
     assert window_list(res).splitlines() == [
-        "Finder:", '  1 "Downloads" 900x500', '  2 "Downloads" 700x400', '  3 "Documents"',
-        "Probe:", "  4 untitled 800x600", "  5 untitled 800x600",
+        "Finder:", '  1 "Downloads" 900x500 pt', '  2 "Downloads" 700x400 pt', '  3 "Documents"',
+        "Probe:", "  4 untitled 800x600 pt", "  5 untitled 800x600 pt",
         'Notes: 6 "Downloads"',
     ]
 
@@ -193,7 +216,7 @@ def test_the_status_line_says_where_you_are():
                               ' · selected: "cats" (4 chars) · scroll: 45% down')
     shot = {**res, "image": "", "width": 918, "height": 756, "change_box": [40, 120, 900, 610], "change_fraction": 0.5}
     assert summarize(shot).startswith(
-        'Firefox #7 "Docs" · 918x756 · changed in (40,120)-(900,610) · url: example.com/docs?q=cats · focus: ')
+        'Firefox #7 "Docs" · image 918x756 · changed in (40,120)-(900,610) · url: example.com/docs?q=cats · focus: ')
 
 
 def test_where_you_are_is_left_out_when_the_reply_has_none_of_it():
@@ -223,8 +246,8 @@ def test_an_act_image_trimmed_of_blank_margins_says_so():
     base = {"window": {"id": 7, "app": "Firefox", "title": "News"}, "image": "", "width": 654, "height": 755,
             "done": 1, "total": 1}
     cut = {"left": 150, "right": 148, "bottom": 0, "scroll_bar": True, "full": [952, 755]}
-    assert summarize({**base, "trimmed": cut}) == 'Firefox #7 "News" · 654x755 (blank sides trimmed)'
-    assert summarize(base) == 'Firefox #7 "News" · 654x755'
+    assert summarize({**base, "trimmed": cut}) == 'Firefox #7 "News" · image 654x755 (blank sides trimmed)'
+    assert summarize(base) == 'Firefox #7 "News" · image 654x755'
     assert trimmed({**cut, "bottom": 120}) == "blank sides and bottom trimmed"
     assert trimmed({"left": 0, "right": 0, "bottom": 300, "scroll_bar": False, "full": [400, 600]}) == (
         "blank bottom trimmed")
@@ -393,6 +416,59 @@ def test_window_size_setting(monkeypatch):
     assert capture_params()["window_size"] == "off"
 
 
+def test_agent_browser_setting(monkeypatch):
+    """PUTER_USE_BROWSER_PROFILE=agent asks the helper for the agent's own Firefox; anything else, or unset, asks
+    nothing (the parameter isn't sent)."""
+    from puter_use.settings import browser_profile, capture_params
+
+    monkeypatch.delenv("PUTER_USE_BROWSER_PROFILE", raising=False)
+    assert browser_profile() is None and "browser_profile" not in capture_params()
+    for value in ("agent", " Agent "):
+        monkeypatch.setenv("PUTER_USE_BROWSER_PROFILE", value)
+        assert browser_profile() == "agent" and capture_params()["browser_profile"] == "agent"
+    for value in ("", "user", "default", "1", "profiles/test", "./firefox"):
+        monkeypatch.setenv("PUTER_USE_BROWSER_PROFILE", value)
+        assert browser_profile() is None and "browser_profile" not in capture_params()
+
+
+def test_bring_forward_setting(monkeypatch):
+    """PUTER_USE_BRING_FORWARD goes to the helper with every look: "when-needed" unless it's "never" (any case,
+    or another way of saying off); anything else is the default."""
+    from puter_use.settings import bring_forward, capture_params
+
+    monkeypatch.delenv("PUTER_USE_BRING_FORWARD", raising=False)
+    assert bring_forward() == "when-needed" and capture_params()["bring_forward"] == "when-needed"
+    for value in ("never", " Never ", "NEVER", "off", "0", "false", "no"):
+        monkeypatch.setenv("PUTER_USE_BRING_FORWARD", value)
+        assert capture_params()["bring_forward"] == "never"
+    for value in ("", "when-needed", "always", "1", "on"):
+        monkeypatch.setenv("PUTER_USE_BRING_FORWARD", value)
+        assert capture_params()["bring_forward"] == "when-needed"
+
+
+def test_agent_browser_profile_folder(monkeypatch):
+    """An absolute path in PUTER_USE_BROWSER_PROFILE goes to the helper as it is (the helper standardizes it), and
+    one starting with `~` with the home folder in its place; a relative one is off."""
+    from puter_use.settings import browser_profile, capture_params
+
+    monkeypatch.setenv("PUTER_USE_BROWSER_PROFILE", " /tmp/pu test/firefox/ ")
+    assert browser_profile() == "/tmp/pu test/firefox/"
+    assert capture_params()["browser_profile"] == "/tmp/pu test/firefox/"
+    monkeypatch.setenv("HOME", "/Users/ada")
+    monkeypatch.setenv("PUTER_USE_BROWSER_PROFILE", "~/pu-firefox")
+    assert capture_params()["browser_profile"] == "/Users/ada/pu-firefox"
+    monkeypatch.setenv("PUTER_USE_BROWSER_PROFILE", "pu-firefox")
+    assert "browser_profile" not in capture_params()
+
+
+def test_the_agents_own_firefox_is_listed_apart():
+    res = {"windows": [
+        {"id": 5, "app": "Firefox (agent)", "title": "Dashboard — Mozilla Firefox", "on_screen": True, "yours": True},
+        {"id": 7, "app": "Firefox", "title": "Inbox — Mozilla Firefox", "on_screen": True, "front": True},
+    ]}
+    assert window_list(res).splitlines() == ['Firefox (agent): 5 "Dashboard" (yours)', 'Firefox: 7 "Inbox" (front)']
+
+
 def test_each_read_of_a_batch_comes_under_its_own_label():
     """An act's reads, in batch order: an element's page labelled as screenshot(read=…) is, a region's text whole."""
     res = {"window": {"id": 7, "app": "Probe"}, "done": 3, "total": 3, "reads": [
@@ -451,12 +527,12 @@ def test_an_act_image_of_only_what_changed_says_where_it_is_and_how_to_aim():
             "done": 1, "total": 1, "changed": True}
     crop = {**base, "crop": [112, 56, 336, 168], "change_box": [4, 2, 24, 12], "change_fraction": 0.01}
     assert summarize(crop) == (
-        'Probe #7 "w" · 112x112 (showing only the changed area, window points (112,56)-(336,168): coords are '
+        'Probe #7 "w" · image 112x112 (showing only the changed area, window points (112,56)-(336,168): coords are '
         "this picture's own pixels; screenshot for the whole window) · changed in (4,2)-(24,12)")
     assert cropped((0, 0, 10, 10)).startswith("showing only the changed area, window points (0,0)-(10,10): ")
     assert cropped(None) == cropped([]) == cropped([1, 2, 3]) == cropped({"x": 1}) == ""
     # A whole image: as before. A crop is never trimmed; a zoom is never a crop.
-    assert summarize(base) == 'Probe #7 "w" · 112x112'
+    assert summarize(base) == 'Probe #7 "w" · image 112x112'
     assert "trimmed" not in summarize({**crop, "trimmed": {"left": 150, "right": 148, "bottom": 0}})
     assert "changed area" not in summarize({**crop, "zoom": True})
     # An image kept out of the result has no size to explain.
@@ -485,18 +561,53 @@ def test_a_low_detail_image_says_how_sparse_it_is():
     base = {"window": {"id": 7, "app": "Firefox", "title": "Docs"}, "image": "", "width": 896, "height": 560,
             "done": 1, "total": 1, "changed": True, "change_box": [40, 120, 300, 200], "change_fraction": 0.1}
     low = {**base, "detail": {"level": "low", "scale": 0.62, "text_height": 16.0}}
-    assert summarize(low) == ('Firefox #7 "Docs" · 896x560 · low detail (0.62 px/pt)'
+    assert summarize(low) == ('Firefox #7 "Docs" · image 896x560 · low detail (0.62 px/pt)'
                               " · changed in (40,120)-(300,200)")
-    assert summarize(base) == 'Firefox #7 "Docs" · 896x560 · changed in (40,120)-(300,200)'
+    assert summarize(base) == 'Firefox #7 "Docs" · image 896x560 · changed in (40,120)-(300,200)'
     assert low_detail({"level": "low", "scale": 0.5}) == "low detail (0.5 px/pt)"
     assert low_detail({"level": "low"}) == low_detail({"level": "low", "scale": None}) == "low detail"
     assert low_detail(None) == low_detail({}) == low_detail({"level": "normal", "scale": 0.75}) == ""
     assert "low detail" not in summarize({k: v for k, v in low.items() if k != "image"})
     # A crop at low detail: both.
     both = summarize({**low, "width": 112, "height": 112, "crop": [10, 10, 160, 160]})
-    assert both.startswith('Firefox #7 "Docs" · 112x112 (showing only the changed area, window points '
+    assert both.startswith('Firefox #7 "Docs" · image 112x112 (showing only the changed area, window points '
                            "(10,10)-(160,160): ")
     assert "screenshot for the whole window) · low detail (0.62 px/pt) · changed in" in both
+
+
+def test_an_image_says_its_scale_when_its_window_would_seem_to_change_size():
+    """The size is the image's own pixels (`image WxH`, what coordinates are in). When the helper sends the
+    window's size in points (`window_pt`: the image's scale isn't the last one's of that window), the status
+    line adds the image's pixels a point of that window, so one window at two scales doesn't read as two
+    sizes; a low-detail image says it with its detail. Without it, nothing more."""
+    from puter_use.present import window_scale
+
+    base = {"window": {"id": 7, "app": "Firefox", "title": "Docs"}, "image": "", "width": 922, "height": 756,
+            "scale": 0.64, "done": 1, "total": 1}
+    assert summarize(base) == 'Firefox #7 "Docs" · image 922x756'
+    told = {**base, "window_pt": [1448, 1187]}
+    assert summarize(told) == 'Firefox #7 "Docs" · image 922x756 (0.64 px/pt of a 1448x1187-pt window)'
+    cut = {"left": 150, "right": 148, "bottom": 0}
+    assert summarize({**told, "trimmed": cut}) == (
+        'Firefox #7 "Docs" · image 922x756 (blank sides trimmed, 0.64 px/pt of a 1448x1187-pt window)')
+    low = {**told, "detail": {"level": "low", "scale": 0.64}}
+    assert summarize(low) == 'Firefox #7 "Docs" · image 922x756 · low detail (0.64 px/pt of a 1448x1187-pt window)'
+    assert summarize({**base, "zoom": True}) == 'Firefox #7 "Docs" · zoomed image 922x756 (coords stay in full-window space)'
+    assert window_scale(0.5, [1440, 900]) == "0.5 px/pt of a 1440x900-pt window"
+    assert window_scale(0.5, None) == window_scale(None, [1440, 900]) == window_scale(0.5, [1440]) == ""
+
+
+def test_an_image_that_may_be_old_says_so():
+    """An image of a window its app wasn't drawing (the helper's `stale`) is marked on the status line, before
+    what else is said of it; the note saying why follows. With no image in the result, there's nothing to mark."""
+    note = "Firefox isn't drawing #7 (it's covered and isn't its key window): this picture may be old"
+    res = {"window": {"id": 7, "app": "Firefox", "title": "Docs"}, "image": "", "width": 918, "height": 756,
+           "changed": False, "stale": True, "notes": [note]}
+    assert summarize(res).splitlines() == ['Firefox #7 "Docs" · image 918x756 (may be old) · no visible change',
+                                           f"note: {note}"]
+    cut = {"left": 150, "right": 148, "bottom": 0}
+    assert summarize({**res, "trimmed": cut}).startswith('Firefox #7 "Docs" · image 918x756 (may be old, blank sides trimmed)')
+    assert "may be old)" not in summarize({k: v for k, v in res.items() if k != "image"})
 
 
 def test_an_mcp_result_of_a_crop_has_its_image_and_note(monkeypatch):

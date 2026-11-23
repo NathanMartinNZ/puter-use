@@ -157,11 +157,36 @@ enum AX {
     @MainActor static func bringOnScreen(pid: pid_t, wid: CGWindowID) -> CGRect? {
         guard let win = window(pid: pid, wid: wid), let f = frame(win),
               (value(win, kAXSubroleAttribute) as? String) == "AXStandardWindow" else { return nil }
-        let top = NSScreen.screens.first?.frame.height ?? 0  // global points are measured down from its top
-        let screens = NSScreen.screens.map { s in
+        guard let to = onScreen(f, screens: visibleScreens()) else { return nil }
+        var size = to.size, origin = to.origin
+        if size != f.size, let v = AXValueCreate(.cgSize, &size) { write(win, kAXSizeAttribute, v) }
+        if let v = AXValueCreate(.cgPoint, &origin) { write(win, kAXPositionAttribute, v) }
+        guard let now = frame(win), now != f else { return nil }
+        return now
+    }
+
+    /// The visible area of each screen (without the menu bar and the Dock), in global points measured down from the
+    /// top of the first, as windows' frames are.
+    @MainActor static func visibleScreens() -> [CGRect] {
+        let top = NSScreen.screens.first?.frame.height ?? 0
+        return NSScreen.screens.map { s in
             CGRect(x: s.visibleFrame.minX, y: top - s.visibleFrame.maxY, width: s.visibleFrame.width, height: s.visibleFrame.height)
         }
-        guard let to = onScreen(f, screens: screens) else { return nil }
+    }
+
+    /// Of `screens`, the one most of `f` is on (the first if it's on none).
+    nonisolated static func screen(of f: CGRect, _ screens: [CGRect]) -> CGRect? {
+        func area(_ r: CGRect) -> CGFloat { r.isNull ? 0 : r.width * r.height }
+        let shown = screens.map { area(f.intersection($0)) }
+        guard let best = shown.indices.max(by: { shown[$0] < shown[$1] }) else { return nil }
+        return shown[best] > 0 ? screens[best] : screens[0]
+    }
+
+    /// Move a window the agent just opened to frame `to` (resized first, if it's another size and can be). Its frame
+    /// then, or nil if it isn't a document window or didn't move. Only for the agent's own new windows.
+    @MainActor static func place(pid: pid_t, wid: CGWindowID, at to: CGRect) -> CGRect? {
+        guard let win = window(pid: pid, wid: wid), let f = frame(win),
+              (value(win, kAXSubroleAttribute) as? String) == "AXStandardWindow" else { return nil }
         var size = to.size, origin = to.origin
         if size != f.size, let v = AXValueCreate(.cgSize, &size) { write(win, kAXSizeAttribute, v) }
         if let v = AXValueCreate(.cgPoint, &origin) { write(win, kAXPositionAttribute, v) }

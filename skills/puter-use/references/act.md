@@ -71,7 +71,10 @@ opens a new window moves the batch to it, and says so.
 **What it prints.** With `--screenshot auto` (the default) an image only if the window changed, also
 after a failed action or a stop for the user's OK; `never`, just the status line; `always`, an image
 every time. A batch of only `read` and `clipboard` actions prints just their text. An image may leave
-out a page's blank margins (`654x755 (blank sides trimmed)`): coordinates are still its pixels. A
+out a page's blank margins (`image 654x755 (blank sides trimmed)`): coordinates are still its pixels.
+`(may be old)` after the size means the window's app (mainly a browser) wasn't drawing it while it was
+out of view (the note says why). A
 change only in a spinner or clock that keeps moving by itself isn't a change. The status line
 adds where you are when it changes: `url:` (a browser's page), `focus:` (role and label, never a
 value), `selected:` (the selected text and its length) and `scroll:` (`45% down`, `bottom`, …).
+The window's title is followed by whose it is: `(yours)`, `(yours, used by the user)` or `(the user's)`.

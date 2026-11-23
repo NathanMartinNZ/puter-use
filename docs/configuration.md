@@ -21,6 +21,8 @@ for the CLI, in your shell.
 | `PUTER_USE_CURSOR_SPEED` | `1` | pointer pace: `2` = twice as fast, `0` = jump instantly |
 | `PUTER_USE_TYPING_WPM` | `280` | typing speed, with a human rhythm; `0` = as fast as possible |
 | `PUTER_USE_PASTE_OVER` | `80` | text longer than this many characters (per line) is pasted instead of typed, and so is an address in a browser's address bar; `0` = always type |
+| `PUTER_USE_BROWSER_PROFILE` | unset | `agent`: `navigate` uses a Firefox of the agent's own, on a puter-use profile, instead of yours; an absolute path: the same, on that profile folder (see [The agent's own Firefox](#the-agents-own-firefox)) |
+| `PUTER_USE_BRING_FORWARD` | `when-needed` | `never`: puter-use never brings an app forward by itself. By default, when one of the agent's own windows has stopped drawing while covered and you've left the keyboard and mouse alone for 3 s, its app comes forward for a moment until the window draws again, then the app you were in comes back. That gives one fresh look: covered again, the window may stop drawing again; starting Firefox with `MOZ_WINDOW_OCCLUSION=0` fixes it for good (see [Keeping your Firefox's covered windows drawn](#keeping-your-firefoxs-covered-windows-drawn)) |
 | `PUTER_USE_SESSION` | `mcp-<pid>` / `default` | the session requests belong to (see [Sessions](tools.md#sessions)) |
 | `PUTER_USE_APP_CARDS` | `1` | `0` turns off the line about an app on the first look at it |
 | `PUTER_USE_OUTLINE_CHARS` | `8000` | longest accessibility outline sent (500-40000) |
@@ -32,6 +34,100 @@ for the CLI, in your shell.
 | `PUTER_USE_IMAGE_META` | `0` | `1`: each image in an MCP result says which window it shows and which earlier ones it supersedes |
 | `PUTER_USE_IMAGE_DELIVERY` | `inline` | `hybrid`: an `act` image of an edit checked by accessibility is saved to a file instead |
 | `PUTER_USE_OMIT_VERIFIED` | `0` | `1`: an `act` image of an edit checked by accessibility is left out |
+
+## The agent's own Firefox
+
+With `PUTER_USE_BROWSER_PROFILE=agent`, a `navigate` with no `window` (unless the agent's current window is
+another browser's), or with `window: "Firefox"`, goes to a second Firefox that puter-use starts in the
+background on a profile of its own, `~/Library/Application Support/puter-use/firefox`, instead of your
+Firefox or your default browser. It needs Firefox installed. Off by default. The CLI and code mode use it
+too when the variable is set in their shell.
+
+What it changes:
+- Your Firefox's windows, tabs and keyboard are left alone. The agent's keys never wait for your window to
+  let go of Firefox's keyboard: its instance has a keyboard of its own.
+- Its windows keep drawing while covered (it's started with `MOZ_WINDOW_OCCLUSION=0`, which reaches only
+  that process), so their pictures stay current and their pages readable. Minimized ones still stop.
+  (Your own Firefox can do the same: see [Keeping your Firefox's covered windows
+  drawn](#keeping-your-firefoxs-covered-windows-drawn).)
+- It has none of your saved logins, cards, history or extensions. The `user.js` puter-use writes there on
+  each start turns off autofill and password saving, first-run pages, New Tab tiles and stories, the
+  translation pop-up, session restore and the default-browser prompt, and opens links from other apps in a
+  window of their own.
+
+What it costs:
+- Sites the agent has to be signed in to need you to sign in there once (the profile keeps it, as any does).
+- A second Firefox icon in the Dock while it runs.
+- What macOS keeps per app is shared with your Firefox, such as camera and microphone permission.
+
+`windows` and replies call it `Firefox (agent)`, and that name works as a `window`. A window id still
+reaches any window, your Firefox's too. As anywhere, only the windows the agent opened there are its own:
+a link you open can land there when your Firefox isn't running, in a window of its own, and that window is
+yours. puter-use quits it after 30 minutes with no agent using it, and when the helper quits, but never
+while it has a window the agent didn't open.
+
+**Another profile folder.** `PUTER_USE_BROWSER_PROFILE` can also be an absolute path to a folder (a
+leading `~` is expanded): the agent's Firefox then runs on that profile instead, for tests or to keep it
+somewhere else. puter-use writes its `user.js` into the profile, so it uses only a folder that's new,
+empty or one it set up before, never a profile of yours: it says so instead of starting. Nor does it
+start on a profile another Firefox is using (one whose command line names that folder, or one holding
+its lock, as your Firefox holds its own profile's): it says which one, rather than leave Firefox to
+complain that it's already running. While the agent's Firefox runs on one folder, a `navigate` that
+asks for another says so; the other is used once it has quit.
+
+## Keeping your Firefox's covered windows drawn
+
+Firefox stops drawing a window that gets fully covered while it isn't Firefox's key window, and drops
+its page's accessibility tree, until part of it shows again. When that happens to one of the agent's
+own windows while you've left the keyboard and mouse alone for 3 seconds, puter-use brings Firefox
+forward for a moment, until the window draws again (usually well under a second), then brings back the
+app you were in. If you touch the keyboard or mouse meanwhile, your app comes back at once. Never while
+you're in Firefox or a full-screen app, never onto another Space, and at most once a window every 30
+seconds; the window may stay above other apps' windows that covered it, below the one you were in.
+That gives the agent one fresh look, not a lasting fix: once the window is covered again it may stop
+drawing again. The lasting fix is starting Firefox with `MOZ_WINDOW_OCCLUSION=0`, as below.
+`PUTER_USE_BRING_FORWARD=never` turns that off. With it off, or when it can't (you're busy, say), puter-use
+tells the agent the window isn't drawn (see "Windows that aren't being drawn" in [Tools](tools.md)): the agent then has
+to ask you to bring it into view, and it's told you can stop this as below.
+
+Your own Firefox keeps drawing its covered windows, so none of that happens, when it's started with the
+environment variable `MOZ_WINDOW_OCCLUSION=0`.
+
+1. Quit Firefox.
+2. In Terminal, run `launchctl setenv MOZ_WINDOW_OCCLUSION 0`.
+3. Start Firefox again (from the Dock, Spotlight or Finder).
+
+That lasts until you log out or restart. To keep it, have a LaunchAgent run the same command at each
+login: save this as `~/Library/LaunchAgents/local.moz-window-occlusion.plist`.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.moz-window-occlusion</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/launchctl</string>
+        <string>setenv</string>
+        <string>MOZ_WINDOW_OCCLUSION</string>
+        <string>0</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+```
+
+It runs from your next login on. If Firefox reopens at login before it has run, quit Firefox and start
+it again. `launchctl getenv MOZ_WINDOW_OCCLUSION` prints `0` while it's set. To undo it, delete the
+file, run `launchctl unsetenv MOZ_WINDOW_OCCLUSION` and restart Firefox.
+
+What it costs: Firefox keeps drawing its covered windows, so it uses a little more CPU and battery.
+Minimized windows still pause, as before. puter-use reads the variable from each Firefox process, so a
+covered window of one started with it never counts as not drawn. Browsers built on Firefox (Zen,
+LibreWolf, …) read the same variable. The agent's own Firefox is always started with it.
 
 ## Leaner MCP profiles
 

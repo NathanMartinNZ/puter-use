@@ -378,7 +378,7 @@ def test_mcp_failed_first_look_keeps_its_image(monkeypatch):
     out = asyncio.run(m.act([m.Action(type="click", target="No such button")]))
     assert out.is_error is True
     assert [c.type for c in out.content] == ["image", "text"]
-    assert "App #7 \"w\" · 40x30 · ran 0/1 actions" in out.content[1].text
+    assert "App #7 \"w\" · image 40x30 · ran 0/1 actions" in out.content[1].text
     assert 'error: action 1 (click): nothing shows "No such button"' in out.content[1].text
 
 

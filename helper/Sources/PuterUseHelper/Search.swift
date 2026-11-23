@@ -10,6 +10,7 @@ extension AX {
         let frame: CGRect?
         let exact: Bool  // the whole label equals the query
         var offScreen = false  // outside its window (scrolled out of view): found by an off-screen search
+        var inPage = false  // in a web page (an AXWebArea, or that itself), not the browser's own controls around it
     }
 
     /// Role names an agent might use for the outline's names.
@@ -31,9 +32,10 @@ extension AX {
 
     /// Visible elements whose label or value contains `query` (case-insensitive; "" matches any), optionally
     /// of one `role`, in reading order. `windows` limits the search; nil = all the app's on-screen windows.
+    /// `pageOnly`: only those in a web page (`Match.inPage`).
     static func search(pid: pid_t, windows wids: Set<CGWindowID>? = nil, query: String, role: String? = nil,
-                       limit: Int = 50, budget: TimeInterval = 1.5) -> [Match] {
-        searchAll(pid: pid, windows: wids, query: query, role: role, limit: limit, budget: budget).matches
+                       limit: Int = 50, budget: TimeInterval = 1.5, pageOnly: Bool = false) -> [Match] {
+        searchAll(pid: pid, windows: wids, query: query, role: role, limit: limit, budget: budget, pageOnly: pageOnly).matches
     }
 
     /// `search`, and whether it looked at everything (not when it ran out of time or reached `limit`).
@@ -42,7 +44,7 @@ extension AX {
     /// the elements on the way that don't show the text but are near it (see `Near`).
     static func searchAll(pid: pid_t, windows wids: Set<CGWindowID>? = nil, query: String, role: String? = nil,
                           limit: Int = 50, budget: TimeInterval = 1.5, offScreen: Bool = false,
-                          near: Near? = nil) -> (matches: [Match], complete: Bool) {
+                          near: Near? = nil, pageOnly: Bool = false) -> (matches: [Match], complete: Bool) {
         guard let wins = value(appElement(pid), kAXWindowsAttribute) as? [AXUIElement] else { return ([], true) }
         var roots: [(AXUIElement, CGRect)] = []
         for win in wins {
@@ -52,27 +54,29 @@ extension AX {
             roots.append((win, wf))
         }
         return search(in: roots, menus: menuWindows(pid), query: query, role: role, limit: limit, budget: budget,
-                      offScreen: offScreen, near: near)
+                      offScreen: offScreen, near: near, pageOnly: pageOnly)
     }
 
     /// `searchAll` over window elements `roots` (with their frames), the app's open menus at `menus`.
     /// `now` and `read` are there for tests.
     static func search(in roots: [(AXUIElement, CGRect)], menus: [CGRect], query: String, role: String?, limit: Int,
-                       budget: TimeInterval, offScreen: Bool, near: Near? = nil, now: () -> TimeInterval = uptime,
+                       budget: TimeInterval, offScreen: Bool, near: Near? = nil, pageOnly: Bool = false,
+                       now: () -> TimeInterval = uptime,
                        read: (AXUIElement) -> [AnyObject]? = readAttrs) -> (matches: [Match], complete: Bool) {
         let end = now() + budget
-        let q = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        // Curly quotes, dashes and no-break spaces are their plain marks on both sides (`fold1`): "we've" finds "we’ve".
+        let q = fold1(query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))
         // A label that's the query but for case, spacing and "..." vs "…" (`menuKey`) is the same label: a whole-
-        // label match. (Only short texts can be: no long value is normalised.) `low`: a text in lower case.
+        // label match. (Only short texts can be: no long value is normalised.) `low`: a text in lower case, folded.
         let key = menuKey(query), most = key.utf16.count * 3 + 20
         func same(_ low: String) -> Bool { low.utf16.count <= most && (ownKey(low) ? low : menuKey(low)) == key }
         func shows(_ s: String) -> Bool {
             if q.isEmpty { return !s.isEmpty }
-            let low = s.lowercased()
+            let low = fold1(s.lowercased())
             return low.contains(q) || same(low)
         }
         func whole(_ s: String) -> Bool {
-            let low = s.lowercased()
+            let low = fold1(s.lowercased())
             return low.trimmingCharacters(in: .whitespaces) == q || same(low)
         }
         let wantRole = role.map(roleKey)
@@ -84,8 +88,8 @@ extension AX {
             // `outside`: something it's in is outside the window (`search` skips all of that). `view`: the part of the
             // screen it can be seen in, its window clipped to the scroll areas and web pages it's in (as `AX.sight`
             // says); `hidden`: something it's in is scrolled out of that view though inside the window (a list's rows
-            // above its visible part): found by `search`, but tagged off screen.
-            func walk(_ el: AXUIElement, depth: Int, outside: Bool, view: CGRect = wf, hidden: Bool = false) {
+            // above its visible part): found by `search`, but tagged off screen. `page`: something it's in is a web page.
+            func walk(_ el: AXUIElement, depth: Int, outside: Bool, view: CGRect = wf, hidden: Bool = false, page: Bool = false) {
                 guard depth < 60, !cut else { return }
                 if out.count >= limit || now() >= end { cut = true; return }
                 guard let vals = read(el) else { return }
@@ -109,6 +113,7 @@ extension AX {
                 }
                 if r == "AXMenu", !menuOpen(rect, menus) { return }  // a pop-up's menu, closed
                 let subrole = vals[1] as? String
+                let inPage = page || r == "AXWebArea"
                 var name = roleNames[r] ?? String(r.dropFirst(2)).lowercased()
                 if subrole == "AXSearchField" { name = "search" }
                 if subrole == "AXSecureTextField" { name = "password" }
@@ -126,9 +131,9 @@ extension AX {
                 texts += subrole == "AXSecureTextField" ? [] : [vals[4] as? String].compactMap { $0 }
                 if r != "AXWindow", !name.isEmpty, wantRole == nil || roleKey(name) == wantRole,
                    let hit = texts.first(where: shows) ?? (q.isEmpty && wantRole != nil ? "" : nil) {
-                    if away == offScreen {
+                    if away == offScreen, inPage || !pageOnly {
                         out.append(Match(element: el, role: name, label: hit, frame: rect,
-                                         exact: whole(hit), offScreen: offScreen || clipped))
+                                         exact: whole(hit), offScreen: offScreen || clipped, inPage: inPage))
                     }
                     if leaves.contains(r) { return }  // its own text children would only repeat it
                 } else if let near, r != "AXWindow", !name.isEmpty {
@@ -136,7 +141,9 @@ extension AX {
                 }
                 var inner = view
                 if r == "AXScrollArea" || r == "AXWebArea", let rr = rect, rr.width > 0, rr.height > 0 { inner = view.intersection(rr) }
-                for k in vals[5] as? [AXUIElement] ?? [] { walk(k, depth: depth + 1, outside: away, view: inner, hidden: clipped) }
+                for k in vals[5] as? [AXUIElement] ?? [] {
+                    walk(k, depth: depth + 1, outside: away, view: inner, hidden: clipped, page: inPage)
+                }
             }
             walk(win, depth: 0, outside: false)
         }

@@ -251,9 +251,48 @@ extension AX {
         path.indices.map { shownTitle(Array(path[...$0])) }.joined(separator: " > ")
     }
 
-    /// Normalised for matching: case, "..." vs "…", and spacing don't matter. (Menu items, and targets' labels.)
+    /// Normalised for matching: case, "..." vs "…", typographic marks vs plain ones (`fold1`: "Don’t Save" is
+    /// "don't save"), and spacing don't matter. (Menu items, and targets' labels.)
     static func menuKey(_ s: String) -> String {
-        s.lowercased().replacingOccurrences(of: "...", with: "…").split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        fold1(s.lowercased()).replacingOccurrences(of: "...", with: "…").split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+    }
+
+    /// `s` with typographic marks as the plain ones typed for them: curly single quotes and the prime as ', curly
+    /// double quotes and the double prime as ", the dashes and the minus sign as -, and the no-break, narrow
+    /// no-break, thin and figure spaces as a space. So a search for "we've" finds a page's "we’ve". One for one,
+    /// each a single UTF-16 unit both ways (and characters stay whole), so a match's range and offsets in the
+    /// result are the same in `s` (`unfolded`).
+    static func fold1(_ s: String) -> String {
+        // Each of those marks starts with byte C2 or E2 in UTF-8: a string with neither (plain ASCII, most of
+        // what's searched, and wait_for asks of every element it polls) is given back as it is.
+        guard s.utf8.contains(where: { $0 == 0xE2 || $0 == 0xC2 }) else { return s }
+        var changed = false
+        let units = s.utf16.map { u -> UInt16 in
+            guard let plain = plainMark(u) else { return u }
+            changed = true
+            return plain
+        }
+        return changed ? String(decoding: units, as: UTF16.self) : s
+    }
+
+    /// The plain mark `fold1` gives for UTF-16 unit `u`, if it's one it folds.
+    private static func plainMark(_ u: UInt16) -> UInt16? {
+        switch u {
+        case 0x2018, 0x2019, 0x201A, 0x201B, 0x2032: return 0x27  // ‘ ’ ‚ ‛ ′
+        case 0x201C, 0x201D, 0x201E, 0x201F, 0x2033: return 0x22  // “ ” „ ‟ ″
+        case 0x2010...0x2015, 0x2212: return 0x2D  // ‐ ‑ ‒ – — ― −
+        case 0x00A0, 0x202F, 0x2009, 0x2007: return 0x20  // no-break, narrow no-break, thin, figure spaces
+        default: return nil
+        }
+    }
+
+    /// Range `r` of `fold1(s)` (`folded`) as a range of `s`: the same place, as folding moves no UTF-16 unit.
+    static func unfolded(_ r: Range<String.Index>, of folded: String, in s: String) -> Range<String.Index> {
+        func back(_ i: String.Index) -> String.Index {
+            s.utf16.index(s.startIndex, offsetBy: folded.utf16.distance(from: folded.startIndex, to: i))
+        }
+        return back(r.lowerBound)..<back(r.upperBound)
     }
 
     /// Whether lower-case `s` is its own `menuKey` for sure (plain ASCII, no dots, single spaces between words):

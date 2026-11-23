@@ -48,27 +48,32 @@ extension Handlers {
     /// one for one), then how many more there are and the offset to search on from. With none, one line
     /// saying so (`whose`: whose characters were searched, e.g. "the clipboard's "). At most `limit`
     /// characters in all. `count`: the matches from `start` on (counting stops at `queryCount`). Offsets count
-    /// characters, as pages do, so a read from one starts at its match.
+    /// characters, as pages do, so a read from one starts at its match. Curly quotes, dashes and no-break spaces
+    /// match their plain marks ("we've" finds "we’ve"), and the lines show the text as it is.
     nonisolated static func textMatches(_ s: String, query: String, from start: Int, limit: Int,
                                         in whose: String = "") -> (text: String, count: Int) {
         let start = max(0, start)
         var lines: [String] = [], count = 0, used = 0, full = false, next = start
-        if !query.isEmpty, var i = s.index(s.startIndex, offsetBy: start, limitedBy: s.endIndex) {
+        // Searched folded (`AX.fold1`), one for one: its characters, and so the offsets, are those of `s`.
+        let f = AX.fold1(s), q = AX.fold1(query)
+        if !query.isEmpty, var i = f.index(f.startIndex, offsetBy: start, limitedBy: f.endIndex) {
             var at = start  // the offset of `i`
             let room = limit - 50  // for the lines, leaving room to say how many more
-            while count < queryCount, let r = s.range(of: query, options: .caseInsensitive, range: i..<s.endIndex) {
-                guard let lo = String.Index(r.lowerBound, within: s), let hi = String.Index(r.upperBound, within: s),
+            while count < queryCount, let r = f.range(of: q, options: .caseInsensitive, range: i..<f.endIndex) {
+                guard let lo = String.Index(r.lowerBound, within: f), let hi = String.Index(r.upperBound, within: f),
                       lo < hi else {
-                    let on = s.index(after: r.lowerBound)  // part of a character (an accent, a skin tone): search on past it
-                    at += s.distance(from: i, to: on)
+                    let on = f.index(after: r.lowerBound)  // part of a character (an accent, a skin tone): search on past it
+                    at += f.distance(from: i, to: on)
                     i = on
                     continue
                 }
-                at += s.distance(from: i, to: lo)
-                let end = at + s.distance(from: lo, to: hi)
+                at += f.distance(from: i, to: lo)
+                let end = at + f.distance(from: lo, to: hi)
                 count += 1
                 if !full && lines.count < queryShown {
-                    let line = "@\(at): " + snippet(s, lo, hi), adds = (lines.isEmpty ? 0 : 1) + line.count
+                    let shown = AX.unfolded(lo..<hi, of: f, in: s)  // the text as it is
+                    let line = "@\(at): " + snippet(s, shown.lowerBound, shown.upperBound)
+                    let adds = (lines.isEmpty ? 0 : 1) + line.count
                     if lines.isEmpty || used + adds <= room {
                         lines.append(line)
                         used += adds

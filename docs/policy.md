@@ -50,5 +50,15 @@ replay asks again; `confirm: true` on the macro action (`macro NAME --confirm`) 
 replay makes. A `fill` checks its fields and submit button before filling anything in, and its
 `confirm` covers its own clicks.
 
+Undoing the agent's own toggle doesn't ask: "Remove from saved" on the very button it pressed as
+"Save" in the last 10 minutes, when that press added or saved something and didn't ask, the button is
+still called what the press made it, "remove" is its only confirm word, and the two labels are one
+toggle's ("Add to cart" and "Remove from cart", "Add" and "Remove"). A note says so. Never for any
+other word, or a control that became something else ("Continue", then "Place order").
+
+A `target` found by reading the screen (no accessibility element shows it, as on a page whose tree
+isn't built yet) is judged by the whole line of text it was found in: a click on "account" in
+"Delete account" asks.
+
 This is a safety net, not a guarantee. It looks at labels, so an unlabelled icon, or a key an app
 handles without a menu command or button (the Delete key in a list, say), isn't caught.

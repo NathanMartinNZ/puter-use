@@ -25,6 +25,13 @@ final class Connection: @unchecked Sendable {  // only touched on the main threa
     let reports: Bool  // the client reports done/lost; else a reply written counts as delivered
     var work = Work()  // what it has done so far, for a note if its result never reaches the agent
     var windowNote: (text: String, pair: [CGWindowID])?  // the app name it passed meant a window other than the front one
+    // The agent's windows that changed hands or look since it last used them, its own Firefox started for it or
+    // given a window (`Handlers.agentBrowserTarget`), and an app brought forward to redraw one of its windows
+    // (`Handlers.revive`): said with the reply, an error's too.
+    var ownerNotes: [String] = []
+    var reviewed = Set<pid_t>()  // apps whose agent windows it has looked at for that (`Handlers.reviewOwnership`)
+    var changeReviewed = Set<CGWindowID>()  // the agent's windows it's about, looked at for another site or tab count (`Handlers.reviewChange`)
+    var bringForward = true  // its app may be brought forward to redraw one of the agent's windows (`Handlers.revive`)
     private var gone = false
 
     init(fd: Int32, key: RequestKey?, reports: Bool = true) {

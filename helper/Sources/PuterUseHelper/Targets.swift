@@ -192,16 +192,21 @@ extension Handlers {
     }
 
     /// Where `v`'s text is on screen, read off the pixels: for apps without an accessibility tree. Nothing there
-    /// showing it (and it wasn't in a menu just closed) is `Missing`.
-    static func readOffScreen(_ v: Any, _ t: Target) async throws -> CGPoint {
+    /// showing it (and it wasn't in a menu just closed) is `Missing`. With the whole line it was read in (`line`):
+    /// what a press there is judged by, with no element to ask (`Policy.checkReadPress`).
+    static func readOffScreen(_ v: Any, _ t: Target) async throws -> (point: CGPoint, line: String) {
         let sp = try spec(v)
         func nothing(_ text: String) -> Error {
             if let hint = menuHint(sp, t) { return HelperError(hint) }
             return Missing(description: text)
         }
         // The screen shows text, not what kind of element it is.
-        if sp.role != nil { throw nothing("nothing shows \(sp.description) in the window") }
-        let hits = try await ocrFind(sp.text, t)
+        if sp.role != nil {
+            do { try await checkDrawn(t) } catch let e as NotDrawn { throw e.missing(sp.description) }
+            throw nothing("nothing shows \(sp.description) in the window")
+        }
+        let hits: [OCR.Hit]
+        do { hits = try await ocrFind(sp.text, t) } catch let e as NotDrawn { throw e.missing(sp.description) }
         var pick = hits.filter(\.exact)
         if pick.isEmpty { pick = hits }
         if let nth = sp.nth, nth >= 1, nth <= pick.count { pick = [pick[nth - 1]] }
@@ -215,7 +220,7 @@ extension Handlers {
         }
         notes.append("\(sp.description) found by reading the screen (no accessibility element)")
         TargetLookup.current?.found = true
-        return CGPoint(x: pick[0].rect.midX, y: pick[0].rect.midY)
+        return (CGPoint(x: pick[0].rect.midX, y: pick[0].rect.midY), pick[0].line)
     }
 
     /// For text that isn't there but was in a menu of this window closed in this call or the last one: say
@@ -244,12 +249,14 @@ extension Handlers {
 
     /// The window as `ocrFind` reads it (one picture can be read for several texts).
     /// For apps with no accessibility tree. One that had a tree and has none now isn't answering (the
-    /// screen is locked, say): reading pixels instead would find text where controls used to be.
+    /// screen is locked, say): reading pixels instead would find text where controls used to be. Nor one its app
+    /// isn't drawing (`NotDrawn`): its picture shows what was there before.
     static func ocrShot(_ t: Target) async throws -> Shot {
         if Windows.screenLocked { throw HelperError("the screen is locked, so the window can't be read: wait until the user unlocks it") }
         if case .window(let w) = t, AX.registries[w.id].map({ !$0.nodes.isEmpty }) == true, AX.window(pid: w.pid, wid: w.id) == nil {
             throw HelperError("the window's accessibility isn't answering just now (it was before): try again in a moment")
         }
+        try await checkDrawn(t)
         return try await sharpShot(t, region: nil)
     }
 
@@ -349,17 +356,30 @@ extension Handlers {
         hits += narrowed(hits.contains(where: \.exact) ? away.filter(\.exact) : away, sp).prefix(cap - hits.count)
         // A whole label off screen comes before ones shown that only contain the text: those go under "partial matches".
         if hits.contains(where: \.exact) { hits = hits.filter(\.exact) }
-        var lines = hits.map { describe($0, id: number($0, w.id), t) }
         // A target takes whole-label matches when there are any, but find also shows a few that contain the text
         // ("Sign in" is also in "Sign in with Google"), controls first.
+        var more: [AX.Match] = []
         if hits.contains(where: \.exact), partials > 0 {
             let rest = (all + away).filter { m in !m.exact && !hits.contains { CFEqual($0.element, m.element) } }
-            let more = (sp.role == nil ? rest.filter { $0.role != "text" } + rest.filter { $0.role == "text" } : rest).prefix(partials)
-            if !more.isEmpty {
-                lines.append("partial matches (target one by its whole text or number):")
-                lines += more.map { describe($0, id: number($0, w.id), t) }
-            }
+            more = Array((sp.role == nil ? rest.filter { $0.role != "text" } + rest.filter { $0.role == "text" } : rest).prefix(partials))
         }
+        // A browser window its app isn't drawing has no page to read, but its tabs and toolbar carry the page's title:
+        // what's found only there is listed, marked as not in the page, and why the page doesn't show it is said.
+        var frozen = !hits.isEmpty && (hits + more).allSatisfy({ chromeOnly($0, w) }) ? try await frozenNow(t, tree: true) : nil
+        if var f = frozen {
+            if await revive(w, &f) { throw Redrawn() }  // drawn again: looked for again (`find`)
+            frozen = f
+            meta[w.id]?.frozen = f
+        }
+        func line(_ m: AX.Match) -> String {
+            describe(m, id: number(m, w.id), t) + (frozen != nil ? " (\(w.app)'s own, not in the page)" : "")
+        }
+        var lines = hits.map(line)
+        if !more.isEmpty {
+            lines.append("partial matches (target one by its whole text or number):")
+            lines += more.map(line)
+        }
+        if let frozen { lines.append("(nothing in the page: \(NotDrawn(frozen: frozen, app: w.app, wid: w.id)))") }
         if hits.isEmpty, sp.role == nil {
             let seen = try await screen(q)
             lines = screenLines(Array(seen.prefix(cap))) { toPixels(t, $0) }
@@ -406,16 +426,30 @@ extension Handlers {
         }
         // A picture to give what's found its place in pixels (at (x,y)): never shown, so an act's first look
         // still shows the window (`startLook`).
-        if meta[t.key] == nil, let shot = try? await plan(t, region: nil, Opts(p)).run() {
-            remember(t, shot, Signature(shot.image), shown: false)
+        if meta[t.key] == nil, case let o = Opts(p), let shot = try? await plan(t, region: nil, o).run() {
+            remember(t, shot, Signature(shot.image), shown: false, sizing: o.sizing)
         }
         let cap = findCap(count: max(queries.count, 1), limit: p["limit"])
+        // Nothing found in a window its app isn't drawing (asked before its picture is read, `ocrShot`, or here for a
+        // role, which isn't read off it): the find fails saying so, as looking again won't change it. Unless its app
+        // was brought forward to draw it again (`Redrawn`): then it's looked for again, once.
+        func lines(_ sp: Spec, partials: Int, deadline: TimeInterval, screen: (String) async throws -> [OCR.Hit]) async throws
+            -> (lines: [String], similar: [String], complete: Bool) {
+            func look() async throws -> (lines: [String], similar: [String], complete: Bool) {
+                let found = try await findLines(sp, w, t, cap: cap, partials: partials, deadline: deadline, screen: screen)
+                if found.lines.isEmpty, sp.role != nil { try await checkDrawn(t) }
+                return found
+            }
+            do {
+                do { return try await look() } catch is Redrawn { return try await look() }
+            } catch let e as NotDrawn { throw e.missing(sp.description) }
+        }
         let text: String
         if queries.isEmpty, let role {
             text = roleLines(role, w, t, cap: cap).joined(separator: "\n")
         } else if queries.count == 1 {
             let sp = Spec(text: queries[0], role: role)
-            let found = try await findLines(sp, w, t, cap: cap, partials: 5, deadline: .infinity) { try await ocrFind($0, t) }
+            let found = try await lines(sp, partials: 5, deadline: .infinity) { try await ocrFind($0, t) }
             text = findText(sp.description, lines: found.lines, similar: found.similar, complete: found.complete)
         } else {
             var picture: Shot?  // for text read off the screen: one, for all of them
@@ -431,7 +465,7 @@ extension Handlers {
                     parts.append("(\(sp.description) wasn't looked for: the others took the time; find it on its own)")
                     continue
                 }
-                let found = try await findLines(sp, w, t, cap: cap, partials: min(2, cap), deadline: deadline, screen: screen)
+                let found = try await lines(sp, partials: min(2, cap), deadline: deadline, screen: screen)
                 parts += findSection(sp.description, lines: found.lines, similar: found.similar, complete: found.complete)
             }
             text = parts.joined(separator: "\n")

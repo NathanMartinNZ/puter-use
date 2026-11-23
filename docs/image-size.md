@@ -46,7 +46,7 @@ what a session's images and text actually cost, under each vendor's formula, tur
   912. The status line gives the part's place in the window, in points:
 
   ```
-  Probe #7 "w" · 112x112 (showing only the changed area, window points (0,0)-(151,151): coords are this picture's own pixels; screenshot for the whole window) · changed in (11,33)-(40,45)
+  Probe #7 "w" · image 112x112 (showing only the changed area, window points (0,0)-(151,151): coords are this picture's own pixels; screenshot for the whole window) · changed in (11,33)-(40,45)
   ```
 
   Coordinates, and the `changed in` box, are that image's own pixels: the helper maps them back to the
@@ -68,8 +68,8 @@ what a session's images and text actually cost, under each vendor's formula, tur
   smaller). It never goes below 0.5 px/pt, nor sharper than usual. Where the text's height isn't known
   (the screen, or an app whose accessibility tree isn't on yet), it uses 0.65 px/pt. A 1440×900 pt
   window with 13 pt text comes out at 896×560 (640 tokens) instead of 1064×665 (912). The status line
-  says `low detail (0.62 px/pt)`, and coordinates are that image's own pixels. A zoom keeps its own
-  scale.
+  says `low detail (0.62 px/pt)` (`of a 1440x900-pt window` too, right after an image at the usual
+  detail), and coordinates are that image's own pixels. A zoom keeps its own scale.
 - **Reading values.** `screenshot(region=…, image=false)` returns the accessibility text in that box,
   one line per visual line, e.g. `380 points by hn_acker 7 hours ago | hide | 165 comments`. It's
   exact and costs a few dozen tokens. A text area in the box gives only the lines it shows there, and
@@ -79,8 +79,10 @@ what a session's images and text actually cost, under each vendor's formula, tur
   Bigger ones taper to 1.5 px/pt by 400×250 pt, which still draws 8 pt text 12 px tall, and a large
   one is brought down toward about 600 tokens, never below 1.4 px/pt. A 296×185 px region of a
   1440×900 pt window comes back at 582×364 (273 tokens; it was 761×476).
-- **Coordinates.** The agent clicks in the screenshot's own pixels, and the helper maps them back to
-  screen points.
+- **Coordinates.** The agent clicks in the screenshot's own pixels (the status line's `image 1064x665`),
+  and the helper maps them back to screen points. An image of a window at another scale than the last
+  one the agent was shown adds the window's size, so the window doesn't seem to change size:
+  `image 922x756 (0.64 px/pt of a 1448x1187-pt window)`. `windows` gives sizes in points.
 - **Fewer images.** An `act` sends no image when nothing visibly changed, and neither a blinking text
   cursor nor something that keeps moving by itself (a spinner, a clock) counts as a change (see
   [Tools](tools.md)). Opt-in, for the MCP server: `PUTER_USE_OMIT_VERIFIED=1` leaves out the image of

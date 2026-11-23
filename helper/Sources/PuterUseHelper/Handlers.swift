@@ -41,6 +41,14 @@ struct Meta {
     var crops = 0
     // Where the capture was (global points): a window moved or resized since gets a whole picture (`ChangeCrop`).
     var captured: CGRect? = nil
+    // How it was sized: a capture made the same way gives the same pixels while the window doesn't change.
+    var sizing: Sizing? = nil
+    // The window's title as the picture shows it: its title then, or, for a capture that was the last one pixel for
+    // pixel, the title kept with that one (a window its app isn't drawing shows the title it last drew).
+    var title: String? = nil
+    // What showed, at the picture or since, that the window's app isn't drawing it (`Handlers.Frozen`): the picture
+    // may be old, so coordinates read off it stop.
+    var frozen: Handlers.Frozen? = nil
 
     /// A box in the whole capture (pixels) as the picture sent shows it: in a crop, from its origin and within
     /// it; through the margins left out of it (`Trim.box`). Nil if none of it is in the picture.
@@ -202,6 +210,7 @@ enum Handlers {
         let id: Any = req["id"] ?? NSNull()
         do {
             Hold.touch()
+            Connection.current?.bringForward = forwardSetting(p["bring_forward"])
             var result: [String: Any]
             switch req["cmd"] as? String ?? "" {
             case "status":
@@ -231,11 +240,22 @@ enum Handlers {
                 result["notes"] = [n.text] + (result["notes"] as? [String] ?? [])
                 Session.current.pickNoted.insert(n.pair)
             }
+            if let owned = Connection.current?.ownerNotes, !owned.isEmpty {  // its windows that changed hands or look
+                result["notes"] = owned + (result["notes"] as? [String] ?? [])
+            }
             return ["id": id, "ok": true, "result": result]
         } catch {
             if error is Cancelled || Connection.hungUp { return nil }
-            return ["id": id, "ok": false, "error": "\(error)"]
+            // Its windows that changed hands or look are told once, as they're found: here too.
+            return ["id": id, "ok": false, "error": withNotes("\(error)", Connection.current?.ownerNotes ?? [])]
         }
+    }
+
+    /// An error's text with notes after it (each a sentence of its own), for a reply that has nowhere else for them.
+    nonisolated static func withNotes(_ error: String, _ notes: [String]) -> String {
+        guard !notes.isEmpty else { return error }
+        let end = error.last.map { ".!?".contains($0) } == true ? " " : ". "
+        return error + end + notes.map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: ". ")
     }
 
     static func encode(_ obj: [String: Any]) -> Data {
@@ -284,14 +304,16 @@ enum Handlers {
                 throw HelperError("no window selected: pass window (an id from windows, an app name, or \"screen\")")
             }
             if cur == 0 { return .screen }
-            guard let w = Windows.info(cur) else { throw HelperError("window \(cur) no longer exists" + appWindows(cur)) }
+            guard let w = Windows.info(cur) else {
+                throw HelperError(unseenWindow(cur) ?? "window \(cur) no longer exists" + appWindows(cur))
+            }
             return used(w)
         }
         if let n = num(v), !(v is String && Int(v as! String) == nil) {
             // An id no window can have (negative, fractional, past UInt32) is not found either.
             guard let id = CGWindowID(exactly: n), let w = Windows.info(id) else {
-                throw HelperError("window \(Int(exactly: n).map(String.init) ?? "\(n)") not found"
-                    + (CGWindowID(exactly: n).map(appWindows) ?? ""))
+                throw HelperError(CGWindowID(exactly: n).flatMap(unseenWindow)
+                    ?? "window \(Int(exactly: n).map(String.init) ?? "\(n)") not found" + (CGWindowID(exactly: n).map(appWindows) ?? ""))
             }
             return used(w)
         }
@@ -299,12 +321,19 @@ enum Handlers {
             throw HelperError("bad window value")
         }
         if s.lowercased() == "screen" { return .screen }
-        let wins = Windows.targetable(app: s)
+        // "Firefox (agent)", as listings name the agent's own Firefox: its windows alone.
+        let agents = AgentBrowser.aim(s) == .agent
+        let wins = agents ? AgentBrowser.windows() : Windows.targetable(app: s)
+        for pid in Set(wins.map(\.pid)) { reviewOwnership(pid) }  // a window the user took over isn't the session's to pick
         let system = { (w: WinInfo) in systemWindow(w, AX.window(pid: w.pid, wid: w.id)) }  // the dictation orb
         if let hit = appWindow(wins, query: s, current: current, own: Session.current.ownRecent,
-                               noted: Session.current.pickNoted, system: system) {
+                               noted: Session.current.pickNoted, agent: agentWindows,
+                               browser: wins.first.map { isBrowser($0.pid) } ?? false, system: system) {
             if let note = hit.note { Connection.current?.windowNote = note }
             return used(hit.window)
+        }
+        if agents {
+            throw HelperError("no window for \"\(s)\": \(AgentBrowser.absent)")
         }
         if Windows.runningApp(s) != nil { throw HelperError("\(s) is running but has no windows (use windows with launch=true)") }
         throw HelperError("no window for \"\(s)\" (not running? use windows with launch=true)")
@@ -320,10 +349,18 @@ enum Handlers {
 
     /// The window app name `query` means (`pick`), with a note when that isn't the app's front window
     /// (the one an app name used to mean) and the session hasn't been told about that pair yet (`noted`).
+    /// In a browser (`browser`), a name that falls back to the front window of the user's (none of `agent`'s)
+    /// says so too, once a window: the agent may have taken it for its own.
     static func appWindow(_ wins: [WinInfo], query: String, current: CGWindowID?, own: [CGWindowID],
-                          noted: Set<[CGWindowID]>, system: (WinInfo) -> Bool = { _ in false })
+                          noted: Set<[CGWindowID]>, agent: Set<CGWindowID> = [], browser: Bool = false,
+                          system: (WinInfo) -> Bool = { _ in false })
         -> (window: WinInfo, note: (text: String, pair: [CGWindowID])?)? {
         guard case let (w, why)? = pick(wins, current: current, own: own, system: system) else { return nil }
+        if why == .front {
+            guard browser, !agent.contains(w.id), !noted.contains([w.id]) else { return (w, nil) }
+            let title = w.title.isEmpty ? "" : " \"\(AX.clip(w.title, 40))\""
+            return (w, ("\"\(query)\" means the user's front window #\(w.id)\(title); navigate opens one of your own", [w.id]))
+        }
         guard let front = pick(wins, current: nil, own: [], system: system)?.0, front.id != w.id,
               !noted.contains([w.id, front.id]) else { return (w, nil) }
         let mine = why == .current ? "the window you're on, #\(w.id)" : "your own window #\(w.id)"
@@ -346,14 +383,46 @@ enum Handlers {
         return (wins.first(where: \.onScreen) ?? wins.first).map { ($0, .front) }
     }
 
-    /// A window the session works on: its app is remembered, for when it's gone.
+    /// A window the session works on: its app is remembered, for when it's gone. Its own windows of that app
+    /// are looked at first, in case the user has taken one over (`reviewOwnership`), and this one, if it's its
+    /// own, for another site or tab count since (`reviewChange`).
     static func used(_ w: WinInfo) -> Target {
+        reviewOwnership(w.pid)
+        reviewChange(w)
+        if AgentBrowser.isInstance(w.pid) { AgentBrowser.touch() }  // in use: not quit as idle
         Session.current.windowApps[w.id] = (w.app, w.pid)
         if Session.current.agentWindows.contains(w.id) {  // its own: the one an app name means next
             Session.current.ownRecent.removeAll { $0 == w.id }
             Session.current.ownRecent.append(w.id)
+            Session.current.owned[w.id]?.lastUsed = Date()
         }
         return .window(w)
+    }
+
+    /// Why window `id`, which the window server lists but not on screen (so `Windows.info` doesn't find it, while
+    /// `windows` lists it), can't be used (`unseen`), or nil when it isn't such a window.
+    static func unseenWindow(_ id: CGWindowID) -> String? {
+        // (Not an app the policy keeps agents out of: those windows aren't listed.)
+        guard let w = Windows.all().first(where: { $0.id == id && !$0.onScreen }), Policy.level(w.pid) != .deny else { return nil }
+        return unseen(coverOf(w).cover, app: w.app.isEmpty ? Policy.appName(w.pid) : w.app, wid: id)
+    }
+
+    /// Why window `wid` of `app` can't be seen or used while it's minimized, on another Space or its app is hidden
+    /// (`cover`), and that it's the user's to change: bringing it back would put it in front of them. Nil otherwise.
+    nonisolated static func unseen(_ cover: Cover, app: String, wid: CGWindowID) -> String? {
+        switch cover {
+        case .minimized:
+            return "window #\(wid) is minimized, so it can't be seen or used: un-minimizing it would bring it to the front, "
+                + "so ask the user to bring it back, or work in another window"
+        case .otherSpace:
+            return "window #\(wid) is on another Space, so it can't be seen or used from here: ask the user to bring it to "
+                + "this one"
+        case .hidden:
+            return "window #\(wid) can't be seen or used while \(app) is hidden: showing \(app) would bring it to the front, "
+                + "so ask the user to show \(app), or work in another window"
+        case .inView, .covered:
+            return nil
+        }
     }
 
     /// For a window that's gone: whose it was and that app's windows now (" (it was Firefox's; …)"), the
@@ -373,7 +442,10 @@ enum Handlers {
         let app = (p["app"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         let launched = app != nil && p["launch"] as? Bool == true
         let wins: [WinInfo]
-        if let app, launched {
+        if let app, AgentBrowser.aim(app) == .agent {  // "Firefox (agent)": the agent's own Firefox, never started here
+            wins = AgentBrowser.windows()
+            if launched, wins.isEmpty { throw HelperError(AgentBrowser.absent) }
+        } else if let app, launched {
             // Not shrunk to the window box: an app may restore the user's last session as it launches.
             wins = try await Windows.launch(app)
         } else {
@@ -400,15 +472,19 @@ enum Handlers {
             if systemWindow(w, AX.window(pid: w.pid, wid: w.id)) { return nil }  // macOS's dictation orb, not the app's
             return (w, l)
         }
-        // Which are the agent's, the one it's on, the one in front, the one with its app's keyboard.
+        // Which are the agent's (once it's known the user hasn't taken one over), the one it's on, the one in front,
+        // the one with its app's keyboard.
         let ws = allowed.map { $0.0 }
+        for pid in Set(ws.filter { agentWindows.contains($0.id) }.map(\.pid)) { reviewOwnership(pid) }
         var keys: [pid_t: CGWindowID] = [:]
         for pid in keyboardApps(ws, agent: agentWindows, current: current) { keys[pid] = keyWindow(pid) }
         let front = Set(ws.map { $0.pid }).first { Hold.isFront($0) }
-        let tags = windowTags(ws, agent: agentWindows, current: current, front: front, keys: keys)
+        let tags = windowTags(ws, agent: agentWindows, used: Set(ws.map(\.id).filter { owner($0) == .shared }),
+                              current: current, front: front, keys: keys)
         let listed = allowed.map { pair -> [String: Any] in
             let (w, l) = pair
             var j = w.json
+            j["app"] = AgentBrowser.label(w)  // the agent's own Firefox apart from the user's
             if l != .full { j["policy"] = l.rawValue }
             for tag in tags[w.id] ?? [] { j[tag] = true }
             return j
@@ -438,16 +514,19 @@ enum Handlers {
     }
 
     /// The tags of each window `windows` lists (`wins`, front to back for those on screen), in this order:
-    /// `yours`, one the agent opened (`agent`); `current`, the one it's on; `front`, the front window of the
-    /// app really in front (`front`: what the user sees on top); `keyboard`, the window of its app that has
-    /// the app's keyboard (`keys`, each asked app's key window: keys sent to that app go there).
-    nonisolated static func windowTags(_ wins: [WinInfo], agent: Set<CGWindowID>, current: CGWindowID?, front: pid_t?,
+    /// `yours`, one the agent opened (`agent`); `used`, one of those the user has used since (`used`); `current`,
+    /// the one it's on; `front`, the front window of the app really in front (`front`: what the user sees on top);
+    /// `keyboard`, the window of its app that has the app's keyboard (`keys`, each asked app's key window: keys
+    /// sent to that app go there).
+    nonisolated static func windowTags(_ wins: [WinInfo], agent: Set<CGWindowID>, used: Set<CGWindowID> = [],
+                                       current: CGWindowID?, front: pid_t?,
                                        keys: [pid_t: CGWindowID]) -> [CGWindowID: [String]] {
         let frontWindow = front.flatMap { pid in wins.first { $0.pid == pid && $0.onScreen } }?.id
         var out: [CGWindowID: [String]] = [:]
         for w in wins {
             var tags: [String] = []
             if agent.contains(w.id) { tags.append("yours") }
+            if agent.contains(w.id), used.contains(w.id) { tags.append("used") }
             if w.id == current { tags.append("current") }
             if w.id == frontWindow { tags.append("front") }
             if keys[w.pid] == w.id { tags.append("keyboard") }
@@ -638,16 +717,21 @@ enum Handlers {
     }
 
     /// Keep `shot` as what coordinates in `t` refer to (and what was over the window then, `Run.look`).
-    /// `shown`: it goes to the agent as an image (else it only places what the agent is told in pixels).
-    static func remember(_ t: Target, _ shot: Shot, _ sig: Signature, shown: Bool) {
+    /// `shown`: it goes to the agent as an image (else it only places what the agent is told in pixels). `sizing`:
+    /// how it was captured. One that's the last picture pixel for pixel keeps that one's title, and what showed its
+    /// app wasn't drawing it (`Meta.frozen`): nothing has been drawn since.
+    static func remember(_ t: Target, _ shot: Shot, _ sig: Signature, shown: Bool, sizing: Sizing? = nil) {
         let o = origin(t)
         let start = AX.uptime(), cursor = caret(t)
         if Trace.on, case .window = t {
             Trace.log(["k": "caret", "ms": ((AX.uptime() - start) * 10_000).rounded() / 10, "found": cursor != nil])
         }
+        var now: String?
+        if case .window(let w) = t { now = Windows.info(w.id)?.title ?? w.title }
+        let (title, frozen) = kept(meta[t.key], sig: sig, title: now)
         meta[t.key] = Meta(offset: CGPoint(x: shot.rect.minX - o.x, y: shot.rect.minY - o.y), size: shot.rect.size,
                            width: shot.image.width, height: shot.image.height, sig: sig, caret: cursor, shown: shown,
-                           captured: shot.rect)
+                           captured: shot.rect, sizing: sizing, title: title, frozen: frozen)
         Run.look(t)
         if shown { VerifyEdit.seen(t.key) }  // the edits whose pictures were withheld are in this one
     }
@@ -721,11 +805,17 @@ enum Handlers {
                                 offset: CGPoint(x: shot.rect.minX - o.x, y: shot.rect.minY - o.y))
     }
 
+    /// The window a reply is about, with whose it is: `yours` (the session opened it), and `used` when the user
+    /// has used it since.
     static func describe(_ t: Target) -> [String: Any] {
         switch t {
         case .window(let w):
             let fresh = Windows.info(w.id) ?? w
-            return ["id": Int(w.id), "app": fresh.app, "title": fresh.title, "on_screen": fresh.onScreen]
+            var d: [String: Any] = ["id": Int(w.id), "app": AgentBrowser.label(fresh), "title": fresh.title, "on_screen": fresh.onScreen]
+            let o = owner(w.id)
+            d["yours"] = o != .user
+            if o == .shared { d["used"] = true }
+            return d
         case .screen:
             return ["id": 0, "app": "screen", "title": NSWorkspace.shared.frontmostApplication?.localizedName ?? ""]
         }
@@ -756,7 +846,9 @@ enum Handlers {
             AppCards.enabled = p["app_cards"] as? Bool != false
             if case .window(let w) = t, let card = AppCards.card(pid: w.pid) { out["card"] = card }
             looked()
-            return bearings(out.merging(accessibility(t, o), uniquingKeysWith: { _, new in new }), t)
+            return try await bearings(out.merging(accessibility(t, o), uniquingKeysWith: { _, new in new }), t) {
+                accessibility(t, o)  // read again, once the window is drawn again
+            }
         }
         let shot = try await plan(t, region: region, o).run()
         var out = try await result(t, shot, o, zoom: region != nil, text: p["text"] as? Bool == true)
@@ -765,7 +857,10 @@ enum Handlers {
         AppCards.enabled = p["app_cards"] as? Bool != false
         if case .window(let w) = t, let card = AppCards.card(pid: w.pid) { out["card"] = card }
         looked()
-        return region == nil ? bearings(out, t) : out  // (a zoom is a closer look, not a new one)
+        guard region == nil else { return out }  // (a zoom is a closer look, not a new one)
+        return try await bearings(out, t) {  // taken again, once the window is drawn again
+            try await result(t, try await plan(t, region: nil, o).run(), o, zoom: false, text: p["text"] as? Bool == true)
+        }
     }
 
     /// How a screenshot sets the agent's way of looking at its window (`ViewMode`): one without an image
@@ -1153,11 +1248,18 @@ enum Handlers {
     /// The target of an act: its window, as for every command. With none, a batch begun with navigate goes
     /// to a browser: the session's window when that's a browser's, else the default browser's window (the
     /// one its name would mean), the browser started or given a window first if it has none, in the
-    /// background, once the policy is known to allow it (read by bundle id, before anything starts).
+    /// background, once the policy is known to allow it (read by bundle id, before anything starts). With the
+    /// agent's own Firefox on, it goes there instead of the user's Firefox (`AgentBrowser.routes`).
     static func actTarget(_ p: [String: Any]) async throws -> Target {
         let v = p["window"]
-        guard v == nil || v is NSNull, let first = (p["actions"] as? [[String: Any]])?.first, navigates(first),
+        guard let first = (p["actions"] as? [[String: Any]])?.first, navigates(first),
               !(p["actions"] as? [[String: Any]] ?? []).contains(where: { kind($0) == "macro" }) else { return try resolve(v) }
+        // The agent's own Firefox, when the setting is on (or it's named): instead of the user's Firefox.
+        let agents = AgentBrowser.wanted(p)
+        if AgentBrowser.routes(AgentBrowser.aim(v), on: agents ? AgentBrowser.on() : .none, enabled: agents) {
+            return try await agentBrowserTarget(first, p, launch: agents)
+        }
+        guard v == nil || v is NSNull else { return try resolve(v) }
         if let cur = current, cur != 0, let w = Windows.info(cur), isBrowser(w.pid) { return used(w) }
         guard let url = defaultBrowser(), let id = Bundle(url: url)?.bundleIdentifier, browsers.contains(id.lowercased()) else {
             throw HelperError("no window selected: pass window (a browser's name or id, from windows), or use open {url} "
@@ -1168,6 +1270,7 @@ enum Handlers {
         }
         var wins = Windows.targetable(app: id)
         if wins.isEmpty { wins = try await Windows.launch(id) }
+        for pid in Set(wins.map(\.pid)) { reviewOwnership(pid) }  // a window the user took over isn't the session's to pick
         let system = { (w: WinInfo) in systemWindow(w, AX.window(pid: w.pid, wid: w.id)) }  // the dictation orb
         guard let w = pick(wins, current: current, own: Session.current.ownRecent, system: system)?.0 else {
             throw HelperError("no window for \(id) (use windows with launch=true)")
@@ -1182,23 +1285,33 @@ enum Handlers {
 
     /// Actions that act on the app's keyboard focus: keys (including the modifiers a click or drag holds)
     /// and menu commands, which act on the focused window. That window has to be the app's key one first.
-    enum KeyPrimer: Equatable { case none, fromAgentWindow, freshHold }
+    enum KeyPrimer: Equatable { case none, fromAgentWindow, fromUserWindow, freshHold }
 
-    /// Whether a keyboard act on a held background app spends a click on its window, given the window AX
-    /// says has the app's keyboard. Another of the agent's own windows: forced, at the start, to move it here.
-    /// None, or this one, on a new hold (`Hold.fresh`): AX still names the window, but AppKit has no key
-    /// window, so key equivalents go nowhere; that click waits for the first key (`primeKeys`). A window of
-    /// the user's: never (guardKeyboard stops the keys instead).
-    nonisolated static func keyPrimer(focused: CGWindowID?, wid: CGWindowID, fresh: Bool,
-                                      agentWindows: Set<CGWindowID>) -> KeyPrimer {
-        if let focused, focused != wid { return agentWindows.contains(focused) ? .fromAgentWindow : .none }
-        return fresh ? .freshHold : .none
+    /// Whether a keyboard act spends a click on its window `wid`, given the window AX says has the app's keyboard
+    /// (`focused`) and whose each is (`owner`). Forced, at the start, to move the keyboard here:
+    /// - from another of the agent's own windows (`fromAgentWindow`); in the user's front app (`front`) only while
+    ///   they leave the keyboard and mouse alone (`quiet`), as they may be typing there;
+    /// - from a window of the user's, or one of the agent's they've used, to the agent's own window, only while the
+    ///   app is in the background (`fromUserWindow`): as a click there would, and as the agent's clicks there do.
+    ///   The window is in front when the user next switches to the app. Never while they're in it.
+    /// None, or this one, on a new hold (`Hold.fresh`): AX still names the window, but AppKit has no key window,
+    /// so key equivalents go nowhere; that click waits for the first key (`primeKeys`). Otherwise none
+    /// (guardKeyboard stops the keys instead).
+    nonisolated static func keyPrimer(focused: CGWindowID?, wid: CGWindowID, fresh: Bool, front: Bool = false, quiet: Bool = true,
+                                      owner: (CGWindowID) -> Owner) -> KeyPrimer {
+        if let focused, focused != wid {
+            switch owner(focused) {
+            case .agent: return !front || quiet ? .fromAgentWindow : .none
+            case .shared, .user: return !front && owner(wid) == .agent ? .fromUserWindow : .none
+            }
+        }
+        return fresh && !front ? .freshHold : .none
     }
 
     /// Whether keys or a menu command going to `r` now need a new hold's click first (see `primeKeys`).
     static func keysNeedPrimer(_ r: Route) -> Bool {
         guard !r.foreground, r.primer, r.wid != 0, Hold.held[r.pid] == r.wid, Hold.fresh.contains(r.pid) else { return false }
-        return keyPrimer(focused: AX.focusedWindow(pid: r.pid), wid: r.wid, fresh: true, agentWindows: agentWindows) == .freshHold
+        return keyPrimer(focused: AX.focusedWindow(pid: r.pid), wid: r.wid, fresh: true, owner: { owner($0) }) == .freshHold
     }
 
     /// On a new hold, the primer's click makes the window key, just before the first key or menu command
@@ -1292,9 +1405,11 @@ enum Handlers {
                        withhold: ((Meta) -> Void)? = nil) async throws -> [String: Any] {
         let sig = Signature(shot.image)  // (of the whole capture, margins and all)
         let crops = meta[t.key]?.crops ?? 0  // (crops in a row before this picture; what's kept is replaced next)
+        // The scale of the last image of the window the agent was shown (px/pt), before this one replaces it.
+        let seenScale = meta[t.key].flatMap { $0.shown && $0.size.width > 0 ? Double($0.width) / $0.size.width : nil }
         let keep = VerifyEdit.remembers(zoom: zoom, verified: withhold != nil)
         if keep {  // the image goes to the agent in this reply
-            remember(t, shot, sig, shown: true)
+            remember(t, shot, sig, shown: true, sizing: o.sizing)
             meta[t.key]?.ambient = ambient
         }
         // A picture withheld from the agent: its own record, apart from what the agent saw (for where it changed).
@@ -1356,7 +1471,14 @@ enum Handlers {
         var out: [String: Any] = [
             "image": data.base64EncodedString(), "mime": mime, "width": image.width,
             "height": image.height, "zoom": zoom, "window": describe(t),
+            "scale": (Double(shot.scale) * 100).rounded() / 100,  // its pixels a point
         ]
+        // The same window at another scale than the agent's last image of it looks another size: its size in points
+        // says it isn't.
+        if case .window(let w) = t, tellsWindowSize(scale: Double(shot.scale), last: seenScale, zoom: zoom) {
+            let f = Windows.info(w.id)?.frame ?? w.frame
+            out["window_pt"] = [Int(f.width.rounded()), Int(f.height.rounded())]
+        }
         if let cut {
             // What was left out, for the status line: the whole capture's size, and columns cut at each side (the
             // right's left of the scroll bar, which stays) and rows at the bottom.
@@ -1455,9 +1577,12 @@ enum Handlers {
 
     /// Resolve an action's target point: an element (by number or by what it says) or screenshot
     /// coordinates. Text with no accessibility element is looked for on screen. `vet`: the policy's checks on
-    /// the element, run before it's scrolled into view (a stop for the user's OK leaves everything as it was).
-    static func actionPoint(_ a: [String: Any], _ t: Target, required: Bool = true,
-                            vet: ((AX.Node) throws -> Void)? = nil) async throws -> (CGPoint, AX.Node?)? {
+    /// the element, run before it's scrolled into view (a stop for the user's OK leaves everything as it was);
+    /// `vetRead`, those on the line text read off the screen was found in, with no element to check. A window its app
+    /// was brought forward to draw again as the screen was about to be read (`Redrawn`) is looked in again, once
+    /// (`again`: this is that look).
+    static func actionPoint(_ a: [String: Any], _ t: Target, required: Bool = true, vet: ((AX.Node) throws -> Void)? = nil,
+                            vetRead: ((String) throws -> Void)? = nil, again: Bool = false) async throws -> (CGPoint, AX.Node?)? {
         // The element a compound action (type, fill) has just looked up and checked (internal `_node`): that
         // one, not a second search that could find another on a page that re-rendered.
         if let n = a["_node"] as? AX.Node {
@@ -1495,10 +1620,18 @@ enum Handlers {
                     throw HelperError("\(error) (a macro step: what it pressed isn't where it was, so nothing was pressed)")
                 }
                 guard let miss = error as? NotFound else { throw error }
-                do { return (try await readOffScreen(v, t), nil) } catch let e as Missing {
+                do {
+                    let read = try await readOffScreen(v, t)
+                    try vetRead?(read.line)
+                    return (read.point, nil)
+                } catch is Redrawn where !again {
+                    return try await actionPoint(a, t, required: required, vet: vet, vetRead: vetRead, again: true)
+                } catch let e as Missing {
                     // Not on the screen either: missing only if nothing off screen showed it (that's listed then).
                     let text = "\(e)\(miss.hint)"
                     throw miss.clean ? Missing(description: text) : HelperError(text)
+                } catch let e as NotDrawn.Miss {
+                    throw e  // the window isn't being drawn: that alone, not what's like it (the browser's own controls)
                 } catch let e as HelperError where !miss.hint.isEmpty {
                     throw HelperError("\(e)\(miss.hint)")  // with what's off screen showing it, and what's near it
                 }
@@ -1529,7 +1662,10 @@ enum Handlers {
             if type == "double_click" { count = 2 }
             if type == "triple_click" { count = 3 }
             let pressed = button
-            guard let (aimed, node) = try await actionPoint(a, t, vet: { try clickChecks(a, $0, button: pressed) }) else { return }
+            // Text read off the screen (no element to ask) is judged by its line, as a control with that name would be.
+            let vetRead: ((String) throws -> Void)? = button == "left" ? { try Policy.checkReadPress(a, read: $0) } : nil
+            guard let (aimed, node) = try await actionPoint(a, t, vet: { try clickChecks(a, $0, button: pressed) },
+                                                            vetRead: vetRead) else { return }
             var p = aimed
             var r = try route(t, at: p, foreground: foreground)
             if !flags.isEmpty { try guardKeyboard(r) }  // its modifiers go to whichever window has the keyboard
@@ -1668,7 +1804,8 @@ enum Handlers {
             let vet: (AX.Node) throws -> Void = { n in
                 if button == "left" { try Policy.checkPress(a, node: n, at: nil, pid: AX.pidOf(n.element) ?? 0) }
             }
-            if let (q, n) = try await actionPoint(a, t, required: false, vet: vet) { (p, node) = (q, n) } else {
+            let vetRead: ((String) throws -> Void)? = button == "left" ? { try Policy.checkReadPress(a, read: $0) } : nil
+            if let (q, n) = try await actionPoint(a, t, required: false, vet: vet, vetRead: vetRead) { (p, node) = (q, n) } else {
                 guard let tip = pointer.tip else { throw HelperError("mouse_down needs x,y or element") }
                 p = tip
             }
@@ -1985,22 +2122,20 @@ enum Handlers {
             }
         case "activate", "raise", "focus_window":
             guard case .window(let w) = t else { return }
-            AX.raise(pid: w.pid, wid: w.id)
-            try await Run.pause(0.25)
             // Keys after it go to the app's key window: check it's this one (when the app says), and try
             // again twice before saying it isn't.
-            for _ in 0..<2 {
-                guard let key = AX.focusedWindow(pid: w.pid), key != w.id else { break }
-                SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
-                AX.raise(pid: w.pid, wid: w.id)
-                try await Run.pause(0.25)
-            }
-            if let key = AX.focusedWindow(pid: w.pid), key != w.id {
+            if let key = try await raiseToKey(w, pause: 0.25, wait: Run.pause) {
                 throw HelperError("\(w.app) didn't bring window #\(w.id) forward: its keyboard is still in #\(key), so "
                     + "keys would go there. Look at the screen before going on")
             }
         case "close_window", "close":
             guard case .window(let w) = t else { throw HelperError("close_window needs a window target") }
+            // One of the agent's windows may hold the user's pages too: the user is asked first.
+            if a["confirm"] as? Bool != true, owner(w.id) != .user || Session.current.given.contains(w.id),
+               let why = closeRefusal(wid: w.id, given: Session.current.given.contains(w.id),
+                                      tabsThen: Session.current.owned[w.id]?.tabs, tabsNow: tabCount(w)) {
+                throw HelperError(why)
+            }
             if !AX.closeWindow(pid: w.pid, wid: w.id) { throw HelperError("window has no close button") }
             // Gone at once or in a moment; still there after 0.3 s, it's asking something.
             let gone = try await Run.pollUntil(floor: 0, every: 0.05, cap: 0.3) { Windows.info(w.id)?.onScreen != true }
@@ -2038,40 +2173,160 @@ enum Handlers {
     }
 
     /// Stop before keys that would land in a window the user is using rather than the agent's. Nothing is
-    /// ever typed into the user's window: if their window has the keyboard, the action stops and says so.
+    /// ever typed into the user's window: if their window has the keyboard, the action stops and says so. Nor
+    /// into the agent's while the user may be typing there too (`waitsForUser`).
     static func guardKeyboard(_ r: Route) throws {
-        guard !keysReachTarget(r) else { return }
-        let app = Policy.appName(r.pid)
-        if let key = AX.focusedWindow(pid: r.pid), let w = Windows.info(key) {
-            let what = w.title.isEmpty ? "window #\(key)" : "window #\(key) \"\(AX.clip(w.title, 40))\""
-            if agentWindows.contains(key) {
-                // In the user's front app, it's moved at the start of a call (act), and only while they leave the
-                // keyboard and mouse alone: they may be typing into that window.
-                if Hold.isFront(r.pid) {
-                    if !Input.userQuiet() {
-                        throw HelperError("your other \(what) has \(app)'s keyboard, and \(app) is the user's front app: "
-                            + "they're using the keyboard or mouse, maybe typing there, so puter-use didn't move it. The "
-                            + "action didn't run. Try again in a few seconds, or work in #\(key)")
-                    }
-                    throw HelperError("your other \(what) has \(app)'s keyboard, and it wasn't moved to #\(r.wid): the "
-                        + "action didn't run. Run it again in a new call (that moves it when it can), or click inside "
-                        + "#\(r.wid) first; or work in #\(key)")
-                }
-                throw HelperError("your other \(what) has \(app)'s keyboard, and it couldn't be moved to #\(r.wid): the "
-                    + "action didn't run. Work in #\(key), or close it if you're done with it")
+        if let p = switchedIn(r) { throw refused(r, keyboardRefusal(p)) }
+        guard !keysReachTarget(r) else {
+            if userAtKeys(r) {
+                let busy = keyboardBusy(app: Policy.appName(r.pid), target: r.wid)
+                throw refused(r, busy.text, retry: busy.retry)
             }
-            throw keyboardElsewhere("another window of \(app) has the keyboard (\(what), not the agent's #\(r.wid)), so the "
-                + "action didn't run: keys and menu commands would act there", app: app, wait: "it's back in #\(r.wid)", wid: r.wid)
+            return
         }
-        throw keyboardElsewhere("\(app)'s keyboard may be in a window other than the agent's #\(r.wid), so the action "
-            + "didn't run: it would act there", app: app, wait: "they're out of \(app)", wid: r.wid)
+        let app = Policy.appName(r.pid)
+        let key = AX.focusedWindow(pid: r.pid)
+        if let key, owner(key) == .agent {
+            let title = Windows.info(key)?.title ?? ""
+            let what = title.isEmpty ? "window #\(key)" : "window #\(key) \"\(AX.clip(title, 40))\""
+            // In the user's front app, it's moved at the start of a call (act), and only while they leave the
+            // keyboard and mouse alone: they may be typing into that window.
+            if Hold.isFront(r.pid) {
+                if !Input.userQuiet() {
+                    let retry = "Try again in a few seconds, or work in #\(key)"
+                    throw refused(r, "your other \(what) has \(app)'s keyboard, and \(app) is the user's front app: "
+                        + "they're using the keyboard or mouse, maybe typing there, so puter-use didn't move it. The "
+                        + "action didn't run. \(retry)", retry: retry)
+                }
+                let retry = "Run it again in a new call (that moves it when it can), or click inside #\(r.wid) first; "
+                    + "or work in #\(key)"
+                throw refused(r, "your other \(what) has \(app)'s keyboard, and it wasn't moved to #\(r.wid): the "
+                    + "action didn't run. \(retry)", retry: retry)
+            }
+            throw refused(r, "your other \(what) has \(app)'s keyboard, and it couldn't be moved to #\(r.wid): the "
+                + "action didn't run. Work in #\(key), or close it if you're done with it")
+        }
+        throw refused(r, keyboardRefusal(elsewhere(r, key: key)), retry: keyboardRetry(app: app, target: r.wid))
     }
 
-    /// The error for keys the user's window of the app would get (`what`): wait for the keyboard and retry; never take
-    /// it from them. Clicks without keys aren't held up.
-    nonisolated static func keyboardElsewhere(_ what: String, app: String, wait until: String, wid: CGWindowID) -> HelperError {
-        HelperError("\(what). The user may be using \(app): wait until \(until), then retry, and don't work around it "
-            + "(no foreground, activate or click to take the keyboard). Clicks without keys still reach #\(wid)")
+    /// Whether keys for `r`, whose window has its app's keyboard, wait for the user (`waitsForUser`), as things are now.
+    static func userAtKeys(_ r: Route) -> Bool {
+        r.wid != 0 && waitsForUser(foreground: r.foreground, front: Hold.isFront(r.pid), targetOwner: owner(r.wid),
+                                   quiet: Input.userQuiet())
+    }
+
+    /// Whether keys going to one of the agent's windows that has its app's keyboard (`targetOwner` not the user's)
+    /// wait for the user: the app is their front app (`front`), so that window is the one they're in, and they've
+    /// touched the keyboard or mouse in the last moments (`quiet` false), so they may be typing there too. Asked before
+    /// each key, so typing stops when they come in. Not in foreground mode, where the real keyboard is used with the
+    /// user's OK.
+    nonisolated static func waitsForUser(foreground: Bool, front: Bool, targetOwner: Owner, quiet: Bool) -> Bool {
+        !foreground && front && targetOwner != .user && !quiet
+    }
+
+    /// Why keys stop when the user may be typing in the agent's window `target` (`waitsForUser`), with the part that
+    /// says to try again (`retry`, for `refused`).
+    nonisolated static func keyboardBusy(app: String, target: CGWindowID) -> (text: String, retry: String) {
+        let retry = "Try again once they've left the keyboard for a moment"
+        return ("the user is in \(app) and its keyboard is on your window #\(target): they may be typing there, so the "
+            + "action didn't run. \(retry)", retry)
+    }
+
+    /// What a refusal of keys for the agent's own window says to try again, when the keyboard hasn't been moved there
+    /// yet this act (`keyboardElsewhere`).
+    nonisolated static func keyboardRetry(app: String, target: CGWindowID) -> String {
+        "Run it again in a new call: that moves the keyboard to #\(target) while \(app) is in the background"
+    }
+
+    /// What keys stopped for a window of the user's say, as one error (`keyboardElsewhere`'s parts).
+    nonisolated static func keyboardRefusal(_ p: (why: String, effect: String, advice: String)) -> String {
+        "\(p.why), so the action didn't run: \(p.effect). \(p.advice)"
+    }
+
+    /// Why keys stop when a window of the user's (`key`, titled `keyTitle`; `keyOwner` `.shared` for one of the
+    /// agent's they've used; nil when the app can't say which) has `app`'s keyboard rather than `target`, the window
+    /// the action is for (named with whose it is, `targetOwner`, never called the agent's unless it is), in parts:
+    /// the cause (`why`), what keys would do (`effect`) and what to do about it (`advice`). In the user's front app
+    /// (`front`) it clears when they leave it. In the background it never moves by itself, so retrying is no use,
+    /// unless the agent's own window hasn't been tried yet this act (`tried`: a new call moves the keyboard there,
+    /// `keyPrimer`). Never take it from the user. Clicks without keys aren't held up.
+    nonisolated static func keyboardElsewhere(app: String, target: CGWindowID, targetOwner: Owner, key: CGWindowID?,
+                                              keyTitle: String = "", keyOwner: Owner = .user, front: Bool, tried: Bool = true)
+        -> (why: String, effect: String, advice: String) {
+        let aim = "#\(target), the window this action is for (\(whose(targetOwner)))"
+        let clicks = "Clicks without keys still reach #\(target)"
+        let title = keyTitle.isEmpty ? "" : " \"\(AX.clip(keyTitle, 40))\""
+        func named(_ theirs: String) -> String? {
+            key.map { k in keyOwner == .shared ? "your window #\(k)\(title), which the user has used," : "\(theirs) #\(k)\(title)" }
+        }
+        if front {
+            return (named("their window").map { "the user is in \(app) (\($0) has the keyboard)" }
+                        ?? "the user is in \(app), and which of its windows has the keyboard can't be told",
+                    "keys and menu commands would act there, not in \(aim)",
+                    "This clears when they leave \(app); or ask them. Don't take the keyboard from them (no foreground, "
+                        + "activate or a click just to move it). \(clicks)")
+        }
+        let on = named("the user's window").map { $0.hasSuffix(",") ? $0 : $0 + "," } ?? "another window,"
+        return ("\(app)'s keyboard is on \(on) and it won't move by itself",
+                "keys and menu commands would act there, not in \(aim)",
+                !tried && targetOwner == .agent
+                    ? "\(keyboardRetry(app: app, target: target)). \(clicks)"
+                    : "Don't retry: ask the user to click into #\(target). \(clicks)")
+    }
+
+    /// Why keys stop when the user switched to the app after the act moved its keyboard off their window (`from`,
+    /// `KeyMove`): the agent's window came to the front with it, so their keys would go to `target` too.
+    nonisolated static func keyboardSwitchedIn(app: String, target: CGWindowID, targetOwner: Owner = .agent,
+                                               from: CGWindowID) -> (why: String, effect: String, advice: String) {
+        ("the user switched to \(app) after its keyboard was moved off their #\(from)",
+         "their keys would go to #\(target), the window this action is for (\(whose(targetOwner))), too",
+         "This clears when they leave \(app); or ask them")
+    }
+
+    /// The user came into the app after the act under way moved its keyboard to the agent's window (`KeyMove`).
+    static func switchedIn(_ r: Route) -> (why: String, effect: String, advice: String)? {
+        guard let m = Session.current.keyMove, m.took, m.pid == r.pid, !r.foreground, Hold.isFront(r.pid) else { return nil }
+        return keyboardSwitchedIn(app: Policy.appName(r.pid), target: r.wid, targetOwner: owner(r.wid), from: m.from)
+    }
+
+    /// `keyboardElsewhere` for keys going to `r` while `key` has the app's keyboard, as things are now.
+    static func elsewhere(_ r: Route, key: CGWindowID?) -> (why: String, effect: String, advice: String) {
+        let m = Session.current.keyMove
+        return keyboardElsewhere(app: Policy.appName(r.pid), target: r.wid, targetOwner: owner(r.wid), key: key,
+                                 keyTitle: key.flatMap { Windows.info($0)?.title } ?? "", keyOwner: key.map { owner($0) } ?? .user,
+                                 front: Hold.isFront(r.pid), tried: m?.pid == r.pid && m?.wid == r.wid)
+    }
+
+    /// Refusals of keys for one window are counted over this long: the third says to stop retrying.
+    nonisolated static let refusalSpan: TimeInterval = 180
+
+    /// The times keys for a window were refused that still count at `now` (`refusalSpan`), with this one.
+    nonisolated static func refusals(_ before: [TimeInterval], now: TimeInterval) -> [TimeInterval] {
+        before.filter { now - $0 < refusalSpan } + [now]
+    }
+
+    /// What a refusal adds once keys for the window were refused `count` times lately: retrying won't help.
+    nonisolated static func refusalNote(_ count: Int) -> String? {
+        count >= 3 ? "Refused \(count) times in 3 minutes: stop retrying and ask the user" : nil
+    }
+
+    /// What a refusal (`text`) says once keys for its window were refused `count` times lately, this one too: from the
+    /// third on, that retrying won't help (`refusalNote`), in place of the part of it that says to try again (`retry`,
+    /// when it has one), so the two don't disagree.
+    nonisolated static func refusalText(_ text: String, retry: String? = nil, count: Int) -> String {
+        guard let note = refusalNote(count) else { return text }
+        if let retry, !retry.isEmpty, let at = text.range(of: retry, options: .backwards) {
+            return text.replacingCharacters(in: at, with: note)
+        }
+        return "\(text). \(note)"
+    }
+
+    /// The error for keys refused for `r`'s window (`text`, with the part that says to try again: `retry`), counted
+    /// for the session.
+    static func refused(_ r: Route, _ text: String, retry: String? = nil) -> HelperError {
+        let times = refusals(Session.current.refusals[r.wid] ?? [], now: ProcessInfo.processInfo.systemUptime)
+        Session.current.refusals[r.wid] = times
+        return HelperError(refusalText(text, retry: retry, count: times.count))
     }
 
     /// Press a shortcut or key. Chromium ignores key equivalents while in the background, so there the
@@ -2088,6 +2343,57 @@ enum Handlers {
         try await Input.keyCombo(keys, r, typist: typist)
     }
 
+    /// Text that's only a web address, as one is typed into an address bar, a final Return aside: with a scheme
+    /// ("https://…", "about:…"), or localhost or an IP address, or a host name with a dot ("example.com/docs"), each
+    /// with a port if any. Nothing with a space in it, nor an email address, nor a file's name ("index.html",
+    /// "report.pdf": a host whose last part is a common file extension, unless it starts with "www.").
+    nonisolated static func loneAddress(_ text: String) -> Bool {
+        var t = Substring(text)
+        while let last = t.last, last.isNewline { t = t.dropLast() }
+        let s = t.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !s.isEmpty, s.count <= 2048, !s.contains(where: \.isWhitespace) else { return false }
+        if s.hasPrefix("about:"), s.count > 6 { return true }
+        if let r = s.range(of: "://"), r.upperBound < s.endIndex {
+            let scheme = s[..<r.lowerBound]
+            return scheme.first?.isLetter == true && scheme.allSatisfy { $0.isLetter || $0.isNumber || "+.-".contains($0) }
+        }
+        let authority = s.prefix { !"/?#".contains($0) }
+        let parts = authority.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        if parts.count == 2, parts[1].isEmpty || !parts[1].allSatisfy(\.isASCII) || !parts[1].allSatisfy(\.isNumber) { return false }
+        let name = parts.first.map(String.init) ?? ""
+        if name == "localhost" { return true }
+        let labels = name.split(separator: ".", omittingEmptySubsequences: false)
+        if labels.count == 4, labels.allSatisfy({ $0.count <= 3 && Int($0).map { (0...255).contains($0) } == true }) {
+            return true
+        }
+        guard labels.count >= 2, let tld = labels.last, (2...24).contains(tld.count), tld.allSatisfy({ $0.isASCII && $0.isLetter })
+        else { return false }
+        if fileExtensions.contains(String(tld)), labels.first != "www" { return false }
+        return labels.allSatisfy { l in
+            !l.isEmpty && l.first != "-" && l.last != "-" && l.allSatisfy { ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "-" }
+        }
+    }
+
+    /// Common file extensions a typed web address's host rarely ends in (not those much used as domains too, as
+    /// .app, .ai, .io and .sh are).
+    nonisolated static let fileExtensions: Set<String> = [
+        "html", "htm", "xhtml", "php", "asp", "aspx", "jsp", "pdf", "txt", "md", "rtf", "csv", "tsv", "json", "xml",
+        "yaml", "yml", "toml", "ini", "cfg", "conf", "log", "plist", "js", "mjs", "ts", "tsx", "jsx", "css", "scss", "swift",
+        "py", "rb", "java", "kt", "cpp", "hpp", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "pages", "numbers",
+        "key", "png", "jpg", "jpeg", "gif", "svg", "webp", "heic", "tif", "tiff", "bmp", "ico", "mp3", "mp4", "m4a", "wav",
+        "mov", "avi", "mkv", "zip", "gz", "tgz", "tar", "rar", "dmg", "pkg", "exe", "dll", "sql", "db", "sqlite",
+    ]
+
+    /// Whether a `type` action `a` would put a lone web address (`loneAddress`) into a browser's page: it names no
+    /// field to type into, and the focus in its window isn't on a text input (`focusOnText` false; nil when the
+    /// focus is in another window). Typed there, an address doesn't load. Not into a page's own field, which may
+    /// rightly ask for one, nor for navigate's or fill's typing.
+    nonisolated static func addressIntoPage(_ a: [String: Any], text: String, browser: Bool, focusOnText: Bool?) -> Bool {
+        guard browser, focusOnText == false, ["type", "type_text"].contains(kind(a)) else { return false }
+        guard a["element"] == nil, a["target"] == nil, a["x"] == nil, a["coordinate"] == nil else { return false }
+        return loneAddress(text)
+    }
+
     /// Type `text` like a person: up to `pasteOver` characters is typed; a longer stretch is pasted (as people
     /// do with long text), borrowing the clipboard and giving it back. Newlines and tabs are always the
     /// Return and Tab keys, so a "\n" still submits a field even between pasted paragraphs.
@@ -2098,6 +2404,21 @@ enum Handlers {
         // Typing with a key held down would mix the two (and type's own Shift would let go of a held one).
         if !Input.held.isEmpty {
             throw HelperError("keys are held down (key_down): key_up first, or press combinations with keypress")
+        }
+        // An address typed at the focus, in a browser whose focus is in the page: it would go into the page (or set
+        // off its shortcuts), not load. A page's own text field takes it as typed (a form can ask for a URL).
+        if let a = Policy.running, isBrowser(r.pid), loneAddress(text) {
+            var onText: Bool?  // nil: the focus is in another window (guardKeyboard speaks to that)
+            if let f = AX.focusedElement(pid: r.pid) {
+                if AX.windowID(f).map({ $0 == r.wid }) ?? true { onText = AX.isTextInput(f) }
+            } else if keysReachTarget(r) {
+                onText = false
+            }
+            if addressIntoPage(a, text: text, browser: true, focusOnText: onText) {
+                throw HelperError("the focus isn't in the address bar or a text field, so nothing was typed. To load an "
+                    + "address, use navigate {url} (" + (agentWindows.contains(r.wid)
+                        ? "in your window #\(r.wid) it loads there)" : "it opens a window of your own)"))
+            }
         }
         // A browser's address bar holds one address: typing a new one replaces the old (cmd+l and a click
         // select it; when the caret was just left in it, select it here rather than add to it). Only in
@@ -2129,6 +2450,10 @@ enum Handlers {
         if !run.isEmpty || stretches.isEmpty { stretches.append((run, nil)) }
         let a = Policy.running ?? [:]
         var sent = 0  // characters gone out
+        // Before each key: the keys still reach the window, and the user hasn't come into its app since the act moved
+        // its keyboard there, nor is busy in it with the agent's window in front of them (the checks a stretch starts
+        // with, between its keys too: a stretch takes seconds).
+        let stillSafe = { keysReachTarget(r) && switchedIn(r) == nil && !userAtKeys(r) }
         for (i, s) in stretches.enumerated() {
             do {
                 if !s.text.isEmpty { try Policy.checkSecureFocus(r.pid) }
@@ -2159,10 +2484,10 @@ enum Handlers {
                 Connection.current?.work.typed += s.text.count
                 await Input.sleep(typist.instant || quick ? 0.03 : Double.random(in: 0.12...0.25))
                 if !end.isEmpty,
-                   !(await Input.type(end, r, typist: typist, stillSafe: { keysReachTarget(r) })) {
+                   !(await Input.type(end, r, typist: typist, stillSafe: stillSafe)) {
                     throw try interruption(sent, r)
                 }
-            } else if !(await Input.type(s.text + end, r, typist: typist, stillSafe: { keysReachTarget(r) })) {
+            } else if !(await Input.type(s.text + end, r, typist: typist, stillSafe: stillSafe)) {
                 throw try interruption(sent, r)
             }
             sent += s.text.count + end.count
@@ -2258,12 +2583,30 @@ enum Handlers {
         }.map(\.id)
     }
 
-    /// Another window of the app took the keyboard partway through the text.
+    /// Another window of the app took the keyboard partway through the text, or the user came in where it goes: why,
+    /// as a refusal would say it, and what to do about the rest.
     private static func typingInterrupted(_ sent: Int, _ r: Route) -> HelperError {
         let sofar = sent == 0 ? "only part of it had gone out" : "the first \(sent) characters had gone out"
-        return HelperError("stopped partway through the text: another window of \(Policy.appName(r.pid)) took the "
-            + "keyboard (not the agent's #\(r.wid)); \(sofar), and nothing more was typed. Wait until the keyboard "
-            + "is back, then type the rest")
+        let app = Policy.appName(r.pid)
+        var why = "\(app)'s keyboard left #\(r.wid), the window this action is for (\(whose(owner(r.wid))))"
+        var advice = "Look at the window before typing the rest"
+        let reaches = keysReachTarget(r)
+        if let p = switchedIn(r) {
+            (why, advice) = (p.why, p.advice)
+        } else if reaches, userAtKeys(r) {
+            why = "the user is in \(app) and its keyboard is on your window #\(r.wid): they may be typing there"
+            advice = "Type the rest once they've left the keyboard for a moment"
+        } else if !reaches {
+            let key = AX.focusedWindow(pid: r.pid)
+            if let key, owner(key) == .agent {
+                why = "your other window #\(key) took \(app)'s keyboard"
+                advice = "Type the rest in a new call (that moves it back when it can), or work in #\(key)"
+            } else {
+                let p = elsewhere(r, key: key)
+                (why, advice) = (p.why, p.advice)
+            }
+        }
+        return HelperError("stopped partway through the text: \(why); \(sofar), and nothing more was typed. \(advice)")
     }
 
     /// Button holds are a hand's, whatever the typing speed; instant only when the pointer jumps (speed 0).
@@ -2349,6 +2692,9 @@ enum Handlers {
         var shownAtStart = false
         if case .window(let w) = t { shownAtStart = Windows.info(w.id)?.onScreen == true }
         let blind = firstLook && p["guard"] as? Bool != false && actions.contains(where: aimsByCoordinates)
+        // Nor coordinates read off a picture of a window its app wasn't drawing then, or isn't now (`aimCheck`): they
+        // may point at anything the window shows by now. (`drawnTitle`: a title the window was found drawn with.)
+        var drawnTitle: String?
         var firstShot: (plan: CapturePlan, basis: PlanBasis?, shot: Shot)?  // shown if the first action fails (`ending`)
         // (Going by the outline, none to show: a failed first action takes one then, if it comes to that.)
         if firstLook && !readsOnly && ((wantShot && outlined == nil) || actions.contains(where: needsCoordinates)) {
@@ -2356,7 +2702,7 @@ enum Handlers {
             let basis = PlanBasis.of(t)  // read before planning, as `settle` does
             let start = try await plan(t, region: nil, o)
             let shot = try await start.run()
-            remember(t, shot, Signature(shot.image), shown: false)
+            remember(t, shot, Signature(shot.image), shown: false, sizing: o.sizing)
             firstShot = (start, basis, shot)
         }
         // A picture the agent hasn't seen isn't a "before": until it's seen one, the result shows the window.
@@ -2397,6 +2743,12 @@ enum Handlers {
         notes = expanded
         Session.current.reads = []
         Session.current.scrolled = nil
+        Session.current.keyMove = nil
+        defer {
+            Session.current.keyMove = nil
+            // What its windows show now, for telling later whether the user has taken one over (`reviewOwnership`).
+            recordOwned([t.key, run.target.key, current ?? 0] + (Connection.current?.work.opened ?? []))
+        }
         // Background apps drop clicks (as "activation clicks") and key equivalents. Tell the target's AppKit
         // layer it is active (and keep it so between calls, see `Hold`); the user's real focus is untouched.
         try Connection.check()
@@ -2419,15 +2771,31 @@ enum Handlers {
                 SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
                 guard !wasKey else { return }
                 try await Task.sleep(nanoseconds: 30_000_000)
-                switch keyPrimer(focused: AX.focusedWindow(pid: w.pid), wid: w.id, fresh: Hold.fresh.contains(w.pid),
-                                 agentWindows: agentWindows) {
+                let focused = AX.focusedWindow(pid: w.pid)
+                switch keyPrimer(focused: focused, wid: w.id, fresh: Hold.fresh.contains(w.pid), owner: { owner($0) }) {
                 case .fromAgentWindow:
                     // Not taken (Firefox ignores it) while another of the agent's own windows has the keyboard: a
-                    // click just outside this one's content moves it, as a click on the window would. Never from
-                    // a window of the user's: their keyboard stays where they left it (guardKeyboard says so).
+                    // click just outside this one's content moves it, as a click on the window would.
                     await Input.primer(try route(t, at: nil, foreground: false), force: true)
                     await Input.afterPrimer()  // the keyboard gets the primer's whole gap and the pause to move
                     try await Run.pause(0.1)
+                case .fromUserWindow:
+                    // A window of the user's has it, and the app is in the background: moved to the agent's own
+                    // window the same way (the agent's clicks there move it too), so its keys don't wait on a
+                    // keyboard that never comes back by itself. Not once the user has come into the app: there
+                    // their keyboard stays where they left it (guardKeyboard says so).
+                    guard let from = focused, !Hold.isFront(w.pid) else { break }
+                    Session.current.keyMove = KeyMove(pid: w.pid, wid: w.id, from: from)
+                    await Input.primer(try route(t, at: nil, foreground: false), force: true)
+                    await Input.afterPrimer()
+                    try await Run.pause(0.1)
+                    // Didn't take: the keys stop, saying it won't move by itself.
+                    guard AX.focusedWindow(pid: w.pid) == w.id else { break }
+                    Session.current.keyMove?.took = true
+                    let app = Policy.appName(w.pid)
+                    notes.append("moved \(app)'s keyboard to your window #\(w.id) from "
+                        + (owner(from) == .shared ? "your #\(from), which the user has used" : "the user's #\(from)")
+                        + "; it'll be in front when they next switch to \(app)")
                 case .freshHold, .none:
                     break  // a new hold's click waits for the first key or menu command (`primeKeys`)
                 }
@@ -2447,9 +2815,11 @@ enum Handlers {
             // The app is the user's front app, but its keyboard is on another of the agent's own windows, so
             // what they'd type goes there already, not to a window of theirs. It's moved here the same way
             // (as a click here would), only while they're leaving the keyboard and mouse alone: they may be
-            // typing into that window.
+            // typing into that window. Never off one they've used (`keyPrimer`).
             if !foreground, case .window(let w) = t, actions.contains(where: { actsOnKeyboardFocus($0) }),
-               let key = AX.focusedWindow(pid: w.pid), key != w.id, agentWindows.contains(key), Input.userQuiet() {
+               let key = AX.focusedWindow(pid: w.pid),
+               keyPrimer(focused: key, wid: w.id, fresh: false, front: true, quiet: Input.userQuiet(),
+                         owner: { owner($0) }) == .fromAgentWindow {
                 await Input.primer(try route(t, at: nil, foreground: false), force: true)
                 await Input.afterPrimer()
                 try await Run.pause(0.1)
@@ -2531,11 +2901,56 @@ enum Handlers {
                 await closeSuggestions(pid, before: "action \(base + i + 1)", route: try? route(run.target, at: nil, foreground: false))
                 why = run.staleCoordinates()
             }
+            // A picture of a window its app wasn't drawing (or isn't now: asked when its title has changed since).
+            var instead: String?  // what to do then: a new picture wouldn't help
+            if why == nil, aimsByCoordinates(a), case .window(let w) = run.target {
+                let m = meta[w.id], title = m?.title == nil ? nil : Windows.info(w.id)?.title
+                let check = aimCheck(a, guarded: run.guarded, foreground: foreground, moved: run.moved, frozenThen: m?.frozen != nil,
+                                     titleChanged: title != nil && title != m?.title && title != drawnTitle)
+                var frozen = check == .stop ? m?.frozen : nil
+                if check == .look {
+                    frozen = try await frozenNow(run.target, tree: treeReady(w.pid))
+                    if let f = frozen { meta[w.id]?.frozen = f } else { drawnTitle = title }
+                }
+                // Judged not drawn at that picture: what's in the way is asked again first. In view again, the window
+                // is drawn: its coordinates hold if it still looks as that picture does, else a new one is wanted.
+                if check == .stop, var f = frozen {
+                    (f.cover, f.key) = coverOf(w)
+                    let holds = f.cover == .inView ? await pictureHolds(run.target) : nil
+                    switch recheckAim(cover: f.cover, holds: holds) {
+                    case .go:
+                        meta[w.id]?.frozen = nil
+                        frozen = nil
+                    case .stop:
+                        meta[w.id]?.frozen = f
+                        frozen = f
+                    case .retake:
+                        frozen = nil
+                        why = unseenSinceInView(app: w.app, wid: w.id)
+                    }
+                }
+                // Still not drawn: its app is brought forward for a moment to draw it, when that's allowed (`revive`).
+                // Drawn again, its coordinates hold if it still looks as that picture does, else a new one is wanted.
+                if var f = frozen {
+                    if await revive(w, &f) {
+                        frozen = nil
+                        if await pictureHolds(run.target) == true {
+                            meta[w.id]?.frozen = nil
+                        } else {
+                            why = redrawnSince(app: w.app, wid: w.id)
+                        }
+                    } else {
+                        meta[w.id]?.frozen = f
+                        frozen = f
+                    }
+                }
+                if let f = frozen { (why, instead) = staleAim(f, app: w.app, wid: w.id) }
+            }
             if let why {
                 let rest = i + 1 == actions.count ? "it was" : "actions \(base + i + 1)-\(base + actions.count) were"
                 stopped = "stopped before action \(base + i + 1) (\(kind(a)) by coordinates): \(why); \(rest) not run. "
-                    + (!unseenWindow && run.onlyPopupsOpened() ? "If it's a pop-up you don't want, keypress Escape closes it. " : "")
-                    + (wantShot ? "Look at the new screenshot, then continue." : "Take a screenshot, then continue.")
+                    + (instead ?? (!unseenWindow && run.onlyPopupsOpened() ? "If it's a pop-up you don't want, keypress Escape closes it. " : "")
+                        + (wantShot ? "Look at the new screenshot, then continue." : "Take a screenshot, then continue."))
                 break
             }
             defer { notes += AX.remarks; AX.remarks.removeAll() }
@@ -2559,9 +2974,11 @@ enum Handlers {
                     }
                     // What's over the window before it, so `settle` sees a sheet the action made at once.
                     let overBefore = i < actions.count - 1 && mayOpen(a) ? run.baseline() : nil
+                    Session.current.pressing = []  // the presses its checks let through, kept once it's done
                     try await TargetLookup.$current.withValue(lookup) {
                         try await perform(marked(a, last: i == actions.count - 1, menuLook: !foreground && pid(run.target) != nil), run)
                     }
+                    Policy.pressesMade()
                     // A link followed or a form sent: the next action (or the batch's picture) meets the new page.
                     if let mark = run.pageMark {
                         run.pageMark = nil
@@ -2706,7 +3123,19 @@ enum Handlers {
         // Where the agent is in the window it's shown, beside the picture (`orient`), as what ran makes worth
         // saying: the actions done, and one that failed partway (it may have done something).
         let ran = Array(actions.prefix(done < actions.count && !errors.isEmpty ? done + 1 : done))
-        func oriented(_ r: [String: Any]) -> [String: Any] { readsOnly ? r : orient(r, target, ran: ran) }
+        // The end found the window as the agent's last picture of it, pixel for pixel, though its title had changed
+        // (`undrawn`): its app may not be drawing it.
+        var undrawnEnd = false
+        func oriented(_ r: [String: Any]) async throws -> [String: Any] {
+            readsOnly ? r : try await orient(r, target, ran: ran, undrawn: undrawnEnd) {  // once it's drawn again
+                try await result(target, try await plan(target, region: nil, o).run(), o, zoom: false,
+                                 text: p["text"] as? Bool == true, trim: true)
+            }
+        }
+        func sameButTitle(_ sig: Signature, _ b: Signature) -> Bool {
+            guard target.key == t.key, case .window(let w) = target else { return false }
+            return undrawn(title: Windows.info(w.id)?.title, drawn: meta[w.id]?.title, sig: sig, last: b)
+        }
         // Keys, typing or a click went to the window (`CaretShape`). Ending with no new picture of it, that's kept:
         // a change shaped like a text cursor isn't taken for one blinking until the agent has seen the window again.
         let typedHere = !ran.allSatisfy(CaretShape.leavesTextAlone)
@@ -2795,7 +3224,7 @@ enum Handlers {
                         if let cursorNote { notes.append(cursorNote) }
                         if !notes.isEmpty { out["notes"] = notes }
                         out["window"] = describe(target)
-                        return oriented(out.merging(look.out, uniquingKeysWith: { _, new in new }))
+                        return try await oriented(out.merging(look.out, uniquingKeysWith: { _, new in new }))
                     }
                 }
             }
@@ -2824,7 +3253,7 @@ enum Handlers {
                 out.merge(res) { _, new in new }
                 if let note = partShown(t, shot) { out["notes"] = (out["notes"] as? [String] ?? []) + [note] }
                 out["changed"] = true
-                return oriented(out)
+                return try await oriented(out)
             }
         }
         if end == .check, let b = before {
@@ -2845,9 +3274,12 @@ enum Handlers {
                 if let note = partShown(target, look.shot) { out["notes"] = (out["notes"] as? [String] ?? []) + [note] }
                 out["changed"] = true
                 reportChange(c, target)
-                return oriented(out)
+                return try await oriented(out)
             }
-            if look != nil { out["changed"] = false }  // the agent's last image still holds
+            if let look {  // the agent's last image still holds
+                out["changed"] = false
+                undrawnEnd = sameButTitle(Signature(look.shot.image), b)
+            }
         }
         if end != .settled {
             // No image: the agent still hasn't seen the window, so its coordinates stay unanchored (a picture find
@@ -2864,7 +3296,7 @@ enum Handlers {
             if !notes.isEmpty { out["notes"] = notes }
             out["window"] = describe(target)
             if p["text"] as? Bool == true { out.merge(accessibility(target, o, diff: true)) { _, new in new } }
-            return oriented(out)  // (with "never", the only word of where the focus went)
+            return try await oriented(out)  // (with "never", the only word of where the focus went)
         }
 
         // settle_ms after the last input, then still frames. Ones that show a change from what the agent last
@@ -2992,7 +3424,8 @@ enum Handlers {
             out["changed"] = false
             out["window"] = describe(target)
             if p["text"] as? Bool == true { out.merge(accessibility(target, o, diff: true)) { _, new in new } }
-            return oriented(out)
+            if let b = before { undrawnEnd = sameButTitle(sig, b) }
+            return try await oriented(out)
         }
         // With crop_changes: only the part round what changed, when that's a small part of a window the agent has
         // seen whole lately and nothing about the batch calls for all of it (`ChangeCrop`). All of what changed is
@@ -3050,15 +3483,16 @@ enum Handlers {
             Session.current.edits?.withhold()  // its edits are judged again with the next act's here
             noPicture()  // (the agent has no new picture after the typing)
         }
-        return oriented(out)
+        return try await oriented(out)
     }
 
     // MARK: - where the agent is
 
     /// A reply (`out`) with where the agent is in `t`'s window, beside the picture, as the batch's actions
     /// (`ran`) make worth saying, each field only when there's news (`Session.told`, per window):
-    /// - `url`: the page's address (`shortURL`), after an action that may go to another page (`mayNavigate`),
-    ///   in a browser's window, when it isn't the one the agent was last told;
+    /// - `url`: the page's address (`pageAddress`: its address bar's when the page's can't be read), after an action
+    ///   that may go to another page (`mayNavigate`), in a browser's window, when it isn't the one the agent was last
+    ///   told;
     /// - `focus`: what has the keyboard focus (`AX.focusedSummary`: role and label, or "in another window
     ///   (#N)"), after keys, a click or a press (`movesFocus`), when it changed; an outline's own focus line
     ///   (`focused`) has said it already;
@@ -3066,16 +3500,24 @@ enum Handlers {
     /// - `scroll`: where the batch's last scroll left the scroll bar (`ScrollWatch.place`).
     /// A password field's text is never in it: the focus is named by role and label, and a selection there
     /// isn't read. A browser's or Electron app's accessibility tree isn't switched on for these (`treeReady`).
-    static func orient(_ out: [String: Any], _ t: Target, ran: [[String: Any]]) -> [String: Any] {
+    /// Then what shows the window's app isn't drawing it, when something does (`staleReply`; `undrawn`: the act's end
+    /// found it as the agent's last picture with another title; `recapture`: the picture taken anew, once it's drawn
+    /// again).
+    static func orient(_ out: [String: Any], _ t: Target, ran: [[String: Any]], undrawn: Bool = false,
+                       recapture: (() async throws -> [String: Any])? = nil) async throws -> [String: Any] {
         var out = out
         if let s = Session.current.scrolled { out["scroll"] = s }
         guard case .window(let w) = t else { return out }
         var told = Session.current.told[w.id] ?? Orientation()
         let ready = treeReady(w.pid)
-        if ready, isBrowser(w.pid), ran.contains(where: mayNavigate),
-           let url = AX.pageURL(pid: w.pid, wid: w.id).map(shortURL), url != told.url {
-            out["url"] = url
-            told.url = url
+        var page: (tree: PageTree?, address: String?)?  // read when the page's address couldn't be
+        if ready, isBrowser(w.pid), ran.contains(where: mayNavigate) {
+            let read = pageAddress(w)
+            page = read.page
+            if let url = read.url, url != told.url {
+                out["url"] = url
+                told.url = url
+            }
         }
         if let f = out["focused"] as? String {
             told.focus = f
@@ -3087,23 +3529,39 @@ enum Handlers {
             out["selected"] = selectedText(s.text, count: s.count)
         }
         Session.current.told[w.id] = told
-        return out
+        return try await staleReply(out, w, undrawnEnd: undrawn, page: page, recapture: recapture)
     }
 
     /// A screenshot's reply (`out`) with the page's address in a browser's window, whatever the agent was told
     /// before: a screenshot is how it gets its bearings again (after its context was cut short, too). What the
-    /// reply tells, the address and an outline's focus line, is what it was last told (`Session.told`).
-    static func bearings(_ out: [String: Any], _ t: Target) -> [String: Any] {
+    /// reply tells, the address and an outline's focus line, is what it was last told (`Session.told`). Then what
+    /// shows the window's app isn't drawing it, when something does (`staleReply`, with `recapture`).
+    static func bearings(_ out: [String: Any], _ t: Target,
+                         recapture: (() async throws -> [String: Any])? = nil) async throws -> [String: Any] {
         guard case .window(let w) = t else { return out }
         var out = out
         var told = Session.current.told[w.id] ?? Orientation()
-        if isBrowser(w.pid), treeReady(w.pid), let url = AX.pageURL(pid: w.pid, wid: w.id).map(shortURL) {
-            out["url"] = url
-            told.url = url
+        var page: (tree: PageTree?, address: String?)?  // read when the page's address couldn't be
+        if isBrowser(w.pid), treeReady(w.pid) {
+            let read = pageAddress(w)
+            page = read.page
+            if let url = read.url {
+                out["url"] = url
+                told.url = url
+            }
         }
         if let f = out["focused"] as? String { told.focus = f }
         Session.current.told[w.id] = told
-        return out
+        return try await staleReply(out, w, page: page, recapture: recapture)
+    }
+
+    /// A browser window's page address for a reply: its web page's (`shortURL`), else, when that can't be read (no page
+    /// in its tree, as in a window its app isn't drawing), its address bar's (`shortAddress`), with what was read of
+    /// the page then (`page`).
+    static func pageAddress(_ w: WinInfo) -> (url: String?, page: (tree: PageTree?, address: String?)?) {
+        if let u = AX.pageURL(pid: w.pid, wid: w.id) { return (shortURL(u), nil) }
+        let page = browserPage(w)
+        return (page?.address.map(shortAddress), page)
     }
 
     /// Whether asking `pid`'s accessibility about its page or its focus won't be what switches on its tree:
@@ -3478,6 +3936,8 @@ enum Handlers {
 /// Once the user brings the held app to the front it is really active, so the hold is dropped and the
 /// app is never told it's inactive: AppKit would then believe that while the WindowServer keeps it
 /// frontmost, and Firefox drops every click and drag-select in that state until the user switches apps.
+/// puter-use's own moment of bringing it forward to redraw a window (`Handlers.flash`) keeps the hold: it's
+/// sent again once the user's app is back in front (`restore`).
 @MainActor
 enum Hold {
     static var held: [pid_t: CGWindowID] = [:]
@@ -3506,6 +3966,30 @@ enum Hold {
         for pid in Session.current.holding { lastUse[pid] = Date() }
     }
 
+    /// Apps puter-use brings forward for a moment (`Handlers.flash`), with until when (system uptime) their notices of
+    /// coming forward are its own rather than the user's: a hold on one isn't dropped for them (`restore` sends it
+    /// again).
+    static var flashing: [pid_t: TimeInterval] = [:]
+
+    /// Whether `pid` coming forward now is puter-use's own doing (`flashing`).
+    static func ownActivation(_ pid: pid_t) -> Bool {
+        (flashing[pid] ?? 0) > ProcessInfo.processInfo.systemUptime
+    }
+
+    /// After `pid` was brought forward for a moment and the user's app brought back (`Handlers.flash`): really told
+    /// it's inactive as that came back, so a hold on it is sent again, as a new one (its next click is an activation
+    /// click again). Dropped if it can't be, or if `pid` is still in front (the user's app didn't come back): then
+    /// it's as if the user had brought it forward.
+    static func restore(_ pid: pid_t) {
+        guard let wid = held[pid] else { return }
+        if !isFront(pid), SkyLight.setAppKitActive(pid: pid, wid: wid, true) {
+            fresh.insert(pid)
+            lastUse[pid] = Date()
+        } else {
+            forget(pid)
+        }
+    }
+
     static func activate(pid: pid_t, wid: CGWindowID) -> Bool {
         let me = Session.current
         for other in me.holding where other != pid { drop(other, from: me) }
@@ -3527,7 +4011,7 @@ enum Hold {
                 forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
             ) { note in
                 let pid = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
-                MainActor.assumeIsolated { if let pid, held[pid] != nil { forget(pid) } }
+                MainActor.assumeIsolated { if let pid, held[pid] != nil, !ownActivation(pid) { forget(pid) } }
             }
         }
         return true

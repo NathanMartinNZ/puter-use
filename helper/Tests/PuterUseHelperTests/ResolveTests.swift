@@ -94,6 +94,24 @@ final class ResolveTests: XCTestCase {
         XCTAssertNil(Handlers.appWindow([], query: "App", current: 1, own: [1], noted: []))
     }
 
+    /// A browser's name with no window of the session's to mean falls back to the user's front window: said once
+    /// per window, with how to get one of its own. Not for other apps, nor for a window of the agent's.
+    func testABrowsersNameMeaningTheUsersFrontWindowSaysSo() throws {
+        let front = WinInfo(id: 31, pid: 1, app: "Firefox", title: "YouTube", frame: CGRect(x: 0, y: 0, width: 400, height: 300),
+                            layer: 0, onScreen: true)
+        let wins = [front, win(32)]
+        let hit = try XCTUnwrap(Handlers.appWindow(wins, query: "Firefox", current: nil, own: [], noted: [], browser: true))
+        XCTAssertEqual(hit.window.id, 31)
+        XCTAssertEqual(hit.note?.text, "\"Firefox\" means the user's front window #31 \"YouTube\"; navigate opens one of your own")
+        XCTAssertEqual(hit.note?.pair, [31])
+        XCTAssertNil(Handlers.appWindow(wins, query: "Firefox", current: nil, own: [], noted: [[31]], browser: true)?.note)
+        XCTAssertNil(Handlers.appWindow(wins, query: "Notes", current: nil, own: [], noted: [])?.note, "not a browser")
+        XCTAssertNil(Handlers.appWindow(wins, query: "Firefox", current: nil, own: [], noted: [], agent: [31], browser: true)?.note)
+        // Its own window, or the one it's on: as before.
+        XCTAssertEqual(Handlers.appWindow(wins, query: "Firefox", current: nil, own: [32], noted: [], browser: true)?.note?.text,
+                       "\"Firefox\" is your own window #32; Firefox's front window is #31 \"YouTube\"")
+    }
+
     /// macOS's dictation orb, shown as an untitled window of the app (often its front one), is never what
     /// its name means while the app has another window; the one it's on (by id earlier) still is.
     func testAnAppNameSkipsTheDictationOrb() {

@@ -27,21 +27,30 @@ enum Windows {
         let opts: CGWindowListOption = onScreenOnly
             ? [.optionOnScreenOnly, .excludeDesktopElements] : [.optionAll, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return [] }
-        return list.compactMap { d in
-            guard let id = d[kCGWindowNumber as String] as? CGWindowID,
-                  let pid = d[kCGWindowOwnerPID as String] as? pid_t,
-                  let b = d[kCGWindowBounds as String] as? NSDictionary,
-                  let frame = CGRect(dictionaryRepresentation: b)
-            else { return nil }
-            return WinInfo(
-                id: id, pid: pid,
-                app: d[kCGWindowOwnerName as String] as? String ?? "",
-                title: d[kCGWindowName as String] as? String ?? "",
-                frame: frame,
-                layer: d[kCGWindowLayer as String] as? Int ?? 0,
-                onScreen: d[kCGWindowIsOnscreen as String] as? Bool ?? false,
-                alpha: d[kCGWindowAlpha as String] as? Double ?? 1)
-        }
+        return list.compactMap(parse)
+    }
+
+    /// The windows on screen over window `wid`, front to back.
+    static func above(_ wid: CGWindowID) -> [WinInfo] {
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], wid) as? [[String: Any]]
+        return (list ?? []).compactMap(parse)
+    }
+
+    /// One window of the window server's list.
+    static func parse(_ d: [String: Any]) -> WinInfo? {
+        guard let id = d[kCGWindowNumber as String] as? CGWindowID,
+              let pid = d[kCGWindowOwnerPID as String] as? pid_t,
+              let b = d[kCGWindowBounds as String] as? NSDictionary,
+              let frame = CGRect(dictionaryRepresentation: b)
+        else { return nil }
+        return WinInfo(
+            id: id, pid: pid,
+            app: d[kCGWindowOwnerName as String] as? String ?? "",
+            title: d[kCGWindowName as String] as? String ?? "",
+            frame: frame,
+            layer: d[kCGWindowLayer as String] as? Int ?? 0,
+            onScreen: d[kCGWindowIsOnscreen as String] as? Bool ?? false,
+            alpha: d[kCGWindowAlpha as String] as? Double ?? 1)
     }
 
     static func info(_ id: CGWindowID) -> WinInfo? {
@@ -139,11 +148,21 @@ enum Windows {
     /// `Capture.planWindow` composites into `w`'s screenshot (`Capture.related`: only what overlaps `w` or a
     /// window already taken, nothing faint or tiny, and not the menu-bar or tooltip layers): a click or a
     /// pointer move goes to whichever of the app's windows is really at its point, whether or not the picture
-    /// shows that window.
+    /// shows that window. Accessibility is asked about those on its layer (`Capture.kin`) only when there are some.
     static func popups(over w: WinInfo) -> [WinInfo] {
         let mine = all(onScreenOnly: true).filter { $0.pid == w.pid }  // front to back
         guard let i = mine.firstIndex(where: { $0.id == w.id }) else { return [] }
-        return mine[..<i].filter { $0.frame.width > 1 && ($0.layer > w.layer || w.frame.contains($0.frame)) }
+        let front = Array(mine[..<i])
+        let ask = Set(front.filter { $0.layer == w.layer && $0.frame.width > 1 && w.frame.contains($0.frame) }.map(\.id))
+        return popups(front, over: w, kin: ask.isEmpty ? [:] : Capture.kin(of: ask, around: w.id, pid: w.pid))
+    }
+
+    /// Of the app's windows in front of `w` (`front`), those a click at their point goes to instead of `w`: on a higher
+    /// layer, or inside it on its layer, but not another of the app's own windows there (one the same size over it,
+    /// say, maybe the user's: `kin`, as accessibility says), since a click stamped for `w` goes to `w` under it. One
+    /// accessibility couldn't be asked about is taken, as a sheet would be.
+    nonisolated static func popups(_ front: [WinInfo], over w: WinInfo, kin: [CGWindowID: Capture.Kin]) -> [WinInfo] {
+        front.filter { $0.frame.width > 1 && ($0.layer > w.layer || (w.frame.contains($0.frame) && kin[$0.id] != .another)) }
     }
 
     /// Topmost on-screen window at a global point (used for whole-screen mode), skipping our overlays.

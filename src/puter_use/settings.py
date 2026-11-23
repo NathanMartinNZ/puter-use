@@ -36,13 +36,41 @@ def capture_params() -> dict:
         "app_cards": env("PUTER_USE_APP_CARDS", "1") != "0",
         # Longest accessibility outline sent (characters); longer ones are cut with a note.
         "max_chars": int(env("PUTER_USE_OUTLINE_CHARS", "8000")),
+        # Whether an app may be brought forward for a moment to redraw one of the agent's windows (see
+        # `bring_forward`).
+        "bring_forward": bring_forward(),
     }
     if trace := env("PUTER_USE_TRACE"):  # JSON-lines log of every event sent (scripts/check_motion.py)
         params["trace"] = trace
+    if profile := browser_profile():  # navigate goes to the agent's own Firefox, on this profile
+        params["browser_profile"] = profile
     for key in ("max_width", "max_height"):  # optional pixel caps on top of scale/max_tokens
         if v := env(f"PUTER_USE_{key.upper()}"):
             params[key] = int(v)
     return params
+
+
+def browser_profile() -> str | None:
+    """PUTER_USE_BROWSER_PROFILE=agent: a navigate with no window, or one aimed at Firefox by name, goes to the
+    agent's own Firefox, a second instance on a puter-use profile started in the background, instead of the user's
+    Firefox or the default browser. An absolute path (a leading `~` is expanded) instead: the same, on that profile
+    folder (the helper uses only a new or empty one, or one it set up). "agent", the path, or None (anything else,
+    or unset: off, the default)."""
+    value = (os.environ.get("PUTER_USE_BROWSER_PROFILE") or "").strip()
+    if value.lower() == "agent":
+        return "agent"
+    path = os.path.expanduser(value)
+    return path if os.path.isabs(path) else None
+
+
+def bring_forward() -> str:
+    """PUTER_USE_BRING_FORWARD: "when-needed" (the default) or "never". When one of the agent's own windows
+    has stopped drawing while covered (Firefox does that) and the user has left the keyboard and mouse alone
+    for a few seconds, the helper brings its app forward for a moment, until the window draws again, then
+    gives focus back to the app the user was in. "never" (or "off", "0", "false", "no"): it only says the window
+    isn't being drawn. Anything else counts as the default."""
+    value = (os.environ.get("PUTER_USE_BRING_FORWARD") or "").strip().lower()
+    return "never" if value in ("never", "off", "0", "false", "no") else "when-needed"
 
 
 def session(default: str) -> str:

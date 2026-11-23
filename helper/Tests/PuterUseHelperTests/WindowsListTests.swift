@@ -38,6 +38,14 @@ final class WindowsListTests: XCTestCase {
         XCTAssertNil(tags[4])
     }
 
+    /// One of the agent's windows the user has used since is tagged so, after `yours`; only the agent's are.
+    func testAWindowTheUserHasUsedIsTaggedUsed() {
+        let wins = [Self.win(1, pid: 10), Self.win(2, pid: 10)]
+        let tags = Handlers.windowTags(wins, agent: [1], used: [1, 2], current: 1, front: nil, keys: [:])
+        XCTAssertEqual(tags[1], ["yours", "used", "current"])
+        XCTAssertNil(tags[2], "not the agent's: nothing to say")
+    }
+
     /// The front window is the front app's first on screen (the list runs front to back); a hidden one never is.
     func testTheFrontWindowIsTheFrontAppsFirstOnScreen() {
         let wins = [Self.win(1, pid: 10, onScreen: false), Self.win(2, pid: 20), Self.win(3, pid: 10), Self.win(4, pid: 10)]

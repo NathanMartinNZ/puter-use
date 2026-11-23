@@ -7,9 +7,10 @@ failed or the batch stopped early.
 ## Looking
 
 - `puter-use windows [APP] [--launch]` lists the windows by app, `App: id "title" (tags)`: `yours`
-  (you opened it), `current` (the one you're on), `front` (the user's top window), `keyboard` (gets its
-  app's keys), `hidden`; `--launch` opens the app in the background. An app name works as the window
-  anywhere, so this is only for choosing among several.
+  (you opened it), `used by the user` (yours, but they've been in it since), `current` (the one you're
+  on), `front` (the user's top window), `keyboard` (gets its app's keys), `hidden`; `--launch` opens the
+  app in the background. An app name works as the window anywhere, so this is only for choosing among
+  several.
 - `puter-use shot <id|app>` captures that window. Screenshots are downscaled to save context:
   coordinates are pixels in the **latest full screenshot** of that window, and the tool maps them to
   the real window.

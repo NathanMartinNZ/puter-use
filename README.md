@@ -13,10 +13,16 @@ Computer Use, for any agent that speaks MCP.
 
 - **Works in the background.** Events go straight to the target window. Your real pointer never
   moves and the app you're using stays in front. A purple cursor shows where the agent is acting.
+  (One exception, on by default: when an agent's own window has stopped drawing while covered and
+  you've left the keyboard and mouse alone, its app comes forward for a moment to redraw it, then
+  yours comes back. `PUTER_USE_BRING_FORWARD=never` turns that off.)
   If you take the keyboard in the same app (bring another of its windows forward), its typing and
   shortcuts stop and say so, rather than landing in your window.
 - **Light on context.** Only the target window is captured, even when it's covered, at about
   350-800 image tokens. After an action, a new screenshot is sent only if the window changed.
+  (An app can stop drawing a window that's fully covered, browsers mainly: then the reply says its
+  picture may be old. Firefox can be started so it keeps drawing them: see [Keeping your Firefox's
+  covered windows drawn](docs/configuration.md#keeping-your-firefoxs-covered-windows-drawn).)
 - **Hard to misclick.** The agent can aim by what a control says (`target: "Save"`) instead of by
   pixels, and a batch stops if something opens over the window part-way through.
 - **Fewer model calls.** One call runs many steps: clicks, typing, shortcuts, menu commands, a whole
@@ -154,6 +160,8 @@ you're most likely to want:
 | `PUTER_USE_TYPING_WPM` | `280` | typing speed; `0` = as fast as possible |
 | `PUTER_USE_CURSOR` | `1` | `0` hides the agent cursor |
 | `PUTER_USE_TILE` | `28` | image tile size: 28 for Claude, 32 for OpenAI models |
+| `PUTER_USE_BRING_FORWARD` | `when-needed` | `never`: don't bring an app forward for a moment to redraw an agent's window that stopped drawing while covered ([details](docs/configuration.md#keeping-your-firefoxs-covered-windows-drawn)) |
+| `PUTER_USE_BROWSER_PROFILE` | unset | `agent`: `navigate` uses a Firefox of the agent's own, apart from yours: you sign in to sites there once, and it adds a second Firefox icon to the Dock; or an absolute path to a profile folder for it ([details](docs/configuration.md#the-agents-own-firefox)) |
 
 Opt-in [leaner MCP profiles](docs/configuration.md#leaner-mcp-profiles) cut what the server puts in an
 agent's context: a thin `act` schema (`PUTER_USE_SCHEMA=thin`), no macros (`PUTER_USE_MACROS=0`),
@@ -202,8 +210,9 @@ server or CLI. It starts on demand. Input goes to one app's process through priv
 - **Same app, another window.** Keys go to the app's key window, whatever window they're stamped
   for: if you bring another window of the agent's app forward, its typing, shortcuts, modifier-clicks
   and menu commands stop with an error naming the window that has the keyboard, instead of acting on
-  yours. Its clicks still go to its own window. Switch away (or focus its window) and retry, or use
-  `foreground=true` knowingly.
+  yours. Its clicks still go to its own window. Once you switch away, its next keys move the app's
+  keyboard back to its own window, which is then in front when you return to the app. Use
+  `foreground=true` only knowingly.
 - **Hover.** Apps work out hover from the real pointer (AppKit tracking areas, Firefox), so a
   background `move` reaches the app as mouse-moved events but doesn't light up hover effects or open
   hover menus. Click instead, or use `foreground=true`.

@@ -173,7 +173,10 @@ enum Capture {
                         frame: w.frame, layer: w.windowLayer, onScreen: w.isOnScreen, alpha: alpha[w.windowID] ?? 1)
             }
             let mine = content.windows.filter { $0.owningApplication?.processID == pid }
-            let ids = Set(Capture.related(to: info(win), among: mine.map(info), display: display.frame).map(\.id))
+            // What the app's windows on the window's own layer over it are is asked only when there are some.
+            let ask = Capture.kinAsked(to: info(win), among: mine.map(info), display: display.frame)
+            let kin = ask.isEmpty ? [:] : Capture.kin(of: ask, around: wid, pid: pid)
+            let ids = Set(Capture.related(to: info(win), among: mine.map(info), display: display.frame, kin: kin).map(\.id))
             let taken = mine.filter { ids.contains($0.windowID) }
             var rect = win.frame
             for w in taken where w.windowLayer > win.windowLayer { rect = rect.union(w.frame) }
@@ -200,18 +203,35 @@ enum Capture {
     /// bar's status items (20-25), and tooltips, drag images and above (`overLayer` and up).
     static let barLayers = 20...25, overLayer = 200
 
-    /// The windows composited into a capture of `win`: the window itself; its sheets and attached panels
-    /// (the same layer, inside it); and the menus, popovers and panels over it (a higher layer) that
-    /// overlap it or one already taken, so a cascade of submenus comes whole wherever it reaches. Only
-    /// `win`'s app's, on screen on `display`, and big and opaque enough to see (as `WindowSet.of`
-    /// counts them). The app's menu-bar items, its tooltips and its other windows that merely sit nearby
-    /// are left out: each would widen the picture (and blur the window to fit the token cap) or change
-    /// its size whenever it came or went.
-    static func related(to win: WinInfo, among windows: [WinInfo], display: CGRect) -> [WinInfo] {
+    /// What accessibility says one of the app's windows on the captured window's own layer is (`kin`), for
+    /// `related`: another of the app's windows with a title bar of its own (another document, maybe the user's), or
+    /// what hangs off another one (`another`); what hangs off the captured window (`attached`: a sheet, drawer or
+    /// popover); or neither, or not listed at all (`other`: a dialog, a child panel).
+    enum Kin: Equatable { case another, attached, other }
+
+    /// Roles of what hangs off a window rather than standing on its own.
+    nonisolated static let hanging: Set<String> = ["AXSheet", "AXDrawer", "AXPopover"]
+
+    /// The `Kin` of a window accessibility lists with `role` and `subrole`, with the window it says it hangs off
+    /// (`parent`; nil: none said), the captured window being `wid`.
+    nonisolated static func kin(role: String?, subrole: String?, parent: CGWindowID?, of wid: CGWindowID) -> Kin {
+        if let role, hanging.contains(role) {
+            guard let parent else { return .other }
+            return parent == wid ? .attached : .another
+        }
+        return role == "AXWindow" && subrole == "AXStandardWindow" ? .another : .other
+    }
+
+    /// The windows composited into a capture of `win`: the window itself; what hangs off it on its own layer
+    /// (`sameLayer`); and the menus, popovers and panels over it (a higher layer) that overlap it or one already
+    /// taken, so a cascade of submenus comes whole wherever it reaches. Only `win`'s app's, on screen on
+    /// `display`, and big and opaque enough to see (as `WindowSet.of` counts them). The app's menu-bar items, its
+    /// tooltips and its other windows that merely sit nearby are left out: each would widen the picture (and blur
+    /// the window to fit the token cap) or change its size whenever it came or went.
+    static func related(to win: WinInfo, among windows: [WinInfo], display: CGRect, kin: [CGWindowID: Kin]) -> [WinInfo] {
         let mine = windows.filter { $0.pid == win.pid && $0.onScreen && $0.frame.intersects(display) }
-        func seen(_ w: WinInfo) -> Bool { w.alpha > 0.05 && w.frame.width >= 30 && w.frame.height >= 20 }
         var out = mine.filter { w in
-            w.id == win.id || (w.layer == win.layer && seen(w) && win.frame.contains(w.frame))  // sheets / attached panels
+            w.id == win.id || (w.layer == win.layer && seen(w) && sameLayer(w.frame, of: win.frame, kin: kin[w.id]))
         }
         var over = mine.filter { w in
             w.id != win.id && w.layer > win.layer && !barLayers.contains(w.layer) && w.layer < overLayer && seen(w)
@@ -220,6 +240,91 @@ enum Capture {
         while let i = over.firstIndex(where: { w in reached.contains { $0.insetBy(dx: -2, dy: -2).intersects(w.frame) } }) {
             reached.append(over[i].frame)
             out.append(over.remove(at: i))
+        }
+        return out
+    }
+
+    /// Big and opaque enough to see, as `WindowSet.of` counts windows.
+    nonisolated static func seen(_ w: WinInfo) -> Bool { w.alpha > 0.05 && w.frame.width >= 30 && w.frame.height >= 20 }
+
+    /// Whether one of the app's windows on the captured window's layer (at `frame`; the captured one at `of`) is
+    /// part of its picture, by what accessibility says it is (`kin`; nil: it couldn't be asked). Over it, such a
+    /// window can be another of the app's windows the same size or smaller, whose picture would stand in for the
+    /// captured one's: in a browser, maybe the user's window in the agent's screenshot. So it's taken only when it
+    /// hangs off the captured window (a sheet, drawer or popover) and overlaps it, or when it's neither that nor one
+    /// of the app's own windows (a dialog, a child panel accessibility doesn't list) and lies inside it below its top
+    /// edge, as a sheet does: one that starts at the same top edge has its title bar where the captured one's is, so
+    /// it's a window of its own. Never another of the app's own windows, whatever its frame, nor anything when
+    /// accessibility couldn't say.
+    nonisolated static func sameLayer(_ frame: CGRect, of win: CGRect, kin: Kin?) -> Bool {
+        switch kin {
+        case .attached: return frame.intersects(win)
+        case .other: return win.contains(frame) && frame.minY > win.minY + 2
+        case .another, nil: return false
+        }
+    }
+
+    /// The app's windows on `win`'s layer whose `Kin` `related` needs: those big enough to see that overlap it on
+    /// `display`. Usually none, so accessibility isn't asked at all.
+    static func kinAsked(to win: WinInfo, among windows: [WinInfo], display: CGRect) -> Set<CGWindowID> {
+        Set(windows.filter { w in
+            w.id != win.id && w.pid == win.pid && w.onScreen && w.layer == win.layer && seen(w)
+                && w.frame.intersects(display) && w.frame.intersects(win.frame)
+        }.map(\.id))
+    }
+
+    /// What accessibility says each of `ids` is (`Kin`), all windows of app `pid` on the layer of its window `wid`:
+    /// `attached` when `wid` holds it as a sheet, drawer or popover; else by its role in the app's window list, and
+    /// the window it says it hangs off; `other` when neither lists it. Empty when the app's windows can't be read
+    /// (the app is busy), so none is taken. Asked with a short timeout, without switching on a browser's tree
+    /// (windows and their sheets are there either way).
+    static func kin(of ids: Set<CGWindowID>, around wid: CGWindowID, pid: pid_t) -> [CGWindowID: Kin] {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+        guard let wins = AX.value(app, kAXWindowsAttribute) as? [AXUIElement] else { return [:] }
+        func number(_ el: AXUIElement) -> CGWindowID? {
+            var id: CGWindowID = 0
+            return _AXUIElementGetWindow(el, &id) == .success ? id : nil
+        }
+        func kinOf(_ el: AXUIElement) -> Kin {
+            AXUIElementSetMessagingTimeout(el, 0.3)
+            let role = AX.value(el, kAXRoleAttribute) as? String
+            var parent: CGWindowID?
+            if let role, hanging.contains(role), let p = AX.value(el, kAXParentAttribute), CFGetTypeID(p) == AXUIElementGetTypeID() {
+                parent = number(p as! AXUIElement)
+            }
+            return kin(role: role, subrole: AX.value(el, kAXSubroleAttribute) as? String, parent: parent, of: wid)
+        }
+        var out: [CGWindowID: Kin] = [:]
+        var unnumbered: [AXUIElement] = []  // listed, but which window each is can't be told
+        for el in wins {
+            guard let id = number(el) else {
+                unnumbered.append(el)
+                continue
+            }
+            if id == wid {
+                // What hangs off the captured window is among its children.
+                AXUIElementSetMessagingTimeout(el, 0.3)
+                for c in AX.children(el) {
+                    AXUIElementSetMessagingTimeout(c, 0.3)
+                    guard let cid = number(c), cid != wid, ids.contains(cid),
+                          (AX.value(c, kAXRoleAttribute) as? String).map(hanging.contains) == true else { continue }
+                    out[cid] = .attached
+                }
+            } else if ids.contains(id), out[id] == nil {
+                out[id] = kinOf(el)
+            }
+        }
+        // Not listed by its number: told by its frame among those listed without one, if one has it (that may be the
+        // captured window itself, the same size: then it's one of the app's own windows either way, and left out).
+        for id in ids where out[id] == nil {
+            guard let f = Windows.info(id)?.frame,
+                  let el = unnumbered.first(where: { AX.frame($0).map { abs($0.minX - f.minX) < 2 && abs($0.minY - f.minY) < 2 } ?? false })
+            else {
+                out[id] = .other
+                continue
+            }
+            out[id] = kinOf(el)
         }
         return out
     }

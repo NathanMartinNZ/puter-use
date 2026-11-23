@@ -608,7 +608,9 @@ extension Handlers {
 
     /// navigate {url, new_window}: go to a web address in a browser window: cmd+l, the address, Return,
     /// then wait for the page to load. In a window the agent didn't open, it opens its own first
-    /// (new_window defaults to true there), so the user's tabs are left alone.
+    /// (new_window defaults to true there), so the user's tabs are left alone: by cmd+n, or through the
+    /// app's menu when keys wouldn't reach the window and the app is in the background (`newWindowBy`);
+    /// either way moved off the user's windows of the app (`takeOwnWindow`).
     static func navigate(_ a: [String: Any], _ run: Run) async throws {
         guard let url = (a["url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty else {
             throw HelperError("navigate needs url")
@@ -618,10 +620,18 @@ extension Handlers {
         }
         var r = try route(run.target, at: nil, foreground: run.foreground)
         if a["new_window"] as? Bool ?? !agentWindows.contains(w.id) {
-            try await press(["cmd", "n"], r)
-            guard let nw = try await run.newWindow(pid: w.pid, timeout: 4) else { throw HelperError("cmd+n opened no new window") }
-            agentWindows.insert(nw.id)
-            try await run.moveTo(nw, note: "opened its own window #\(nw.id)")
+            let nw: WinInfo
+            if newWindowBy(foreground: run.foreground, keysReach: keysReachTarget(r), front: Hold.isFront(w.pid)) == .menu,
+               let byMenu = try await newWindowByMenu(a, run, from: w) {
+                nw = byMenu
+            } else {  // (in the user's front app, with another window holding its keyboard, guardKeyboard stops the keys)
+                let keyBefore = AX.focusedWindow(pid: w.pid), front = Hold.isFront(w.pid)
+                try await press(["cmd", "n"], r)
+                guard let opened = try await run.newWindow(pid: w.pid, timeout: 4) else { throw HelperError("cmd+n opened no new window") }
+                agentWindows.insert(opened.id)
+                nw = try await takeOwnWindow(opened, run, from: w, keyBefore: keyBefore, front: front,
+                                             note: "opened its own window #\(opened.id)")
+            }
             r = try route(run.target, at: nil, foreground: run.foreground)
             // It focuses its address bar: go on once it has (cmd+l needs the keyboard in it, and the address is
             // pasted only into an address bar), or after 0.6 s anyway.
@@ -634,6 +644,165 @@ extension Handlers {
         let before = shownPage(run)
         try await press(["Return"], r)
         try await awaitPage(url, before: before, run, timeout: pageTimeout(a))
+    }
+
+    /// How navigate opens its own window: by the shortcut's keys, or by pressing the app's New Window menu item
+    /// through accessibility (`menu`). Keys go to the app's key window, so when that's another window (the user's has
+    /// the app's keyboard: `keysReach` false) they'd stop (`guardKeyboard`); the menu needs no keyboard. Only while
+    /// the app is in the background (`front` false): the new window takes the app's keyboard, and in the user's front
+    /// app that's where their typing goes, so there the keys stop and say so instead. Never in foreground mode.
+    enum NewWindowBy: Equatable { case keys, menu }
+
+    nonisolated static func newWindowBy(foreground: Bool, keysReach: Bool, front: Bool) -> NewWindowBy {
+        !foreground && !keysReach && !front ? .menu : .keys
+    }
+
+    /// What becomes of the window that appears after navigate pressed the New Window menu item: used when it's a fresh
+    /// one (`freshWindow`) and the user is still out of the app; kept as the agent's but left where it is when they've
+    /// come into the app meanwhile (`userCameIn`: it's in front of them now); else not used (`notFresh`), as a page
+    /// of the user's may have opened it.
+    enum MenuWindow: Equatable { case use, userCameIn, notFresh }
+
+    nonisolated static func menuWindow(fresh: Bool, front: Bool) -> MenuWindow {
+        guard fresh else { return .notFresh }
+        return front ? .userCameIn : .use
+    }
+
+    /// Whether a new browser window is a fresh one, as New Window opens it, rather than one a page opened: one tab
+    /// (`tabs`; nil when the tab strip can't be read or isn't shown) showing a new-tab or blank page, by its page's
+    /// address (`url`), else by its address bar (`address`: empty on a new tab). Nothing to go by isn't fresh.
+    nonisolated static func freshWindow(tabs: Int?, url: String?, address: String?) -> Bool {
+        if let tabs, tabs != 1 { return false }
+        if let url { return blankPage(url) }
+        if let address { return blankPage(address) }
+        return false
+    }
+
+    /// Whether an address is a browser's new-tab, start or blank page ("about:home", "chrome://newtab/",
+    /// "favorites://"), or empty.
+    nonisolated static func blankPage(_ s: String) -> Bool {
+        let t = s.trimmingCharacters(in: .whitespaces).lowercased()
+        guard let colon = t.firstIndex(of: ":") else { return t.isEmpty }
+        let scheme = String(t[..<colon])
+        var rest = t[t.index(after: colon)...]
+        while rest.hasPrefix("/") { rest = rest.dropFirst() }
+        while rest.hasSuffix("/") { rest = rest.dropLast() }
+        if scheme == "favorites" || scheme == "topsites" { return true }
+        return ["about", "chrome", "edge", "brave", "vivaldi", "opera", "arc"].contains(scheme)
+            && ["blank", "home", "newtab", "new-tab-page", "new-tab-page-third-party", "startpage"].contains(String(rest))
+    }
+
+    /// navigate's own window, opened through the app's New Window menu item (the one cmd+n runs, pressed through
+    /// accessibility, after the policy's check of its title) while another window has the app's keyboard and the app
+    /// is in the background (`newWindowBy`). The new window takes the app's keyboard and lands where the app cascades
+    /// it, over the user's window it came from, so it's moved off the user's windows as cmd+n's is (`takeOwnWindow`).
+    /// Used only when it's fresh (`menuWindow`). Nil when the user came into the app before the press: the keys go
+    /// then, and say why they stop.
+    static func newWindowByMenu(_ a: [String: Any], _ run: Run, from w: WinInfo) async throws -> WinInfo? {
+        let app = Policy.appName(w.pid)
+        let keyBefore = AX.focusedWindow(pid: w.pid)
+        guard let (item, title) = AX.menuItem(pid: w.pid, shortcut: ["cmd", "n"]) else {
+            let at = keyBefore.map { " (#\($0))" } ?? ""
+            throw HelperError("keys for #\(w.id) would go to the window with \(app)'s keyboard\(at), and \(app) has no menu item "
+                + "for cmd+n to press instead: nothing was done. Ask the user to click into #\(w.id)")
+        }
+        try Policy.checkItem(a, title)
+        try Connection.check()
+        guard !Hold.isFront(w.pid) else { return nil }  // looked at again just before: the user may have come in
+        guard AX.act(item, kAXPressAction) == .success else {
+            throw HelperError("\(app)'s \"\(title)\" menu item couldn't be pressed (keys would have gone to another window): "
+                + "nothing was done. Ask the user to click into #\(w.id)")
+        }
+        guard let nw = try await run.newWindow(pid: w.pid, timeout: 4) else {
+            throw HelperError("pressed \(app)'s \"\(title)\" menu item, but no new window appeared")
+        }
+        // A new window's page and tab strip take a moment to be readable.
+        let fresh = try await Run.poll(floor: 0, every: 0.08, cap: 1.2, { () -> (Bool, Bool) in
+            let win = AX.window(pid: nw.pid, wid: nw.id)
+            let url = AX.pageURL(pid: nw.pid, wid: nw.id), address = win.flatMap { AX.addressText(in: $0) }
+            return (freshWindow(tabs: tabCount(nw), url: url, address: address), url != nil || address != nil)
+        }) { $0.0 || $0.1 }.0
+        let shows = (Windows.info(nw.id) ?? nw).title
+        switch menuWindow(fresh: fresh, front: Hold.isFront(w.pid)) {
+        case .notFresh:
+            throw HelperError("window #\(nw.id)" + (shows.isEmpty ? "" : " \"\(AX.clip(shows, 40))\"") + " opened after \(app)'s "
+                + "\"\(title)\" menu item was pressed, but it isn't a new empty window, so it wasn't used: a page of the user's "
+                + "may have opened it. Ask the user before you use or close it")
+        case .userCameIn:
+            agentWindows.insert(nw.id)
+            throw HelperError("opened your window #\(nw.id) through \(app)'s menu, but the user came into \(app) meanwhile, so "
+                + "it's in front of them: it wasn't moved, and nothing more was done. This clears when they leave \(app); or ask them")
+        case .use:
+            agentWindows.insert(nw.id)
+        }
+        return try await takeOwnWindow(nw, run, from: w, keyBefore: keyBefore, front: false,
+                                       note: "opened your window #\(nw.id) through \(app)'s menu")
+    }
+
+    /// navigate's own new window `nw`, opened from window `w` (by cmd+n or through the menu: `note` says which), taken
+    /// for the rest of the batch (`Run.moveTo`). The app cascades a new window over the one it came from, so when it
+    /// would cover any of the user's windows of the app on its screen, it's moved at once to where it covers least of
+    /// them (`ownWindowSpot`; theirs never move), at the size the batch's box gives a new window; not when the user may
+    /// have opened it (`Run.arrange`), nor in foreground mode (as `Run.moveTo` places none there). When it took the
+    /// app's keyboard from `keyBefore` while the app was in the background (`front` false, as the key or menu item was
+    /// pressed), that's kept as the background keyboard move is: keys stop if the user switches in (`switchedIn`). The
+    /// note says where it went and that it has the keyboard. The window as it is then.
+    static func takeOwnWindow(_ nw: WinInfo, _ run: Run, from w: WinInfo, keyBefore: CGWindowID?, front: Bool,
+                              note: String) async throws -> WinInfo {
+        let app = Policy.appName(w.pid)
+        let now = Windows.info(nw.id) ?? nw
+        var moved = ""
+        let may = run.arrange(w.pid)
+        if !run.foreground, may.place, let screen = AX.screen(of: now.frame, AX.visibleScreens()) {
+            let theirs = Windows.all(onScreenOnly: true).filter {
+                $0.pid == w.pid && $0.layer == 0 && $0.id != nw.id && $0.alpha > 0.05 && owner($0.id) != .agent
+            }.map(\.frame)
+            let box = may.fit ? run.fitBox(for: nw.id) : nil
+            let size = CGSize(width: min(now.frame.width, box?.width ?? .infinity), height: min(now.frame.height, box?.height ?? .infinity))
+            if let to = ownWindowSpot(frame: now.frame, size: size, screen: screen, theirs: theirs),
+               let f = AX.place(pid: nw.pid, wid: nw.id, at: to) {
+                try await Run.placed(nw.id, at: f)
+                moved = movedOffNote(before: Run.covered(CGRect(origin: now.frame.origin, size: size), by: theirs),
+                                     after: Run.covered(f, by: theirs))
+                let resized = abs(f.width - now.frame.width) > 1 || abs(f.height - now.frame.height) > 1
+                moved += resized ? ", sized to \(Int(f.width))x\(Int(f.height)) pt" : ""
+            }
+        }
+        let keyed = AX.focusedWindow(pid: w.pid) == nw.id
+        // Taken off the user's window as the background keyboard move does: keys stop if they switch in (`switchedIn`).
+        if keyed, !front, let from = keyBefore, from != nw.id {
+            Session.current.keyMove = KeyMove(pid: w.pid, wid: nw.id, from: from, took: true)
+        }
+        let at = notes.count
+        try await run.moveTo(Windows.info(nw.id) ?? nw, note: note + moved)
+        // After what moveTo adds to the note (the size it shrank it to).
+        if keyed, !run.foreground, at < notes.count { notes[at] += keyboardNote(front: front, app: app) }
+        return Windows.info(nw.id) ?? nw
+    }
+
+    /// Where navigate's own new window, at `frame` as its app opened it, goes on `screen` (its visible area): where it
+    /// covers least of the user's windows of its app there (`theirs`, which never move; `Run.leastCovering`), at `size`
+    /// (what the batch's box gives a new window), wholly on that screen. Nil when it stays where it is: at that size
+    /// where it opened it covers none of theirs (`Run.moveTo` shrinks it there), or it's there already.
+    nonisolated static func ownWindowSpot(frame: CGRect, size: CGSize, screen: CGRect, theirs: [CGRect]) -> CGRect? {
+        guard Run.covered(CGRect(origin: frame.origin, size: size), by: theirs) >= 1 else { return nil }
+        let to = Run.leastCovering(size: size, from: frame.origin, screen: screen, avoid: theirs)
+        return Run.matches(frame, to) ? nil : to
+    }
+
+    /// What navigate's note on its own new window says of its move (`ownWindowSpot`), from how much of the user's
+    /// windows it covered where it opened (`before`) and covers now (`after`, in square points): off them, or onto as
+    /// little of them as the screen has room for; nothing when it covers no less.
+    nonisolated static func movedOffNote(before: CGFloat, after: CGFloat) -> String {
+        if after < 1 { return " and moved it off the user's windows" }
+        return after < before ? " and moved it to where it covers least of the user's windows (the screen has no free spot its size)" : ""
+    }
+
+    /// What navigate's note on its own new window adds when it has `app`'s keyboard: it's in front when the user next
+    /// switches to the app, or, when the app was their front app already (`front`), it's where their keys go now.
+    nonisolated static func keyboardNote(front: Bool, app: String) -> String {
+        front ? "; it now has \(app)'s keyboard, and \(app) is the user's front app"
+            : "; it now has \(app)'s keyboard, so it'll be in front when the user next switches to \(app)"
     }
 
     /// A browser window ready for an address: the app's key window, with its focus on a text input in it
@@ -656,10 +825,16 @@ extension Handlers {
     /// After the Return that goes to `url` from the address bar: wait for the page to load, with a note when
     /// it hasn't, or when the window still shows the page it showed `before` (Return didn't take).
     static func awaitPage(_ url: String, before: [String?]?, _ run: Run, timeout: Double) async throws {
-        if case .window(let now) = run.target,
-           !(try await AX.waitForPage(pid: now.pid, wid: now.id, timeout: timeout, first: firstPagePause(before, url))) {
+        guard case .window(let now) = run.target else { return }
+        if !(try await AX.waitForPage(pid: now.pid, wid: now.id, timeout: timeout, first: firstPagePause(before, url))) {
             notes.append("the page was still loading after \(Int(timeout)) s")
-        } else if let before, !sameAddress(before[0], url), case .window(let now) = run.target {
+        } else if AX.pageURL(pid: now.pid, wid: now.id) == nil, var f = try await frozenNow(run.target, tree: true), f.unread,
+                  !(await revive(now, &f)) {
+            // "Loaded" with no page to say so: in a window its app isn't drawing, the page has no tree. (Brought forward
+            // and drawn again, `revive`, its page can be read: whether it's the new one is looked at below.)
+            meta[now.id]?.frozen = f
+            notes.append("can't tell whether the page loaded: \(frozenError(f, app: now.app, wid: now.id))")
+        } else if let before, !sameAddress(before[0], url) {
             // "Loaded" may be the old page: Firefox keeps it, loaded and idle, until the new one answers.
             let until = Date().addingTimeInterval(timeout)
             var shown = shownPage(run)
@@ -965,10 +1140,41 @@ extension Handlers {
         let what = (role.map { "\($0) " } ?? "") + (q.isEmpty ? "" : "\"\(q)\"")
         // An app with nothing in its accessibility tree (a canvas, a game): watch the pixels instead.
         let byEye = !q.isEmpty && AX.search(pid: w.pid, windows: waitScope(w, run), query: "", limit: 1, budget: 0.5).isEmpty
+        // A window its app isn't drawing won't show it, nor say it's gone: the wait stops then, saying so (`NotDrawn`),
+        // unless its app was brought forward to draw it again (`Redrawn`): then it looks again.
+        func undrawn(_ e: NotDrawn) -> HelperError {
+            HelperError("wait_for: " + (gone ? "whether \(what) went away can't be told" : "\(what) can't be waited for") + ": \(e)")
+        }
+        var asked = -Double.infinity  // when it last asked whether the window is being drawn
+        var askedChrome = -Double.infinity  // when it last asked that about a match in the browser's own controls
         while true {
-            let found = byEye ? !((try? await ocrFind(q, run.target)) ?? []).isEmpty
-                : !AX.search(pid: w.pid, windows: waitScope(w, run), query: q, role: role, limit: 1, budget: 1).isEmpty
+            let found: Bool
+            if byEye {  // (its picture isn't read when the window isn't being drawn: `ocrShot`)
+                do { found = !(try await ocrFind(q, run.target)).isEmpty } catch let e as NotDrawn { throw undrawn(e) } catch { found = false }
+            } else {
+                let scope = waitScope(w, run)
+                let hits = AX.search(pid: w.pid, windows: scope, query: q, role: role, limit: 1, budget: 1)
+                found = !hits.isEmpty
+                // A browser window its app isn't drawing has no page to read, but its tabs and toolbar carry the page's
+                // title: a match only there isn't the page's, so the wait stops, saying so. Asked once a second at most.
+                let elapsed = Date().timeIntervalSince(start)
+                if let m = hits.first, elapsed - askedChrome >= 1, chromeOnly(m, w) {
+                    askedChrome = elapsed
+                    if var f = try await frozenNow(run.target, tree: true),
+                       AX.search(pid: w.pid, windows: scope, query: q, role: role, limit: 1, budget: 1, pageOnly: true).isEmpty {
+                        if await revive(w, &f) { continue }  // drawn again: looked for again
+                        meta[w.id]?.frozen = f
+                        throw HelperError("wait_for: " + (gone ? "whether \(what) went away can't be told" : "\(what) can't be waited for")
+                            + ": \(notInPage(app: w.app)), and \(NotDrawn(frozen: f, app: w.app, wid: w.id))")
+                    }
+                }
+            }
             let waited = Date().timeIntervalSince(start)
+            // Not found (or gone): asked at once, then every second while it waits.
+            if !found, !byEye, gone || waited - asked >= 1 {
+                asked = waited
+                do { try await checkDrawn(run.target) } catch let e as NotDrawn { throw undrawn(e) } catch is Redrawn { continue }
+            }
             if found != gone {
                 if waited > 0.5 { notes.append("\(what) \(gone ? "went away" : "appeared") after \(String(format: "%.1f", waited)) s") }
                 return

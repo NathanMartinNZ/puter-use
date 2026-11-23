@@ -402,6 +402,53 @@ final class Run {
         return f
     }
 
+    /// Where a window of `size` goes on `screen` (its visible area, global points) to cover as little of `avoid` as
+    /// it can (the user's windows of its app: their area under it, counted once where they overlap), wholly on that
+    /// screen, shrunk to it if it's bigger: of the spots that cover least, the nearest to where it is (`from`).
+    /// The spots tried are those with an edge on an edge of the screen or of a window avoided, and where it is
+    /// (kept on screen): the area covered changes evenly between them, so the least is at one of them.
+    nonisolated static func leastCovering(size: CGSize, from: CGPoint, screen: CGRect, avoid: [CGRect]) -> CGRect {
+        let w = min(size.width, screen.width), h = min(size.height, screen.height)
+        func spots(_ lo: CGFloat, _ hi: CGFloat, _ len: CGFloat, _ at: CGFloat, _ edges: [CGFloat]) -> [CGFloat] {
+            let all = [lo, hi - len, at] + edges.flatMap { [$0, $0 - len] }
+            return Array(Set(all.map { min(max($0, lo), hi - len) })).sorted()
+        }
+        let xs = spots(screen.minX, screen.maxX, w, from.x, avoid.flatMap { [$0.minX, $0.maxX] })
+        let ys = spots(screen.minY, screen.maxY, h, from.y, avoid.flatMap { [$0.minY, $0.maxY] })
+        var best: (frame: CGRect, covered: CGFloat, away: CGFloat)?
+        for x in xs {
+            for y in ys {
+                let f = CGRect(x: x, y: y, width: w, height: h)
+                let covered = Run.covered(f, by: avoid)
+                let away = hypot(x - from.x, y - from.y)
+                if let b = best, covered > b.covered + 1 || (abs(covered - b.covered) <= 1 && away >= b.away) { continue }
+                best = (f, covered, away)
+            }
+        }
+        return best?.frame ?? CGRect(x: from.x, y: from.y, width: w, height: h)
+    }
+
+    /// The area of `f` that `rects` cover, overlaps counted once.
+    nonisolated static func covered(_ f: CGRect, by rects: [CGRect]) -> CGFloat {
+        unionArea(rects.map { $0.intersection(f) }.filter { !$0.isNull && !$0.isEmpty })
+    }
+
+    /// The area `rects` cover together, overlaps counted once.
+    nonisolated static func unionArea(_ rects: [CGRect]) -> CGFloat {
+        let xs = Array(Set(rects.flatMap { [$0.minX, $0.maxX] })).sorted()
+        var area: CGFloat = 0
+        for (a, b) in zip(xs, xs.dropFirst()) {
+            let spans = rects.filter { $0.minX <= a && $0.maxX >= b }.map { ($0.minY, $0.maxY) }.sorted { $0.0 < $1.0 }
+            var covered: CGFloat = 0, top = -CGFloat.infinity
+            for (lo, hi) in spans where hi > top {
+                covered += hi - max(lo, top)
+                top = hi
+            }
+            area += covered * (b - a)
+        }
+        return area
+    }
+
     /// After `placeOnScreen` moved window `id` to `to`: until the window server has it there, and it's had
     /// a moment to lay out where it is now (0.15 s at most).
     static func placed(_ id: CGWindowID, at to: CGRect) async throws {

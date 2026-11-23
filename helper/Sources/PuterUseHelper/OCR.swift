@@ -25,17 +25,25 @@ enum OCR {
 
     /// Where `query` appears in `shot` (case-insensitive), each with the box of just the matched words.
     static func find(_ query: String, in shot: Shot, fast: Bool = false) async throws -> [Hit] {
-        let q = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let q = AX.fold1(query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))
         guard !q.isEmpty else { return [] }
         var hits: [Hit] = []
         for (o, c) in try await recognize(shot, fast: fast) {
             let s = c.string
-            guard let r = s.range(of: q, options: [.caseInsensitive, .diacriticInsensitive]) else { continue }
+            guard let r = range(of: q, in: s) else { continue }
             let box = (try? c.boundingBox(for: r))?.boundingBox ?? o.boundingBox
             hits.append(Hit(line: s, rect: global(box, shot),
-                            exact: s.lowercased().trimmingCharacters(in: .whitespaces) == q))
+                            exact: AX.fold1(s.lowercased()).trimmingCharacters(in: .whitespaces) == q))
         }
         return hits.sorted { $0.rect.minY < $1.rect.minY }
+    }
+
+    /// Where `q` (folded, `AX.fold1`) is in line `s`, case, accents and typographic marks aside ("we've" finds
+    /// "We’ve"), as a range of `s` itself: Vision boxes the matched words by it.
+    static func range(of q: String, in s: String) -> Range<String.Index>? {
+        let folded = AX.fold1(s)
+        guard let r = folded.range(of: q, options: [.caseInsensitive, .diacriticInsensitive]) else { return nil }
+        return AX.unfolded(r, of: folded, in: s)
     }
 
     /// The text as lines of reading order, like `AX.text` gives (words on one visual line joined), at most

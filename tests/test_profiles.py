@@ -485,7 +485,7 @@ def test_omit_verified_leaves_out_the_image_only_of_a_checked_edit(server):
     assert asyncio.run(m.act([m.Action(**TYPE_ADA)], window=7)) == [f'Probe #7 "w"\n{IMAGE_OMITTED}']
     assert got[1][1]["verify_edits"] is True
     unchecked = asyncio.run(m.act([m.Action(type="click", target="OK")], window=7))
-    assert isinstance(unchecked[0], Image) and unchecked[1] == 'Probe #7 "w" · 40x30'
+    assert isinstance(unchecked[0], Image) and unchecked[1] == 'Probe #7 "w" · image 40x30'
 
 
 @pytest.mark.parametrize("mode", [{"PUTER_USE_OMIT_VERIFIED": "1"}, {"PUTER_USE_IMAGE_DELIVERY": "hybrid"}])

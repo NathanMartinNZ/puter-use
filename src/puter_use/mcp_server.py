@@ -650,8 +650,9 @@ async def _call(cmd: str, **params) -> dict:
 @reported
 async def windows(app: str | None = None, launch: bool = False) -> str:
     """App windows you can control, by app: `App: id "title" (tags)`. Tags: yours (you opened it),
-    current (the default window), front (on top), keyboard (gets its app's keys), hidden. app filters
-    by name or bundle id; launch=true opens it in the background if it has no window."""
+    used by the user, current (the default window), front (on top), keyboard (gets its app's keys),
+    hidden. app filters by name or bundle id; launch=true opens it in the background if it has no
+    window."""
     res = await _call("windows", app=app, launch=launch, window_size=capture_params()["window_size"])
     if "windows" not in res:
         raise ToolError("the helper's reply had no window list; try again")
@@ -749,8 +750,8 @@ async def act(actions: list[Action], window: int | str | None = None, text: Outl
       first; clear empties it, submit presses Return. "\\n" is Return, "\\t" Tab
     - keypress {keys, repeat?}: "cmd+t", ["ctrl","a"], or a sequence "Tab Tab Return".
       Names: Return, Tab, Escape, BackSpace, Up, PageDown, F5
-    - Keys and menu commands stop with an error while the user has another of the app's windows:
-      do as it says
+    - Keys and menu commands may stop with an error while the user's window of the app has its
+      keyboard: do as it says (it says whether retrying can help)
     - key_down/key_up {keys}: hold keys over later actions; hold_key {keys, ms ≤ 10000}. mouse_down
       {x,y|element}, move (drags while down), mouse_up {x?,y?}; all let go at the end
     - menu {item: "File > Export as PDF…"}: a menu-bar command, no pointer needed (or its name
@@ -759,7 +760,8 @@ async def act(actions: list[Action], window: int | str | None = None, text: Outl
       "I agree": true}: keys are labels; text is typed or picks an option, true/false ticks; IDs and phone
       numbers as strings; filled top-down. Or [{element|target, text|option|checked}, …]
     - select {element|target, option}: pick from a pop-up or combo box
-    - navigate {url, new_window?, timeout_ms?}: in a browser; waits for the page (default 10000 ms)
+    - navigate {url, new_window?, timeout_ms?}: in a browser (in a window of yours, loads there); waits
+      for the page (default 10000 ms)
     - open {url|path, app?}: a link, document or app, in the background. With open or navigate first,
       window can be left out
     - wait_for {text, role?, gone?, timeout_ms?}: until an element showing text appears (or goes);

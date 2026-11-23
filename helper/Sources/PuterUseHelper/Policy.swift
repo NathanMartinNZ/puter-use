@@ -219,31 +219,185 @@ enum Policy {
     }
 
     /// The confirm word or phrase in `label`, matched as whole words.
-    static func riskyWord(_ label: String) -> String? {
+    static func riskyWord(_ label: String) -> String? { riskyWords(label, in: config.confirm).first }
+
+    /// All the confirm words and phrases of list `confirm` in `label`, matched as whole words, in the list's order.
+    static func riskyWords(_ label: String, in confirm: [String]) -> [String] {
         var l = " " + phrase(label) + " "
         for h in harmless { l = l.replacingOccurrences(of: " \(h) ", with: " ") }
-        return config.confirm.first { l.contains(" \($0) ") }
+        return confirm.filter { l.contains(" \($0) ") }
     }
 
     /// A press on `node` (or on whatever control is at `p`) needs the user's OK first, unless the action
-    /// says it has it (`confirm: true`). Judged by `pressLabel`: a button named only by the text in it stops
-    /// as one with that name would. Never a press that only sets something (`settingOnly`), whatever its label.
+    /// says it has it (`confirm: true`), or it undoes the session's own press of that control (`undoes`).
+    /// Judged by `pressLabel`: a button named only by the text in it stops as one with that name would. Never a
+    /// press that only sets something (`settingOnly`), whatever its label. A press that passes is noted for the
+    /// action under way, which keeps it once it's done (`pressesMade`).
     @MainActor
     static func checkPress(_ a: [String: Any], node: AX.Node?, at p: CGPoint?, pid: pid_t) throws {
-        guard a["confirm"] as? Bool != true, !config.confirm.isEmpty else { return }
-        var label: String?
+        let confirm = config.confirm
+        guard !confirm.isEmpty else { return }
+        let ok = a["confirm"] as? Bool == true
+        var label: String?, element = node?.element, role = ""
         if let node {
-            let role = AX.value(node.element, kAXRoleAttribute) as? String ?? node.role
+            role = AX.value(node.element, kAXRoleAttribute) as? String ?? node.role
             if !asksOK(role: role) { return }
             label = pressLabel(node)
         }
         if label == nil, let p, let el = Macros.control(pid, at: p) {
-            let role = AX.value(el, kAXRoleAttribute) as? String ?? ""
+            role = AX.value(el, kAXRoleAttribute) as? String ?? ""
             if !asksOK(role: role) { return }
+            element = el
             label = pressLabel(own: AX.label(el), role: role, numbered: nil, shown: nil, inside: { innerWords(el) },
                                inControl: { false })
         }
-        if let label, let word = riskyWord(label) { throw NeedsOK(label: label, word: word) }
+        guard let element else { return }
+        let press = Press(element: element, window: AX.windowID(element), role: role, before: label, asked: ok)
+        if !ok, let label, case let risky = riskyWords(label, in: confirm), let word = risky.first {
+            // The session's last press of this very element in this window (no other at its place: a list re-sorted
+            // or a wizard's next step puts another control there).
+            let last = Session.current.presses.last { CFEqual($0.element, element) && $0.window == press.window }
+            if let last, !last.afterRead, undoable(last.before) { last.readAfter() }  // pressed moments ago
+            let age = last.map { Date().timeIntervalSince($0.at) } ?? 0
+            guard let last, undoes(label, risky: risky, before: last.before, after: last.after, asked: last.asked,
+                                   age: age, confirm: confirm) else { throw NeedsOK(label: label, word: word) }
+            press.undoing = (last.before ?? "", age)
+        }
+        Session.current.pressing.append(press)
+    }
+
+    // MARK: - undoing its own press
+
+    /// A press the session made: on which element, in which window, what the control was called just before and
+    /// just after it (read a moment later: a web page relabels a button after the click), when, and whether it
+    /// carried the user's OK. Until its action is done, one about to be made (`checkPress` notes it then).
+    @MainActor final class Press {
+        let element: AXUIElement
+        let window: CGWindowID?
+        let role: String
+        let before: String?
+        let asked: Bool
+        var after: String?  // nil also when it had no label then
+        var afterRead = false
+        var at = Date()  // the clock, not uptime: a Mac asleep meanwhile has let the minutes pass too
+        var undoing: (label: String, ago: TimeInterval)?  // let through without asking as the undo of that press
+
+        init(element: AXUIElement, window: CGWindowID?, role: String, before: String?, asked: Bool) {
+            self.element = element
+            self.window = window
+            self.role = role
+            self.before = before
+            self.asked = asked
+        }
+
+        /// What its control is called now, kept as what it was called just after the press. Asked on the main
+        /// actor, so a busy app (a browser loading the page a link opened) gets `labelTimeout` a question rather than
+        /// the default seconds: not answered, it's not known (and its undo asks).
+        func readAfter() {
+            let el = element
+            AXUIElementSetMessagingTimeout(el, Policy.labelTimeout)
+            defer { AXUIElementSetMessagingTimeout(el, 0) }  // (the element is the one pressed: as it was for anything else)
+            after = Policy.pressLabel(own: AX.label(el), role: role, numbered: nil, shown: nil,
+                                      inside: { Policy.innerWords(el, timeout: Policy.labelTimeout) },
+                                      inControl: { Policy.inPressControl(el, timeout: Policy.labelTimeout) })
+            afterRead = true
+        }
+
+        /// What its control is called just after the press, read a moment later (`afterReads`), and once more if it
+        /// still said what it did before, or nothing: a web page relabels a button once its script or its server answers.
+        /// Only for a press the undo rule could pair (`undoable`): no other one's label is ever asked for.
+        func watchAfter() {
+            Task { @MainActor in
+                var waited = 0.0
+                for at in Policy.afterReads {
+                    try? await Task.sleep(nanoseconds: UInt64((at - waited) * 1e9))
+                    waited = at
+                    if afterRead, after != nil, after != before { return }  // relabelled (read by a check of its undo, maybe)
+                    readAfter()
+                }
+            }
+        }
+    }
+
+    /// How many of its presses a session keeps, and for how long one can be undone without asking (s).
+    static let pressesKept = 20, undoWithin: TimeInterval = 10 * 60
+
+    /// How long a question about a pressed control's label waits for its app (s; `Press.readAfter`).
+    static let labelTimeout: Float = 0.3
+
+    /// When what a pressed control is called just after the press is read (s after it; `Press.watchAfter`).
+    static let afterReads = [0.5, 2.0]
+
+    /// The presses `checkPress` let through in the action just done, as made: each kept (the newest `pressesKept`
+    /// in all), what its control is called read a moment later, and a note for one let through as an undo.
+    /// One checked twice (before scrolling to it, then at the click) was pressed once.
+    @MainActor static func pressesMade() {
+        let session = Session.current
+        var made: [Press] = []
+        for p in session.pressing {
+            made.removeAll { CFEqual($0.element, p.element) }
+            made.append(p)
+        }
+        session.pressing = []
+        let now = Date()
+        for p in made {
+            p.at = now
+            if let (label, ago) = p.undoing {
+                Handlers.notes.append("pressed \"\(AX.clip(p.before ?? "", 60))\" without asking: it undoes your own "
+                    + "\"\(AX.clip(label, 60))\" from \(agoText(ago)) ago")
+            }
+            session.presses.append(p)
+            if undoable(p.before) { p.watchAfter() }
+        }
+        if session.presses.count > pressesKept { session.presses.removeFirst(session.presses.count - pressesKept) }
+    }
+
+    /// "40 s", "1 min", "9 min".
+    static func agoText(_ s: TimeInterval) -> String {
+        s < 60 ? "\(max(1, Int(s))) s" : "\(Int(s / 60)) min"
+    }
+
+    /// Words a toggle's two labels differ by ("Add to cart" and "Remove from cart", "Save" and "Remove from saved").
+    static let toggleWords: Set<String> = ["add", "adds", "added", "adding", "save", "saves", "saved", "saving", "remove",
+                                           "removed", "from", "to"]
+
+    /// The words of the side of a toggle a press the undo rule pairs was made on: what it adds or saves.
+    static let undoableWords: Set<String> = ["add", "adds", "added", "adding", "save", "saves", "saved", "saving"]
+
+    /// A word as a toggle's labels are compared: a leading "un" dropped ("unsave" is "save").
+    static func toggleWord<S: StringProtocol>(_ w: S) -> String {
+        w.hasPrefix("un") && w.count > 4 ? String(w.dropFirst(2)) : String(w)
+    }
+
+    /// Whether a press on a control called `label` (before the press) is one the undo rule can pair later: a word of it
+    /// adds or saves (`undoableWords`: "Save", "Add to cart", "Add"). Only those are watched for what the control is
+    /// called just after (`Press.watchAfter`), and only their undo can go without asking: read only at the undo, that
+    /// label couldn't show the control hadn't been relabelled since.
+    static func undoable(_ label: String?) -> Bool {
+        guard let label else { return false }
+        return phrase(label).split(separator: " ").contains { undoableWords.contains(toggleWord($0)) }
+    }
+
+    /// Whether a press on a control now called `label`, which would ask for its confirm words `risky`, undoes the
+    /// session's own last press of that same control instead, so it needn't ask: "Remove from saved" on the button
+    /// it pressed as "Save". `before` and `after`: what the control was called just before and just after that
+    /// press; `asked`: whether it carried the user's OK; `age`: how long ago it was (s); `confirm`: the policy's
+    /// list. Only when all of these hold:
+    /// - "remove" is the only confirm word: never delete, send, pay, buy, publish or any other;
+    /// - that press was within `undoWithin`, didn't ask, and wasn't risky itself (so an undo isn't undone in turn);
+    /// - it added or saved something (`undoable`);
+    /// - the control is still called what it was just after that press (it hasn't been relabelled since);
+    /// - the two labels are one toggle's: with `toggleWords` and a leading "un" dropped, what's left of them shares
+    ///   a word ("Add to cart" and "Remove from cart"), or nothing is left of either ("Add" and "Remove").
+    static func undoes(_ label: String, risky: [String], before: String?, after: String?, asked: Bool,
+                       age: TimeInterval, confirm: [String]) -> Bool {
+        guard risky == ["remove"], !asked, age >= 0, age <= undoWithin, let before, label == after,
+              riskyWords(before, in: confirm).isEmpty, undoable(before) else { return false }
+        func rest(_ s: String) -> Set<String> {
+            Set(phrase(s).split(separator: " ").map { toggleWord($0) }.filter { !toggleWords.contains($0) })
+        }
+        let was = rest(before), now = rest(label)
+        return was.isEmpty && now.isEmpty || !was.isDisjoint(with: now)
     }
 
     /// Controls a press only sets, and a press sets back (a checkbox, switch, radio button, disclosure triangle),
@@ -284,8 +438,8 @@ enum Policy {
     }
 
     /// The words in `el`: for a text, what it says; else what the texts directly in it say (four at most, of
-    /// six children at most), side by side.
-    static func innerWords(_ el: AXUIElement) -> String? {
+    /// six children at most), side by side. `timeout`: how long each question about those children waits (0: as ever).
+    static func innerWords(_ el: AXUIElement, timeout: Float = 0) -> String? {
         func says(_ e: AXUIElement) -> String? {
             for attr in [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute] {
                 if let s = AX.value(e, attr) as? String, !s.allSatisfy(\.isWhitespace) { return s }
@@ -295,20 +449,39 @@ enum Policy {
         if AX.value(el, kAXRoleAttribute) as? String == "AXStaticText" { return says(el) }
         let kids = AX.value(el, kAXChildrenAttribute) as? [AXUIElement] ?? []
         guard !kids.isEmpty, kids.count <= 6 else { return nil }
+        if timeout > 0 { for k in kids { AXUIElementSetMessagingTimeout(k, timeout) } }
         let words = kids.filter { AX.value($0, kAXRoleAttribute) as? String == "AXStaticText" }.prefix(4).compactMap(says)
         let s = words.joined(separator: " ").split(whereSeparator: \.isWhitespace).joined(separator: " ")
         return s.isEmpty ? nil : s
     }
 
-    /// Whether `el` is inside a button, link or menu item (`pressNamedByText`), a few levels up at most.
-    static func inPressControl(_ el: AXUIElement) -> Bool {
+    /// Whether `el` is inside a button, link or menu item (`pressNamedByText`), a few levels up at most. `timeout`:
+    /// how long each question about those above it waits (0: as ever).
+    static func inPressControl(_ el: AXUIElement, timeout: Float = 0) -> Bool {
         var cur = el
         for _ in 0..<4 {
             guard let p = AX.value(cur, kAXParentAttribute), CFGetTypeID(p) == AXUIElementGetTypeID() else { return false }
             cur = p as! AXUIElement
+            if timeout > 0 { AXUIElementSetMessagingTimeout(cur, timeout) }
             if pressNamedByText.contains(AX.value(cur, kAXRoleAttribute) as? String ?? "") { return true }
         }
         return false
+    }
+
+    /// A press on text read off the screen, with no element to judge it by (a page whose accessibility tree isn't
+    /// built yet, an app with none): the same OK, by the whole line the target was found in (`read`), as a control
+    /// with that name would ask. The line, not just the target's words: a click on "account" presses the button that
+    /// says "Delete account".
+    static func checkReadPress(_ a: [String: Any], read line: String) throws {
+        if let word = readPressWord(line, confirm: config.confirm, ok: a["confirm"] as? Bool == true) {
+            throw NeedsOK(label: line, word: word)
+        }
+    }
+
+    /// The confirm word a press on text read off the screen in line `line` stops for (`checkReadPress`), from list
+    /// `confirm`; nil with the user's OK (`ok`) or none in it.
+    static func readPressWord(_ line: String, confirm: [String], ok: Bool) -> String? {
+        ok ? nil : riskyWords(line, in: confirm).first
     }
 
     /// Choosing a menu item or option: the same OK, by its title.

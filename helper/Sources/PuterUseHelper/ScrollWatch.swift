@@ -442,7 +442,8 @@ extension Handlers {
             return describe(m, id: number(m, w.id), t)
         }
         guard blind, sp.role == nil else { return nil }
-        let hits = try await ocrFind(sp.text, t)
+        let hits: [OCR.Hit]
+        do { hits = try await ocrFind(sp.text, t) } catch is Redrawn { hits = try await ocrFind(sp.text, t) }  // drawn again
         guard let h = hits.first(where: \.exact) ?? hits.first else { return nil }
         let px = toPixels(t, CGPoint(x: h.rect.midX, y: h.rect.midY)).map { " at (\($0[0]),\($0[1]))" } ?? ""
         return "text \"\(AX.clip(h.line, 60))\"\(px) (read off the screen: click it by x,y)"

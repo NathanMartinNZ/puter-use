@@ -140,6 +140,13 @@ enum Input {
         return input.allSatisfy { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) >= seconds }
     }
 
+    /// The user's real key presses and clicks so far (left and right), as the HID system counts them since the window
+    /// server started: like `userQuiet`'s times, what puter-use posts to an app isn't in them.
+    static func userPresses() -> Fronts.Presses {
+        func count(_ t: CGEventType) -> UInt32 { CGEventSource.counterForEventType(.hidSystemState, eventType: t) }
+        return Fronts.Presses(keys: count(.keyDown), clicks: count(.leftMouseDown) &+ count(.rightMouseDown))
+    }
+
     static func sleep(_ seconds: Double) async {
         guard seconds > 0 else { return }
         try? await Task.sleep(nanoseconds: UInt64(min(seconds, 600) * 1e9))

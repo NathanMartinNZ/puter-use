@@ -32,8 +32,29 @@ window of the same app has it (the user brought one forward), typing, shortcuts,
 menu commands (which act on the focused window) stop and say which window has the keyboard, rather
 than acting on the user's. Clicks are stamped with their window and still go to the agent's. The check
 happens again before each keystroke while typing, so taking the keyboard mid-text stops it there.
+While the app is in the background, its key window never changes by itself, so keys for one of the
+agent's own windows first move the keyboard there with a primer click, as a click on it would; never
+while the user is in the app, and never onto a window of the agent's the user has used since. When the
+agent's window already has the keyboard of the user's front app, it's the window they're in: keys
+there go only once they've left the keyboard and mouse alone for 2 seconds (checked before each key),
+else they stop and say to try again.
 `foreground=true` is the explicit fallback: it raises the app and uses the real keyboard, interrupting
 the user.
+
+**Windows that stop drawing.** Firefox stops drawing a window that gets fully covered while it isn't
+its key window, and drops its page's accessibility tree, until part of it shows again; one that was its
+key window as it got covered draws on. So when one of the agent's own windows is found not drawn (on
+evidence: see [Tools](tools.md)), puter-use by default brings its app forward for a moment: the window
+is made key and raised (as `activate` does), the app is brought to the front, and once the window draws
+again (its page has a tree again, or a capture differs from the stale one; looked at every 50 ms, for
+1.2 s at most) the app the user was in is brought back. Usually that's well under a second. Only while
+the user has left the keyboard and mouse alone for 3 seconds (the HID system's own times, which
+puter-use's input doesn't touch), never while they're in that app or a full-screen one, never for a
+window on another Space or one the user has used, and once a window in 30 seconds at most. A key press,
+click or move of theirs during it brings their app back at once. The app's hold (above) is sent again
+afterwards, as a new one. A note tells the agent each time. `PUTER_USE_BRING_FORWARD=never` turns it
+off, and a Firefox started with `MOZ_WINDOW_OCCLUSION=0` never needs it (see
+[Configuration](configuration.md#keeping-your-firefoxs-covered-windows-drawn)).
 
 A click on a button, checkbox, pop-up, link or other control named by element uses `AXPress` and
 skips event routing altogether (the pointer still travels there, so the app sees it hover). Anything
