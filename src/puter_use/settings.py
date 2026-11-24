@@ -39,6 +39,9 @@ def capture_params() -> dict:
         # Whether an app may be brought forward for a moment to redraw one of the agent's windows (see
         # `bring_forward`).
         "bring_forward": bring_forward(),
+        # Whether puter-use may show a non-activating popup asking the user to switch focus when a window
+        # conflict blocks keys or a covered window needs redrawing (see `focus_prompt`).
+        "focus_prompt": focus_prompt(),
     }
     if trace := env("PUTER_USE_TRACE"):  # JSON-lines log of every event sent (scripts/check_motion.py)
         params["trace"] = trace
@@ -71,6 +74,27 @@ def bring_forward() -> str:
     isn't being drawn. Anything else counts as the default."""
     value = (os.environ.get("PUTER_USE_BRING_FORWARD") or "").strip().lower()
     return "never" if value in ("never", "off", "0", "false", "no") else "when-needed"
+
+
+def focus_prompt() -> str:
+    """PUTER_USE_FOCUS_PROMPT: "when-needed" (the default) or "never". When keys, shortcuts, menu commands, or
+    redrawing a covered window are blocked because the user is active in another window of the same app (or in
+    the background on a non-agent window), the helper shows a non-activating macOS popup letting the user click
+    Switch Window / Allow or Decline. "never" (or "off", "0", "false", "no"): never show the popup; fail with
+    the usual message. Anything else counts as the default."""
+    value = (os.environ.get("PUTER_USE_FOCUS_PROMPT") or "").strip().lower()
+    return "never" if value in ("never", "off", "0", "false", "no") else "when-needed"
+
+
+def read_params() -> dict:
+    """Bring-forward / focus-prompt overrides for screenshot(read=...) only when disabled (omitted at default
+    so read requests stay minimal and the helper applies its defaults)."""
+    out: dict = {}
+    if bring_forward() == "never":
+        out["bring_forward"] = "never"
+    if focus_prompt() == "never":
+        out["focus_prompt"] = "never"
+    return out
 
 
 def session(default: str) -> str:

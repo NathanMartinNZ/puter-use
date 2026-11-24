@@ -26,8 +26,8 @@ from . import tokens
 from .client import Helper, HelperError, cli_command, request_ids
 from .present import HIDDEN_CAP, IMAGE_OMITTED, IMAGE_SAVED, image_bytes, summarize, window_list, without_image
 from .settings import (act_params, capture_params, detail_param, element_number, element_numbers, image_delivery,
-                       image_dir, image_meta, macros_enabled, omit_verified, outline_params, session, thin_schema,
-                       token_log, verify_edits)
+                       image_dir, image_meta, macros_enabled, omit_verified, outline_params, read_params, session,
+                       thin_schema, token_log, verify_edits)
 
 INSTRUCTIONS = """\
 Operate macOS apps in the background with your own virtual cursor; the user's real mouse and \
@@ -685,7 +685,7 @@ async def screenshot(window: int | str | None = None, region: list[int] | None =
     if read is not None and read is not False:
         what = read.model_dump(exclude_none=True) if isinstance(read, Target) else element_number(read)
         return _content(await _call("screenshot", window=window, read=what, offset=offset, limit=limit,
-                                    query=query))
+                                    query=query, **read_params()))
     res = await _call("screenshot", window=window, region=region, image=image,
                       **outline_params(text or not image, marks), **capture_params(), **detail_param(detail))
     if image and "image" not in res:

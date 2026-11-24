@@ -415,7 +415,10 @@ extension AX {
     /// with that name (`commandPath`). Returns the full path pressed, and the item's shortcut if the
     /// menu shows it disabled (then that's pressed instead: see the menu action).
     /// `check` sees the item's title before it's pressed, and can refuse it.
-    static func pressMenu(pid: pid_t, path: [String], check: (String) throws -> Void = { _ in }) throws -> (String, String?) {
+    /// `beforePress` runs after item lookup, Services, `check`, and submenu checks, just before checking
+    /// enabled state and pressing (so focus prompts never trigger on invalid items, submenus, or Policy stops).
+    static func pressMenu(pid: pid_t, path: [String], check: (String) throws -> Void = { _ in },
+                          beforePress: () throws -> Void = {}) throws -> (String, String?) {
         let path = path.count == 1 ? try commandPath(pid: pid, name: path[0]) : path
         guard path.count >= 2 else { throw HelperError("menu needs an item: a path like \"File > Save\", or a command's name") }
         var level: [(AXUIElement, String)] = menuBar(pid: pid)
@@ -441,6 +444,7 @@ extension AX {
                     let names = children(sub).compactMap { value($0, kAXTitleAttribute) as? String }.filter { !$0.isEmpty }
                     throw HelperError("\(name) opens a submenu: name one of its items (\(listed(names, max: 20)))")
                 }
+                try beforePress()
                 if value(el, kAXEnabledAttribute) as? Bool == false {
                     let fields = ["AXMenuItemCmdChar", "AXMenuItemCmdModifiers", "AXMenuItemCmdVirtualKey", "AXMenuItemCmdGlyph"]
                     if let key = shortcutText(char: value(el, fields[0]) as? String, mods: value(el, fields[1]) as? Int ?? 0,

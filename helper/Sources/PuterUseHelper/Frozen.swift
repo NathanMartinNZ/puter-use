@@ -33,6 +33,7 @@ extension Handlers {
         var key: Bool?
         var firefox = false
         var notForward: String?
+        var declined = false  // user explicitly declined the focus prompt to bring it forward
     }
 
     /// How long a page's missing tree is given to come before it counts (s): a browser can attach a new page's tree a
@@ -352,7 +353,11 @@ extension Handlers {
     /// key window, or holding the app active, doesn't once it's been covered. For good, the user's Firefox can be
     /// started so it draws covered windows on (`occlusionTip`).
     nonisolated static func frozenRemedy(_ f: Frozen, app: String, wid: CGWindowID) -> String {
-        "ask the user to bring #\(wid) into view (even partly), or use activate (raises it to just below the user's front window, so it shows) if they agree"
+        if f.declined {
+            return "don't retry right now; wait until the user leaves \(app) or brings #\(wid) into view"
+                + occlusionTip(f, app: app)
+        }
+        return "ask the user to bring #\(wid) into view (even partly), or use activate (raises it to just below the user's front window, so it shows) if they agree"
             + occlusionTip(f, app: app)
     }
 

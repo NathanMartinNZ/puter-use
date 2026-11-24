@@ -148,19 +148,42 @@ extension Handlers {
         return (id, try AX.node(w.id, id))
     }
 
-    /// The element numbered `idx` in `w`. When it's gone, the error lists the elements like it now
-    /// there, with their numbers and where they are (none is picked: it could be another row's).
-    static func numbered(_ w: WinInfo, _ idx: Int, _ t: Target) throws -> AX.Node {
+    /// The element numbered `idx` in `w`. When it's gone, first checks whether the window's app stopped drawing
+    /// it (`checkDrawn`: if brought forward and drawn again, retries once); otherwise the error lists the elements
+    /// like it now there, with their numbers and where they are (none is picked: it could be another row's).
+    static func numbered(_ w: WinInfo, _ idx: Int, _ t: Target, again: Bool = false) async throws -> AX.Node {
         do { return try AX.node(w.id, idx) } catch let gone as AX.Gone {
+            if !again {
+                do { try await checkDrawn(t) } catch is Redrawn {
+                    return try await numbered(w, idx, t, again: true)
+                } catch let e as NotDrawn {
+                    throw e
+                }
+            }
             throw HelperError(gone.text { r in toPixels(t, CGPoint(x: r.midX, y: r.midY)).map { "(\($0[0]),\($0[1]))" } })
         }
     }
 
+    /// `findOne(v, t)`, checking whether the window's app stopped drawing it on a miss (`NotFound`): if brought
+    /// forward and drawn again (`Redrawn`), looks once more; if still not drawn (`NotDrawn`), throws `e.missing(...)`.
+    static func findOneOrRevive(_ v: Any, _ t: Target, again: Bool = false) async throws -> (Int, AX.Node) {
+        do { return try findOne(v, t) } catch let e as NotFound {
+            if !again {
+                do { try await checkDrawn(t) } catch is Redrawn {
+                    return try await findOneOrRevive(v, t, again: true)
+                } catch let nd as NotDrawn {
+                    throw nd.missing(try spec(v).description)
+                }
+            }
+            throw try missError(e, v, t)
+        }
+    }
+
     /// The element an action names: `element` (a number) or `target` (what it says), or nil if neither.
-    static func elementNode(_ a: [String: Any], _ t: Target) throws -> AX.Node? {
+    static func elementNode(_ a: [String: Any], _ t: Target) async throws -> AX.Node? {
         if let idx = num(a["element"]) {
             guard case .window(let w) = t else { throw HelperError("element needs a window target") }
-            let n = try numbered(w, Int(idx), t)
+            let n = try await numbered(w, Int(idx), t)
             try reachable(n.element, "element \(Int(idx))")
             return n
         }
@@ -176,17 +199,19 @@ extension Handlers {
                     + "same), so nothing was done")
             }
             if saved == nil, a["spot"] as? Bool == true { throw Macros.noSpot(v) }
-            do { return try findOne(v, t).1 } catch {
-                if let (x, y) = saved, !(error is Behind) {
-                    if let (_, n) = try Macros.spot(v, t, at: try toGlobal(t, x, y, a)) {
-                        TargetLookup.current?.found = true
-                        return n
+            if let (x, y) = saved {
+                do { return try findOne(v, t).1 } catch {
+                    if !(error is Behind) {
+                        if let (_, n) = try Macros.spot(v, t, at: try toGlobal(t, x, y, a)) {
+                            TargetLookup.current?.found = true
+                            return n
+                        }
+                        throw HelperError("\(error) (a macro step: what it acted on isn't where it was, so nothing was done)")
                     }
-                    throw HelperError("\(error) (a macro step: what it acted on isn't where it was, so nothing was done)")
+                    throw error
                 }
-                if let e = error as? NotFound { throw try missError(e, v, t) }
-                throw error
             }
+            return try await findOneOrRevive(v, t).1
         }
         return nil
     }
@@ -446,7 +471,18 @@ extension Handlers {
         }
         let text: String
         if queries.isEmpty, let role {
-            text = roleLines(role, w, t, cap: cap).joined(separator: "\n")
+            func lookRole() async throws -> [String] {
+                let got = roleLines(role, w, t, cap: cap)
+                if got.count == 1, got[0].hasPrefix("(no ") { try await checkDrawn(t) }
+                return got
+            }
+            do {
+                let got: [String]
+                do { got = try await lookRole() } catch is Redrawn { got = try await lookRole() }
+                text = got.joined(separator: "\n")
+            } catch let e as NotDrawn {
+                throw e.missing("role \"\(role)\"")
+            }
         } else if queries.count == 1 {
             let sp = Spec(text: queries[0], role: role)
             let found = try await lines(sp, partials: 5, deadline: .infinity) { try await ocrFind($0, t) }
@@ -457,15 +493,17 @@ extension Handlers {
                 if picture == nil { picture = try await ocrShot(t) }
                 return try await OCR.find(q, in: picture!)
             }
-            let deadline = AX.uptime() + findBudget
+            let promptBase = Connection.current?.promptWait ?? 0
+            let baseDeadline = AX.uptime() + findBudget
+            func deadline() -> TimeInterval { baseDeadline + ((Connection.current?.promptWait ?? 0) - promptBase) }
             var parts: [String] = []
             for q in queries {
                 let sp = Spec(text: q, role: role)
-                guard AX.uptime() < deadline else {
+                guard AX.uptime() < deadline() else {
                     parts.append("(\(sp.description) wasn't looked for: the others took the time; find it on its own)")
                     continue
                 }
-                let found = try await lines(sp, partials: min(2, cap), deadline: deadline, screen: screen)
+                let found = try await lines(sp, partials: min(2, cap), deadline: deadline(), screen: screen)
                 parts += findSection(sp.description, lines: found.lines, similar: found.similar, complete: found.complete)
             }
             text = parts.joined(separator: "\n")

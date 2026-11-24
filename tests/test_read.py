@@ -91,6 +91,12 @@ def test_mcp_screenshot_read_returns_the_text_alone(monkeypatch):
         calls.clear()
         asyncio.run(m.screenshot(window="Probe", read=given))
         assert calls[0][1]["read"] == sent, given
+    # Disabled focus_prompt / bring_forward propagate on read calls too.
+    calls.clear()
+    monkeypatch.setenv("PUTER_USE_FOCUS_PROMPT", "never")
+    monkeypatch.setenv("PUTER_USE_BRING_FORWARD", "never")
+    asyncio.run(m.screenshot(window="Probe", read=True))
+    assert calls[0][1]["focus_prompt"] == "never" and calls[0][1]["bring_forward"] == "never"
 
 
 def test_code_mode_read_fetches_every_page():

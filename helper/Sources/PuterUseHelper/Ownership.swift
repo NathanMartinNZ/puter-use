@@ -73,6 +73,13 @@ enum Fronts {
             let pid = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
             MainActor.assumeIsolated {
                 guard let pid else { return }
+                // Ignore puter-use's own temporary flashes (`Hold.flashing`), so they neither record fake user
+                // visits nor prematurely clear an approved focus grant.
+                if Hold.ownActivation(pid) { return }
+                // Leaving the granted app invalidates any active focus grant immediately (trackpad Space swipes too).
+                for s in Session.all.values where s.focusGrant?.pid != pid {
+                    s.focusGrant = nil
+                }
                 // The window the user leaves the app it took over from in (asked without switching on its tree).
                 let leaving = spans.last.flatMap { $0.to == nil && $0.pid != pid ? Handlers.keyWindow($0.pid) : nil }
                 spans = after(spans, front: pid, at: ProcessInfo.processInfo.systemUptime,

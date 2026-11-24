@@ -34,7 +34,15 @@ than acting on the user's. Clicks are stamped with their window and still go to 
 happens again before each keystroke while typing, so taking the keyboard mid-text stops it there.
 While the app is in the background, its key window never changes by itself, so keys for one of the
 agent's own windows first move the keyboard there with a primer click, as a click on it would; never
-while the user is in the app, and never onto a window of the agent's the user has used since. When the
+while the user is in the app, and never onto a window of the agent's the user has used since. When
+keys, shortcuts, modifier-clicks or menu commands are still blocked because the user is in another
+window of that app (or switched in after a background move, or focus sits on a non-agent window),
+`PuterUse.app` by default shows a non-activating floating HUD (`NSPanel` with `.nonactivatingPanel`,
+never stealing keyboard focus while displayed) asking the user to **Switch Window** / **Allow** or
+**Decline**. Approving raises and focuses the target window (or flashes it if the user is in another
+app) and grants a temporary focus lease (immediately revoked on any user key press, click, scroll or
+app switch) so the blocked action completes cleanly; declining or timing out after 30 s stops the
+action with a per-app cooldown (`PUTER_USE_FOCUS_PROMPT=never` disables the popup). When the
 agent's window already has the keyboard of the user's front app, it's the window they're in: keys
 there go only once they've left the keyboard and mouse alone for 2 seconds (checked before each key),
 else they stop and say to try again.

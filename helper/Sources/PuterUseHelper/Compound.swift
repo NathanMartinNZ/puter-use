@@ -16,8 +16,8 @@ extension Handlers {
     /// The element an action names (`elementNode`: element or target), or the control it's the label of: a text
     /// (or label element) titling just one control that `fits` (`AXServesAsTitleForUIElements`: a form's "Email"
     /// beside its field) names that control. Anything else comes back as it is, for the caller's own check.
-    static func controlNode(_ a: [String: Any], _ t: Target, _ fits: (AXUIElement) -> Bool) throws -> AX.Node? {
-        guard let n = try elementNode(a, t) else { return nil }
+    static func controlNode(_ a: [String: Any], _ t: Target, _ fits: (AXUIElement) -> Bool) async throws -> AX.Node? {
+        guard let n = try await elementNode(a, t) else { return nil }
         guard n.role == "AXStaticText" || n.role == "AXGroup", !fits(n.element), let c = AX.titled(by: n.element, fits) else {
             return n
         }
@@ -31,17 +31,24 @@ extension Handlers {
     static func typeInto(_ a: [String: Any], _ text: String, _ run: Run) async throws {
         var node: AX.Node?
         if a["element"] != nil || a["target"] != nil {
-            node = try controlNode(a, run.target, AX.isTextInput)
+            node = try await controlNode(a, run.target, AX.isTextInput)
             // The keys go wherever the focus ends up: not into a button that was named by mistake.
             if let n = node, !AX.isTextInput(n.element) {
                 throw HelperError("that's a \(AX.describe(n.element)), not a text field to type into")
             }
         }
-        // A Return outside a text area presses the window's default button: if that needs the user's OK,
-        // stop before anything is clicked, emptied or typed.
-        if a["submit"] as? Bool == true || text.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\r\n" }) {
+        let submitsReturn = a["submit"] as? Bool == true || text.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\r\n" })
+        // A Return outside a text area presses the window's default button: when `node` is known (`textArea`
+        // known), check before prompting or clicking so Policy.NeedsOK stops without switching windows.
+        if submitsReturn, let node {
             let r = try route(run.target, at: nil, foreground: run.foreground)
-            try Policy.checkFocusKeys(Policy.running ?? a, [["return"]], r, textArea: node.map { $0.role == "AXTextArea" })
+            try Policy.checkFocusKeys(Policy.running ?? a, [["return"]], r, textArea: node.role == "AXTextArea")
+        }
+        try await ensureKeyboard(try route(run.target, at: nil, foreground: run.foreground), run: run, action: "type")
+        // When aimed by x,y (`node == nil`), check Return after ensuring focus is on the target window.
+        if submitsReturn, node == nil {
+            let r = try route(run.target, at: nil, foreground: run.foreground)
+            try Policy.checkFocusKeys(Policy.running ?? a, [["return"]], r, textArea: nil)
         }
         if a["element"] != nil || a["target"] != nil || a["x"] != nil || a["coordinate"] != nil {
             // A suggestions or saved-data list earlier typing opened may lie over this field: closed first, so the
@@ -203,20 +210,31 @@ extension Handlers {
         for (i, f) in fields.enumerated() {
             do {
                 if let option = f["option"] ?? f["select"] {
-                    if let n = try controlNode(f, run.target, AX.isChoosable), let match = AX.optionTitle(n.element, "\(option)") {
+                    if let n = try await controlNode(f, run.target, AX.isChoosable), let match = AX.optionTitle(n.element, "\(option)") {
                         try Policy.checkItem(a, match)
                     }
-                } else if let want = f["checked"] as? Bool, let n = try controlNode(f, run.target, AX.isCheckable),
+                } else if let want = f["checked"] as? Bool, let n = try await controlNode(f, run.target, AX.isCheckable),
                           let v = AX.value(n.element, kAXValueAttribute) as? NSNumber, (v.intValue != 0) != want {
                     try Policy.checkPress(a, node: n, at: nil, pid: app)
                 }
+            } catch is Cancelled {
+                throw Cancelled()
             } catch let stop as Policy.NeedsOK {
                 throw stop
             } catch {
                 throw HelperError("field \(i + 1): \(error)")
             }
         }
-        try checkFillSubmit(a, submitClick, run, app: app) { fields.last.flatMap { try? controlNode($0, run.target, AX.isTextInput) } }
+        let lastNode: AX.Node? = if let last = fields.last { try? await controlNode(last, run.target, AX.isTextInput) } else { nil }
+        if submitClick != nil || lastNode != nil {
+            try await checkFillSubmit(a, submitClick, run, app: app, last: lastNode)
+        }
+        if Policy.typing(a) {
+            try await ensureKeyboard(try route(run.target, at: nil, foreground: run.foreground), run: run, action: "fill")
+        }
+        if submitClick == nil, lastNode == nil {
+            try await checkFillSubmit(a, submitClick, run, app: app, last: nil)
+        }
         try await fillIn(a, fields, submit: submitClick, run, app: app)
     }
 
@@ -227,8 +245,8 @@ extension Handlers {
     /// user's OK, a stop partway that says what was filled), from the top of the form down.
     static func fillByLabel(_ a: [String: Any], _ byLabel: [String: Any], _ run: Run) async throws {
         let app = pid(run.target) ?? run.pidAtStart
-        let plan = try planFill(byLabel, secureAllowed: Policy.config.allowSecureFields) { key in
-            guard let n = try controlNode(["target": key], run.target, AX.isFillable) else { throw HelperError("it names nothing") }
+        let plan = try await planFillAsync(byLabel, secureAllowed: Policy.config.allowSecureFields) { key in
+            guard let n = try await controlNode(["target": key], run.target, AX.isFillable) else { throw HelperError("it names nothing") }
             return FieldControl(node: n, role: AX.value(n.element, kAXRoleAttribute) as? String ?? n.role,
                                 textInput: AX.isTextInput(n.element), inPage: AX.webArea(of: n.element) != nil,
                                 secure: Policy.isSecure(n.element), what: AX.describe(n.element))
@@ -259,7 +277,10 @@ extension Handlers {
             }
         }
         let submitClick = fillSubmitClick(a)
-        try checkFillSubmit(a, submitClick, run, app: app) { plan.last?.node }
+        try await checkFillSubmit(a, submitClick, run, app: app, last: plan.last?.node)
+        if Policy.typing(listed) {
+            try await ensureKeyboard(try route(run.target, at: nil, foreground: run.foreground), run: run, action: "fill")
+        }
         // Its fields' routes see what it types (the list form's fields), not the object.
         try await Policy.$running.withValue(listed) {
             try await fillIn(listed, fields, submit: submitClick, run, app: app, labels: plan.map { $0.key })
@@ -283,11 +304,10 @@ extension Handlers {
     /// A fill's submit, checked before anything is filled in: the press of its button (`click`), or its Return after
     /// the field filled last (`last`: in a text area, Return is a new line). A stop for the user's OK comes here.
     static func checkFillSubmit(_ a: [String: Any], _ click: [String: Any]?, _ run: Run, app: pid_t,
-                                last: () -> AX.Node?) throws {
-        if let click, click["element"] != nil || click["target"] != nil, let n = try? elementNode(click, run.target) {
+                                last: AX.Node?) async throws {
+        if let click, click["element"] != nil || click["target"] != nil, let n = try? await elementNode(click, run.target) {
             try Policy.checkPress(a, node: n, at: nil, pid: app)
         } else if a["submit"] as? Bool == true {
-            let last = last()
             try Policy.checkFocusKeys(a, [["return"]], try route(run.target, at: nil, foreground: run.foreground),
                                       textArea: last.map { $0.role == "AXTextArea" })
         }
@@ -551,8 +571,38 @@ extension Handlers {
         return order.compactMap { k in plan.first { $0.key == k } }
     }
 
+    /// Async counterpart of `planFill` so `fillByLabel` can revive covered frozen browser windows during lookup.
+    static func planFillAsync(_ byLabel: [String: Any], secureAllowed: Bool,
+                              resolve: (String) async throws -> FieldControl) async throws -> [FieldStep] {
+        if let why = fieldValuesProblem(byLabel) { throw HelperError(why) }
+        var plan: [FieldStep] = []
+        for key in byLabel.keys.sorted() {
+            guard let value = byLabel[key].flatMap({ fieldValue($0) }) else { continue }
+            let c: FieldControl
+            do { c = try await resolve(key) } catch is Cancelled {
+                throw Cancelled()
+            } catch {
+                let number = key.allSatisfy { $0.isASCII && $0.isNumber }
+                    ? "; to name element \(key) by its number, give fields as a list: [{\"element\": \(key), …}]" : ""
+                throw HelperError("\(fieldName(key)): \(error)\(number)")
+            }
+            do {
+                let fill = try fieldFill(value, role: c.role, textInput: c.textInput, inPage: c.inPage, what: c.what)
+                if case .text = fill, c.secure, !secureAllowed { throw Policy.secureRefusal() }
+                if let same = plan.first(where: { CFEqual($0.node.element, c.node.element) }) {
+                    throw HelperError("it names the same \(c.what) as \(fieldName(same.key)): give it once")
+                }
+                plan.append((key: key, fill: fill, node: c.node))
+            } catch {
+                throw HelperError("\(fieldName(key)): \(error)")
+            }
+        }
+        let order = fillOrder(plan.map { (key: $0.key, frame: $0.node.frame) })
+        return order.compactMap { k in plan.first { $0.key == k } }
+    }
+
     static func setChecked(_ f: [String: Any], _ want: Bool, _ run: Run) async throws {
-        guard let n = try controlNode(f, run.target, AX.isCheckable) else { throw HelperError("checked needs element or target") }
+        guard let n = try await controlNode(f, run.target, AX.isCheckable) else { throw HelperError("checked needs element or target") }
         guard let v = AX.value(n.element, kAXValueAttribute) as? NSNumber else { throw HelperError("the \(n.name) isn't a checkbox or switch") }
         VerifyEdit.checked(n, want: want, was: VerifyEdit.state(v))  // when the act checks its edits
         if (v.intValue != 0) == want { return }
@@ -566,7 +616,7 @@ extension Handlers {
         guard let option = (a["option"] ?? a["value"] ?? a["text"]).map({ "\($0)" }), !option.isEmpty else {
             throw HelperError("select needs option (the item's title)")
         }
-        guard let n = try controlNode(a, run.target, AX.isChoosable) else { throw HelperError("select needs element or target") }
+        guard let n = try await controlNode(a, run.target, AX.isChoosable) else { throw HelperError("select needs element or target") }
         let role = AX.value(n.element, kAXRoleAttribute) as? String ?? ""
         guard ["AXPopUpButton", "AXComboBox", "AXMenuButton"].contains(role) else {
             throw HelperError("that's a \(AX.describe(n.element)), not a pop-up or combo box to select from")
@@ -624,7 +674,8 @@ extension Handlers {
             if newWindowBy(foreground: run.foreground, keysReach: keysReachTarget(r), front: Hold.isFront(w.pid)) == .menu,
                let byMenu = try await newWindowByMenu(a, run, from: w) {
                 nw = byMenu
-            } else {  // (in the user's front app, with another window holding its keyboard, guardKeyboard stops the keys)
+            } else {  // (in the user's front app, with another window holding its keyboard, prompt or stop)
+                try await ensureKeyboard(r, run: run, action: "navigate")
                 let keyBefore = AX.focusedWindow(pid: w.pid), front = Hold.isFront(w.pid)
                 try await press(["cmd", "n"], r)
                 guard let opened = try await run.newWindow(pid: w.pid, timeout: 4) else { throw HelperError("cmd+n opened no new window") }
@@ -636,6 +687,8 @@ extension Handlers {
             // It focuses its address bar: go on once it has (cmd+l needs the keyboard in it, and the address is
             // pasted only into an address bar), or after 0.6 s anyway.
             _ = try await Run.pollUntil(floor: 0.05, every: 0.04, cap: 0.6) { readyForAddress(pid: nw.pid, wid: nw.id) }
+        } else {
+            try await ensureKeyboard(r, run: run, action: "navigate")
         }
         try await press(["cmd", "l"], r)
         await Input.sleep(typist.between())
@@ -1137,6 +1190,8 @@ extension Handlers {
         guard !q.isEmpty || role != nil else { throw HelperError("wait_for needs text (and/or role), or change: true") }
         let gone = a["gone"] as? Bool == true
         let start = Date()
+        let promptBase = Connection.current?.promptWait ?? 0
+        func elapsedNow() -> TimeInterval { max(0, Date().timeIntervalSince(start) - ((Connection.current?.promptWait ?? 0) - promptBase)) }
         let what = (role.map { "\($0) " } ?? "") + (q.isEmpty ? "" : "\"\(q)\"")
         // An app with nothing in its accessibility tree (a canvas, a game): watch the pixels instead.
         let byEye = !q.isEmpty && AX.search(pid: w.pid, windows: waitScope(w, run), query: "", limit: 1, budget: 0.5).isEmpty
@@ -1157,7 +1212,7 @@ extension Handlers {
                 found = !hits.isEmpty
                 // A browser window its app isn't drawing has no page to read, but its tabs and toolbar carry the page's
                 // title: a match only there isn't the page's, so the wait stops, saying so. Asked once a second at most.
-                let elapsed = Date().timeIntervalSince(start)
+                let elapsed = elapsedNow()
                 if let m = hits.first, elapsed - askedChrome >= 1, chromeOnly(m, w) {
                     askedChrome = elapsed
                     if var f = try await frozenNow(run.target, tree: true),
@@ -1169,7 +1224,7 @@ extension Handlers {
                     }
                 }
             }
-            let waited = Date().timeIntervalSince(start)
+            let waited = elapsedNow()
             // Not found (or gone): asked at once, then every second while it waits.
             if !found, !byEye, gone || waited - asked >= 1 {
                 asked = waited
@@ -1872,6 +1927,7 @@ extension AX {
     /// key: never into a text field). Keys go by route `r`. Whether the pop-up shows it then.
     @MainActor static func typeAhead(_ el: AXUIElement, _ title: String, among titles: [String], _ r: Route) async throws -> Bool {
         guard let pid = pidOf(el), Policy.level(pid) == .full, let letters = typeAheadPrefix(title, among: titles) else { return false }
+        try await Handlers.ensureKeyboard(r, action: "select")
         func ready() -> Bool {
             let f = focusedElement(pid: pid)
             return canTypeAhead(focusRole: f.flatMap { value($0, kAXRoleAttribute) as? String }, onControl: f.map { CFEqual($0, el) } ?? false)

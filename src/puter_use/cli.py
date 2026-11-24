@@ -17,7 +17,7 @@ from pathlib import Path
 from .client import Helper, HelperError, app_path
 from .present import HIDDEN_CAP, image_bytes, summarize, until_missed, window_list
 from .settings import (act_params, capture_params, detail_param, element_number, element_numbers, outline_params,
-                       session)
+                       read_params, session)
 
 SHOTS = Path(os.environ.get("PUTER_USE_SHOTS") or Path.home() / "Library/Caches/puter-use/shots")
 
@@ -299,7 +299,7 @@ async def run(args: argparse.Namespace) -> int:
         elif args.cmd in ("shot", "screenshot") and args.read is not None:
             return report(await h.call("screenshot", window=window_arg(args.window or args.window_pos),
                                        read=read_arg(args.read), offset=args.offset, limit=args.limit,
-                                       query=args.query))
+                                       query=args.query, **read_params()))
         elif args.cmd in ("shot", "screenshot"):
             if args.offset is not None or args.limit is not None or args.query is not None:
                 raise SystemExit("--offset, --limit and --query go with --read")

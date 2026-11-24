@@ -185,7 +185,11 @@ user's OK. A step by `x,y` or number always runs, and neither a `fill`'s fields 
 `until` can be optional. A macro saved from the batch keeps the step, optional.
 
 **Keyboard isolation.** Key events go to the app's key window, not the window they're stamped for. If
-another window of the same app has the keyboard (you brought one forward), keys, modifier-clicks and
+another window of the same app has the keyboard (you brought one forward), `PuterUse.app` by default
+shows a non-activating floating popup asking you to **Switch Window** (or **Allow**) or **Decline**
+without interrupting your typing; approving switches focus to the agent's window so the action
+completes cleanly (`PUTER_USE_FOCUS_PROMPT=never` disables the popup). If you decline, don't respond
+within 30 s, or have the popup disabled, keys, modifier-clicks and
 menu commands stop with an error naming that window instead of acting on yours (checked before each
 keystroke, so taking the keyboard mid-text stops it there). Clicks without keys still go to the
 agent's window. While the app is your front app, the error says it clears when you leave it; in the
@@ -366,9 +370,13 @@ note: brought Firefox forward for 0.6 s to redraw your window #26972 (it had sto
 
 That gives one fresh look, not a lasting fix: once the window is covered again it may stop drawing
 again, and the next try waits out the 30 seconds. The lasting fix is starting Firefox with
-`MOZ_WINDOW_OCCLUSION=0`, which then never needs this. When it isn't done because of the user, the
+`MOZ_WINDOW_OCCLUSION=0`, which then never needs this. When automatic bringing forward can't run
+(you're in that app, busy, in a full-screen app, or the window isn't exclusively the agent's),
+`PuterUse.app` by default asks via the same non-activating focus popup (`PUTER_USE_FOCUS_PROMPT=never`
+disables it). When it still isn't brought forward, the
 not-drawn note says so: `(it's covered; not brought forward: the user is busy)`, `the user is in
-Firefox` or `the user's front app is full screen`. `PUTER_USE_BRING_FORWARD=never` turns it off.
+Firefox`, `the user's front app is full screen`, or `the user declined switching to #…`.
+`PUTER_USE_BRING_FORWARD=never` turns automatic bringing forward off.
 
 **Menus are never left open.** While a menu is open, macOS sends it the user's real keystrokes too,
 whichever app they're typing in. So a menu still open at the end of a batch (a right-click or pop-up

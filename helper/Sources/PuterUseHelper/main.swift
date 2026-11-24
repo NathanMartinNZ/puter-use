@@ -44,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Keys.prepare()  // keyboard-layout lookups must happen on the main thread
+        Fronts.watch()  // track app switches from launch (for ownership & FocusGrant revocation)
         _ = Handlers.builtAt  // read now, before a rebuild can replace the file
         let path = socketPath()
         if Server.isAlive(path) {

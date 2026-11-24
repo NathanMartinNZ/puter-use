@@ -39,6 +39,7 @@ final class Session: @unchecked Sendable {  // only touched on the main thread
     var given = Set<CGWindowID>()  // its windows the user has taken over (close_window leaves them alone)
     var refusals: [CGWindowID: [TimeInterval]] = [:]  // when keys for each window were refused lately (`guardKeyboard`)
     var keyMove: KeyMove?  // the act under way moved its app's keyboard off the user's window (`Handlers.keyPrimer`)
+    var focusGrant: FocusGrant?  // user-approved active window: mouse drift doesn't abort until user presses a key/click or leaves app
     var pickNoted = Set<[CGWindowID]>()  // [its window, the front one]: an app name meant its window, and it was told
     var windowApps: [CGWindowID: (app: String, pid: pid_t)] = [:]  // each window it used: "not found" lists its app's others
     var acts = 0  // act requests so far

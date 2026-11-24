@@ -362,8 +362,10 @@ extension Handlers {
             throw HelperError("until is the text to scroll to: \"Load more\" or {\"text\": \"Load more\", \"role\": \"button\"}")
         }
         let sp = Spec(text: given.text, role: given.role)
-        let deadline = AX.uptime() + ScrollUntil.timeCap
-        func budget() -> TimeInterval { max(0.2, min(1.5, deadline - AX.uptime())) }
+        let promptBase = Connection.current?.promptWait ?? 0
+        let baseDeadline = AX.uptime() + ScrollUntil.timeCap
+        func deadline() -> TimeInterval { baseDeadline + ((Connection.current?.promptWait ?? 0) - promptBase) }
+        func budget() -> TimeInterval { max(0.2, min(1.5, deadline() - AX.uptime())) }
         var state = ScrollUntil(maxScrolls: a["max_scrolls"])
         let win = Windows.info(w.id)?.frame ?? w.frame
         let step = ScrollUntil.step(a, viewport: (ScrollWatch.shownScroller(pid: r.pid, at: p, window: win) ?? win).size,
@@ -386,7 +388,7 @@ extension Handlers {
                 let atEnd = ScrollUntil.atEnd(bar: (bar, barNow), forward: eye.forward)
                 (glance, bar) = (now, barNow)
                 found = try await untilSeen(sp, w, t, blind: now.allSatisfy { $0 == nil }, budget: budget())
-                _ = state.observe(found: found != nil, moved: moved, atEnd: atEnd, late: AX.uptime() >= deadline)
+                _ = state.observe(found: found != nil, moved: moved, atEnd: atEnd, late: AX.uptime() >= deadline())
             }
         }
         // Where it left the scroll bar (the reply's scroll), unless the note names the end it reached.

@@ -33,6 +33,14 @@ extension Handlers {
     /// The longest a flash waits for the window to draw (s).
     nonisolated static let flashCap: Double = 1.2
 
+    /// Structural prerequisites shared by automatic `forward` and user-approved `FocusPrompt.shouldPromptRevive`:
+    /// covered (not minimized, other-Space, hidden or in view), on screen, not foreground mode, app doesn't
+    /// draw covered windows on, and no other session holds its lock.
+    nonisolated static func structurallyRevivable(cover: Cover, onScreen: Bool, foreground: Bool,
+                                                  drawsCovered: Bool, otherAgent: Bool) -> Bool {
+        !foreground && cover == .covered && !drawsCovered && onScreen && !otherAgent
+    }
+
     /// Whether to bring the app of a window found not drawn forward for a moment: only for one that's covered
     /// (`cover`: not minimized, on another Space or with its app hidden) and on this Space (`onScreen`), one of the
     /// session's own the user hasn't used (`owner`), with the setting on (`enabled`), not in foreground mode, of an app
@@ -160,37 +168,179 @@ extension Handlers {
     }
 
     /// When window `w` is found not drawn (`f`): its app brought forward for a moment so it draws `w` again, when
-    /// `forward` allows it (`flash`), with a note for the agent on how that went. Whether `w` is drawn now; if not,
-    /// `f` says why it wasn't brought forward, when the agent should hear it (`forwardWhy`).
+    /// `forward` allows it (`flash`), with a note for the agent on how that went. When automatic flashing can't run
+    /// (e.g. the user is in that app, busy, full-screen, or the window isn't exclusively the agent's), asks the user
+    /// via `FocusPrompt` when eligible. Whether `w` is drawn now; if not, `f` says why it wasn't brought forward.
     static func revive(_ w: WinInfo, _ f: inout Frozen) async -> Bool {
         f.notForward = nil
+        f.declined = false
         let back = NSWorkspace.shared.frontmostApplication
         let d = forwardCheck(w, f, back: back)
-        guard d == .go, let back, back.processIdentifier != Windows.ownPID else {
-            f.notForward = forwardWhy(d, app: w.app)
+        if d == .go, let back, back.processIdentifier != Windows.ownPID {
+            Session.current.forwarded[w.id] = ProcessInfo.processInfo.systemUptime
+            let alreadyMine = AppLocks.holder(w.pid) == Session.current.id
+            if !alreadyMine {
+                do { try await AppLocks.acquire(w.pid) } catch { return false }
+            }
+            defer { if !alreadyMine { AppLocks.release(w.pid) } }
+            guard !Connection.hungUp, Windows.info(w.id)?.onScreen == true else { return false }
+            let r = await flash(w, f, back: back)
+            Connection.current?.ownerNotes.append(flashNote(r, app: w.app, wid: w.id,
+                                                            back: back.localizedName ?? "the app the user was in"))
+            return r.drawn
+        }
+        // Automatic flash couldn't run: check if we can ask the user with a non-activating FocusPrompt.
+        if let prompted = await promptRevive(w, &f, autoDecision: d) {
+            return prompted
+        }
+        if f.notForward == nil { f.notForward = forwardWhy(d, app: w.app) }
+        return false
+    }
+
+    /// Ask the user to approve bringing covered frozen window `w` forward when automatic flash didn't run.
+    /// Returns nil when prompting wasn't eligible (caller uses `forwardWhy`), else whether `w` drew again.
+    private static func promptRevive(_ w: WinInfo, _ f: inout Frozen, autoDecision d: Forward) async -> Bool? {
+        func eligible() -> (ok: Bool, cooldown: FocusPrompt.CooldownReason?) {
+            let since = Session.current.forwarded[w.id].map { ProcessInfo.processInfo.systemUptime - $0 }
+            let driver = AppLocks.holder(w.pid)
+            let revivable = structurallyRevivable(cover: f.cover,
+                                                  onScreen: Windows.info(w.id)?.onScreen == true,
+                                                  foreground: inForeground,
+                                                  drawsCovered: drawsCovered(w.pid),
+                                                  otherAgent: driver != nil && driver != Session.current.id)
+            let cooldown = FocusPrompt.activeCooldown(pid: w.pid)
+            let ok = FocusPrompt.shouldPromptRevive(enabled: Connection.current?.focusPrompt ?? false,
+                                                    quitting: Connection.quitting,
+                                                    structurallyRevivable: revivable,
+                                                    recently: since.map { $0 < forwardGap } ?? false,
+                                                    screenLocked: Windows.screenLocked,
+                                                    inCooldown: cooldown != nil)
+            return (ok, cooldown)
+        }
+        let initial = eligible()
+        if !initial.ok {
+            if let reason = initial.cooldown,
+               structurallyRevivable(cover: f.cover, onScreen: Windows.info(w.id)?.onScreen == true,
+                                     foreground: inForeground, drawsCovered: drawsCovered(w.pid),
+                                     otherAgent: AppLocks.holder(w.pid).map { $0 != Session.current.id } ?? false) {
+                f.declined = reason == .declined
+                f.notForward = reason == .declined
+                    ? "the user recently declined switching \(w.app)"
+                    : "no response to recent switch prompt"
+                return false
+            }
+            return nil
+        }
+        do { try await FocusPrompt.acquireGate() } catch {
+            Connection.current?.work.promptCancelled = true
             return false
         }
-        Session.current.forwarded[w.id] = ProcessInfo.processInfo.systemUptime
-        // No other session's act starts driving the app meanwhile (the session's own act holds it already).
-        let locked = AppLocks.holder(w.pid) == nil
-        if locked { try? await AppLocks.acquire(w.pid) }
-        defer { if locked { AppLocks.release(w.pid) } }
-        let r = await flash(w, f, back: back)
-        Connection.current?.ownerNotes.append(flashNote(r, app: w.app, wid: w.id,
-                                                        back: back.localizedName ?? "the app the user was in"))
-        return r.drawn
+        defer { FocusPrompt.releaseGate() }
+        // Re-check after acquiring the FIFO gate: another session may have triggered a cooldown or window moved.
+        let again = eligible()
+        if !again.ok {
+            if let reason = again.cooldown {
+                f.declined = reason == .declined
+                f.notForward = reason == .declined
+                    ? "the user recently declined switching \(w.app)"
+                    : "no response to recent switch prompt"
+                return false
+            }
+            return nil
+        }
+        if coverOf(w).cover == .inView { return await drawnNow(w, f) }
+        let liveInfo = Windows.info(w.id) ?? w
+        let front = Hold.isFront(w.pid)
+        let key = front ? keyWindow(w.pid, timeout: 0.05) : nil
+        let keyInfo = key.flatMap { Windows.info($0) }
+        let req = FocusPrompt.Request(
+            pid: w.pid, wid: w.id, app: AgentBrowser.label(liveInfo), title: liveInfo.title,
+            targetOwner: owner(w.id), keyWid: key, keyTitle: keyInfo?.title ?? "",
+            keyOwner: key.map { owner($0) } ?? .user, trigger: .frozen, action: "redraw",
+            front: front, sessionOrdinal: Session.current.ordinal,
+            anchorFrame: keyInfo?.frame ?? activeWindowFrame()
+        )
+        let outcome = await FocusPrompt.ask(req) {
+            guard Windows.info(w.id)?.onScreen == true,
+                  NSRunningApplication(processIdentifier: w.pid)?.isTerminated == false else { return .windowGone }
+            if coverOf(w).cover == .inView { return .clearedInView }
+            return nil
+        }
+        switch outcome {
+        case .approved(let presses, let at):
+            FocusPrompt.clearCooldown(pid: w.pid)
+            let alreadyMine = AppLocks.holder(w.pid) == Session.current.id
+            if !alreadyMine {
+                do { try await AppLocks.acquire(w.pid) } catch { return false }
+            }
+            defer { if !alreadyMine { AppLocks.release(w.pid) } }
+            guard !Connection.hungUp, let fresh = Windows.info(w.id), fresh.onScreen else { return false }
+            Session.current.forwarded[w.id] = ProcessInfo.processInfo.systemUptime
+            let liveFront = Hold.isFront(w.pid)
+            let back = NSWorkspace.shared.frontmostApplication
+            if liveFront || back == nil || back?.processIdentifier == Windows.ownPID {
+                let raised = await activateApprovedFront(fresh, presses: presses, at: at, allowBaselineFlip: false)
+                guard raised == nil else {
+                    f.notForward = "\(w.app) didn't bring #\(w.id) forward"
+                    return false
+                }
+                let start = ProcessInfo.processInfo.systemUptime
+                var drawn = false
+                while ProcessInfo.processInfo.systemUptime - start < flashCap {
+                    if Connection.hungUp { return false }
+                    if Input.userPresses() != presses || keyWindow(w.pid, timeout: 0.05).map({ $0 != w.id }) == true { break }
+                    if await drawnNow(fresh, f) { drawn = true; break }
+                    await Input.sleep(0.05)
+                }
+                if !drawn { drawn = await drawnNow(fresh, f) }
+                Connection.current?.ownerNotes.append(
+                    "the user approved switching \(AgentBrowser.label(fresh)) to #\(w.id) to redraw it"
+                        + (drawn ? "" : ", but it didn't draw again")
+                )
+                return drawn
+            }
+            let r = await flash(fresh, f, back: back!, approvedPresses: presses)
+            let backName = back?.localizedName ?? "the app the user was in"
+            Connection.current?.ownerNotes.append(
+                "the user approved bringing \(AgentBrowser.label(fresh)) #\(w.id) forward to redraw it"
+                    + (r.drawn ? "" : " (it didn't draw again)")
+                    + (r.gaveBack ? ", then gave focus back to \(backName)" : "; \(fresh.app) may still be in front")
+            )
+            return r.drawn
+        case .declined:
+            FocusPrompt.recordDecline(pid: w.pid)
+            f.declined = true
+            f.notForward = "the user declined switching to #\(w.id)"
+            return false
+        case .timedOut:
+            FocusPrompt.recordTimeout(pid: w.pid)
+            f.notForward = "no response to switch prompt after \(Int(FocusPrompt.timeout)) s"
+            return false
+        case .clearedInView:
+            return await drawnNow(w, f)
+        case .cancelled:
+            Connection.current?.work.promptCancelled = true
+            return false
+        case .windowGone, .unavailable, .clearedBackground, .clearedFocused:
+            return nil
+        }
     }
 
     /// Brings window `w`'s app forward with `w` raised and key (`raiseToKey`, as activate does), until `w` draws again
     /// (`drawnNow`, looked at every 50 ms for up to `flashCap` s), then the app the user was in (`back`) forward again;
-    /// at once if the user touches the keyboard or mouse meanwhile. Not cut short when the client hangs up: the user's
-    /// app always comes back. A hold on the app (`Hold`) is sent again afterwards: the app was really told it's
+    /// at once if the user touches the keyboard or mouse meanwhile (when `approvedPresses` is given, only new real keys
+    /// or clicks cut it short, not mouse drift after clicking Approve). Not cut short when the client hangs up: the
+    /// user's app always comes back. A hold on the app (`Hold`) is sent again afterwards: the app was really told it's
     /// inactive as `back` came back. Which way each came to the front goes in the helper's trace (`flashTrace`).
-    static func flash(_ w: WinInfo, _ f: Frozen, back: NSRunningApplication) async -> Flash {
+    static func flash(_ w: WinInfo, _ f: Frozen, back: NSRunningApplication,
+                      approvedPresses: Fronts.Presses? = nil) async -> Flash {
         let start = ProcessInfo.processInfo.systemUptime
         func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
-        let presses = Input.userPresses()
-        func userCame() -> Bool { Input.userPresses() != presses || !Input.userQuiet(for: now() - start) }
+        let presses = approvedPresses ?? Input.userPresses()
+        func userCame() -> Bool {
+            if approvedPresses != nil { return Input.userPresses() != presses }
+            return Input.userPresses() != presses || !Input.userQuiet(for: now() - start)
+        }
         Hold.flashing[w.pid] = .infinity  // its coming forward is puter-use's own, not the user's
         var r = Flash()
         // Its window made key and main first, so the app comes forward with that one (on this Space), not another.
@@ -221,8 +371,8 @@ extension Handlers {
         r.gaveBack = r.backBy != .none
         r.seconds = now() - start
         if r.userCame, !r.drawn { r.drawn = await drawnNow(w, f) }
-        Hold.flashing[w.pid] = now() + 1  // its notice of coming forward may come a moment late
-        Hold.restore(w.pid)
+        Hold.flashing[w.pid] = now() + 0.35  // its notice of coming forward may come a moment late
+        if !Hold.isFront(w.pid) { Hold.restore(w.pid) }
         if Trace.on { Trace.log(flashTrace(r, pid: w.pid, wid: w.id)) }
         return r
     }

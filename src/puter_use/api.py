@@ -22,7 +22,7 @@ from typing import Any
 from .client import Helper, HelperError
 from .present import summarize, until_missed
 from .settings import (act_params, capture_params, detail_param, element_number, element_numbers, outline_params,
-                       session)
+                       read_params, session)
 
 __all__ = ["Computer", "Result", "ActionError", "HelperError"]
 
@@ -199,11 +199,11 @@ class Computer:
         what = element_number(what)
         if query is not None:
             return self._call("screenshot", window=self.window, read=what, offset=offset, limit=limit,
-                              query=query).get("read", "")
+                              query=query, **read_params()).get("read", "")
         parts, pos = [], offset
         while limit is None or pos < offset + limit:
             want = 50000 if limit is None else min(50000, offset + limit - pos)
-            raw = self._call("screenshot", window=self.window, read=what, offset=pos, limit=want)
+            raw = self._call("screenshot", window=self.window, read=what, offset=pos, limit=want, **read_params())
             parts.append(raw.get("read", ""))
             start, end, total = raw.get("read_range", [pos, pos, 0])
             if pos == offset:  # a negative offset came to `start`, counted from the beginning: go on from there

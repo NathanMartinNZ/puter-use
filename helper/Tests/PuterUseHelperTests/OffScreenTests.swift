@@ -297,7 +297,7 @@ final class OffScreenTests: XCTestCase {
         let step: [String: Any] = ["type": "click", "target": ["text": "Row 70", "role": "button"], "spot": true]
         for attempt in 0..<2 {
             do {
-                if attempt == 0 { _ = try await Handlers.actionPoint(step, .window(w)) } else { _ = try Handlers.elementNode(step, .window(w)) }
+                if attempt == 0 { _ = try await Handlers.actionPoint(step, .window(w)) } else { _ = try await Handlers.elementNode(step, .window(w)) }
                 XCTFail("it should be refused")
             } catch let e as HelperError {
                 XCTAssertTrue(e.description.contains("was one of several with that name when the macro was saved"), e.description)

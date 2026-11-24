@@ -88,6 +88,7 @@ final class Run {
         if stopping == nil {
             stopping = Task { @MainActor in
                 Connection.quitting = true
+                FocusPrompt.cancelAll()
                 let end = ProcessInfo.processInfo.systemUptime + seconds
                 while !active.isEmpty, ProcessInfo.processInfo.systemUptime < end { await Input.ms(10) }
                 await Connection.ungated { await abandonAll() }  // not held back as the quit's own request would be
@@ -238,6 +239,7 @@ final class Run {
         let leftAlone = may.users ? Run.leftAloneNote(w.frame.size, box: fitBox(for: w.id)) : ""
         target = .window(w)
         Handlers.current = w.id
+        if Handlers.validFocusGrant(pid: w.pid, wid: nil) { Session.current.focusGrant?.wid = w.id }
         moved = true
         visibleBefore.insert(w.id)
         existedBefore.insert(w.id)
@@ -281,10 +283,14 @@ final class Run {
     nonisolated static let launchGrace: TimeInterval = 10
 
     /// What may be done with a new window of app `pid` as the batch meets it, read now: see the static one.
+    /// If the user just clicked Approve on FocusPrompt for `pid` (and made no further real key/click/modifier
+    /// input since), that Approve click is excluded so it never poisons new-window sizing, placement or following.
     func arrange(_ pid: pid_t) -> (fit: Bool, place: Bool, follow: Bool, users: Bool) {
         let span = Date().timeIntervalSince(began) + Run.userLead
+        let granted = Handlers.validFocusGrant(pid: pid, wid: nil)
         return Run.arrange(launching: launching(pid), front: Hold.isFront(pid),
-                           userPressed: Run.sinceUser(Run.opening) < span, userTyped: Run.sinceUser([.keyDown]) < span,
+                           userPressed: !granted && Run.sinceUser(Run.opening) < span,
+                           userTyped: !granted && Run.sinceUser([.keyDown]) < span,
                            foreground: foreground)
     }
 

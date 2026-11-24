@@ -446,6 +446,21 @@ def test_bring_forward_setting(monkeypatch):
         assert capture_params()["bring_forward"] == "when-needed"
 
 
+def test_focus_prompt_setting(monkeypatch):
+    """PUTER_USE_FOCUS_PROMPT goes to the helper with every call: "when-needed" unless it's "never" (any case,
+    or another way of saying off); anything else is the default."""
+    from puter_use.settings import capture_params, focus_prompt
+
+    monkeypatch.delenv("PUTER_USE_FOCUS_PROMPT", raising=False)
+    assert focus_prompt() == "when-needed" and capture_params()["focus_prompt"] == "when-needed"
+    for value in ("never", " Never ", "NEVER", "off", "0", "false", "no"):
+        monkeypatch.setenv("PUTER_USE_FOCUS_PROMPT", value)
+        assert focus_prompt() == "never" and capture_params()["focus_prompt"] == "never"
+    for value in ("", "when-needed", "always", "1", "on"):
+        monkeypatch.setenv("PUTER_USE_FOCUS_PROMPT", value)
+        assert focus_prompt() == "when-needed" and capture_params()["focus_prompt"] == "when-needed"
+
+
 def test_agent_browser_profile_folder(monkeypatch):
     """An absolute path in PUTER_USE_BROWSER_PROFILE goes to the helper as it is (the helper standardizes it), and
     one starting with `~` with the home folder in its place; a relative one is off."""

@@ -211,6 +211,7 @@ enum Handlers {
         do {
             Hold.touch()
             Connection.current?.bringForward = forwardSetting(p["bring_forward"])
+            Connection.current?.focusPrompt = FocusPrompt.setting(p["focus_prompt"])
             var result: [String: Any]
             switch req["cmd"] as? String ?? "" {
             case "status":
@@ -537,9 +538,9 @@ enum Handlers {
 
     /// The app's key window, as its accessibility says: asked without switching on a browser's accessibility
     /// tree (its windows are the app's own either way), giving up quickly on a busy app as `caret` does.
-    static func keyWindow(_ pid: pid_t) -> CGWindowID? {
+    static func keyWindow(_ pid: pid_t, timeout: Float = caretTimeout) -> CGWindowID? {
         let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, caretTimeout)
+        AXUIElementSetMessagingTimeout(app, timeout)
         guard let w = AX.value(app, kAXFocusedWindowAttribute), CFGetTypeID(w) == AXUIElementGetTypeID() else { return nil }
         var id: CGWindowID = 0
         return _AXUIElementGetWindow(w as! AXUIElement, &id) == .success ? id : nil
@@ -747,7 +748,7 @@ enum Handlers {
 
     /// How long one question about the cursor waits for the app: it's asked with every picture, and an app
     /// too slow to answer only loses the blink rule (its cursor blinking counts as a change, as it used to).
-    static let caretTimeout: Float = 0.3
+    nonisolated static let caretTimeout: Float = 0.3
 
     /// The text cursor in `t`'s window: the focused text field or text area there and the cursor in it,
     /// relative to the window. Nil when no text element there has the focus, or text is selected (that's
@@ -830,7 +831,7 @@ enum Handlers {
         let t = try resolve(p["window"])
         try Policy.checkLook(pid(t))
         current = t.key
-        if readRequested(p["read"]) { return try readText(t, p["read"]!, p) }  // one element's whole text: ReadText.swift
+        if readRequested(p["read"]) { return try await readText(t, p["read"]!, p) }  // one element's whole text: ReadText.swift
         let region = try regionPoints(p["region"]).map { try regionRect(t, $0) }
         // (`detail: "low"` for the window's picture; a zoom is a closer look, and no image needs none.)
         let o = region == nil && p["image"] as? Bool != false ? detailed(Opts(p), t) : Opts(p)
@@ -1330,6 +1331,10 @@ enum Handlers {
     /// Thrown by a menu command's check on a new hold, so its click goes after the check and before the press.
     struct PrimeFirst: Error {}
 
+    /// Thrown by a menu command's check when another window has the keyboard, so `ensureKeyboard` runs after
+    /// item lookup and policy checks and before `kAXEnabledAttribute`.
+    struct PromptFirst: Error {}
+
     nonisolated static func actsOnKeyboardFocus(_ a: [String: Any]) -> Bool {
         if keyboardActions.contains(kind(a)) || kind(a) == "menu" || kind(a) == "menu_item" { return true }
         // A move holds keys only when it names a modifier (OpenAI's computer use sends an empty list otherwise).
@@ -1590,7 +1595,7 @@ enum Handlers {
             return try await aimAt(n, aimName(a), vet: vet)
         }
         if let idx = num(a["element"]), case .window(let w) = t {
-            let n = try numbered(w, Int(idx), t)
+            let n = try await numbered(w, Int(idx), t)
             try reachable(n.element, "element \(Int(idx))")
             return try await aimAt(n, "element \(Int(idx))", vet: vet)
         }
@@ -1668,7 +1673,6 @@ enum Handlers {
                                                             vetRead: vetRead) else { return }
             var p = aimed
             var r = try route(t, at: p, foreground: foreground)
-            if !flags.isEmpty { try guardKeyboard(r) }  // its modifiers go to whichever window has the keyboard
             if button == "left" { try Policy.checkPress(a, node: node, at: p, pid: r.pid) }
             if let item = a["item"], let last = AX.menuPath(item).last {
                 try Policy.checkItem(a, last)
@@ -1681,6 +1685,7 @@ enum Handlers {
             if let item = a["item"], AX.menuPath(item).contains(where: { AX.menuKey($0) == "services" }) {
                 throw HelperError("Services hand what's selected to other apps; puter-use doesn't use them")
             }
+            if !flags.isEmpty { try await ensureKeyboard(mainRoute(t, r), run: run, action: type) }  // its modifiers go to whichever window has the keyboard
             // A pop-up's item is chosen through accessibility (see popUpButton).
             if let item = a["item"], AX.menuPath(item).count == 1, button == "left", count == 1, allFlags.isEmpty,
                !foreground, let popup = popUpButton(node?.element ?? AX.element(pid: r.pid, at: p)) {
@@ -1793,7 +1798,7 @@ enum Handlers {
             if !flags.isEmpty, case let level = Policy.level(r.pid), level <= .view {
                 throw Policy.refusal(r.pid, level, doing: "move holding keys")
             }
-            if !flags.isEmpty { try guardKeyboard(r) }  // its modifiers go to whichever window has the keyboard
+            if !flags.isEmpty { try await ensureKeyboard(mainRoute(t, r), run: run, action: type) }  // its modifiers go to whichever window has the keyboard
             let mods = await Input.pressModifiers(flags, r, typist: clickTiming)
             await pointer.move(to: p, r, button: run.heldButton?.button)  // a button is down: this is a drag
             await Input.releaseModifiers(mods, r, typist: clickTiming)
@@ -1811,14 +1816,21 @@ enum Handlers {
             }
             let r = try route(t, at: p, foreground: foreground)
             if button == "left" { try Policy.checkPress(a, node: node, at: p, pid: r.pid) }
+            let mkeys = Keys.splitCombo(a["keys"] ?? a["modifiers"])
+            if !mkeys.isEmpty {
+                for k in mkeys {
+                    if Keys.modifiers[Keys.normalize(k)] == nil { _ = try Keys.parseCombo([k]) }
+                }
+                try await ensureKeyboard(mainRoute(t, r), run: run, action: type)
+            }
             if foreground { prepareForeground(r) }
             await Input.primer(r)
             await pointer.move(to: p, r)
             await Input.sleep(clickTiming.aim())
             await Input.afterPrimer()  // its keys and button go down next
             // Its keys stay down with the button, as a hand holds shift through a shift-drag.
-            if !Keys.splitCombo(a["keys"] ?? a["modifiers"]).isEmpty { try guardKeyboard(r) }
-            for k in Keys.splitCombo(a["keys"] ?? a["modifiers"]) where !run.heldKeys.contains(where: { $0.name == Keys.normalize(k) }) {
+            if !mkeys.isEmpty { try guardKeyboard(mainRoute(t, r)) }
+            for k in mkeys where !run.heldKeys.contains(where: { $0.name == Keys.normalize(k) }) {
                 try run.keyDown(k, r)
                 run.buttonKeys.append(k)
                 await Input.sleep(clickTiming.modifierLead())
@@ -1857,10 +1869,10 @@ enum Handlers {
             }
             guard pts.count >= 2 else { throw HelperError("drag needs path [[x,y],[x,y],...] (or from/to)") }
             let r = try route(t, at: pts[0], foreground: foreground)
-            if !flags.isEmpty { try guardKeyboard(r) }  // its modifiers go to whichever window has the keyboard
             let button = (a["button"] as? String) ?? "left"
             // Down and up on a button presses it, as a click would.
             if button == "left" { try Policy.checkPress(a, node: nil, at: pts[0], pid: r.pid) }
+            if !flags.isEmpty { try await ensureKeyboard(mainRoute(t, r), run: run, action: type) }  // its modifiers go to whichever window has the keyboard
             if foreground { prepareForeground(r) }
             let (down, up, _, btn) = Input.buttonTypes(button)
             // Text views judge a drag by the hardware button, which is up in the background (see TextSelection).
@@ -1940,6 +1952,7 @@ enum Handlers {
                 return
             }
             let r = try route(t, at: nil, foreground: foreground)
+            try await ensureKeyboard(r, run: run, action: "type")
             if foreground { prepareForeground(r) }
             // Into the focused field: read back afterwards as for a field named (a key lost, an autocomplete
             // that took over, typing that went elsewhere), never a password field.
@@ -1966,6 +1979,7 @@ enum Handlers {
             // as a Tab or Return before it may have moved the focus.
             let held = run.heldKeys.map(\.name)
             try Policy.checkShortcuts(a, seq.map { held + $0 }, r.pid)
+            try await ensureKeyboard(r, run: run, action: "keypress")
             if foreground { prepareForeground(r) }
             // Return in a page's field (a form sent), or on a link there: the batch waits for the page it goes to.
             if held.isEmpty, let mark = pageMark(keys: seq, r, run) { run.pageMark = mark }
@@ -1981,8 +1995,8 @@ enum Handlers {
         case "key_down", "keydown", "key_up", "keyup", "hold_key", "hold":
             let keys = Keys.splitCombo(a["keys"] ?? a["key"] ?? a["text"])
             let r = try route(t, at: nil, foreground: foreground)
-            if foreground { prepareForeground(r) }
             if type.hasPrefix("key_up") || type == "keyup" {
+                if foreground { prepareForeground(r) }
                 let names = keys.isEmpty ? run.heldKeys.map(\.name) : keys
                 for (i, k) in names.reversed().enumerated() {
                     if i > 0 { await Input.sleep(typist.modifierTrail()) }
@@ -1991,15 +2005,19 @@ enum Handlers {
                 return
             }
             guard !keys.isEmpty else { throw HelperError("\(type) needs keys, e.g. \"shift\" or \"cmd+option\"") }
-            try guardKeyboard(r)  // a held key would be pressed in whichever window has the keyboard
-            // What they do with the keys already held: a shortcut, Return or Space on a button, a character.
-            let combo = run.heldKeys.map(\.name) + keys
-            try Policy.checkShortcuts(a, [combo], r.pid)
-            try checkKey(combo, r, after: 0)
             let seconds = num(a["ms"]).map { $0 / 1000 } ?? num(a["duration"] ?? a["seconds"]) ?? 1
             if type.hasPrefix("hold"), !(0...10).contains(seconds) {
                 throw HelperError("hold_key holds for at most 10 s (ms 0-10000)")
             }
+            for k in keys {
+                if Keys.modifiers[Keys.normalize(k)] == nil { _ = try Keys.parseCombo([k]) }
+            }
+            // What they do with the keys already held: a shortcut, Return or Space on a button, a character.
+            let combo = run.heldKeys.map(\.name) + keys
+            try Policy.checkShortcuts(a, [combo], r.pid)
+            try await ensureKeyboard(r, run: run, action: type)  // a held key would be pressed in whichever window has the keyboard
+            if foreground { prepareForeground(r) }
+            try checkKey(combo, r, after: 0)
             await primeKeys(r)
             for (i, k) in keys.enumerated() {
                 if i > 0 { await Input.sleep(typist.modifierLead()) }
@@ -2016,19 +2034,28 @@ enum Handlers {
             guard let pid = pid(t) else { throw HelperError("menu needs a window target") }
             // A menu command acts on the app's focused window (Paste, Select All, Undo, …): not another one.
             let menuRoute = try route(t, at: nil, foreground: foreground)
-            try guardKeyboard(menuRoute)
             let path = AX.menuPath(a["item"] ?? a["path"] ?? a["text"])
-            // On a new hold, the window's click (see primeKeys) goes once the item has passed its check.
-            let prime = keysNeedPrimer(menuRoute)
+            // Look up the item and run Policy.checkItem before prompting or priming, and before kAXEnabledAttribute
+            // (so the wrong window's disabled state doesn't hide a command that's enabled in our window).
             let (chosen, shortcut): (String, String?)
             do {
-                (chosen, shortcut) = try AX.pressMenu(pid: pid, path: path) { title in
-                    try Policy.checkItem(a, title)
-                    if prime { throw PrimeFirst() }
-                }
+                (chosen, shortcut) = try AX.pressMenu(pid: pid, path: path, check: { try Policy.checkItem(a, $0) }, beforePress: {
+                    if !keysReachTarget(menuRoute) || switchedIn(menuRoute) != nil || userAtKeys(menuRoute) {
+                        throw PromptFirst()
+                    }
+                    if keysNeedPrimer(menuRoute) { throw PrimeFirst() }
+                })
+            } catch is PromptFirst {
+                try await ensureKeyboard(menuRoute, run: run, action: "menu")
+                if keysNeedPrimer(menuRoute) { await primeKeys(menuRoute) }
+                (chosen, shortcut) = try AX.pressMenu(pid: pid, path: path, check: { try Policy.checkItem(a, $0) }, beforePress: {
+                    try guardKeyboard(menuRoute)
+                })
             } catch is PrimeFirst {
                 await primeKeys(menuRoute)
-                (chosen, shortcut) = try AX.pressMenu(pid: pid, path: path) { try Policy.checkItem(a, $0) }
+                (chosen, shortcut) = try AX.pressMenu(pid: pid, path: path, check: { try Policy.checkItem(a, $0) }, beforePress: {
+                    try guardKeyboard(menuRoute)
+                })
             }
             run.ranMenu = path.count == 1 ? chosen : nil  // a macro saves the path a name alone ran (`Macros.ran`)
             if let shortcut {
@@ -2065,6 +2092,7 @@ enum Handlers {
         case "paste":
             guard let text = a["text"] as? String, !text.isEmpty else { throw HelperError("paste needs text") }
             let r = try route(t, at: nil, foreground: foreground)
+            try await ensureKeyboard(r, run: run, action: "paste")
             try Policy.checkSecureFocus(r.pid)
             if foreground { prepareForeground(r) }
             try Connection.check()
@@ -2075,7 +2103,7 @@ enum Handlers {
             }
             Clipboard.giveBack()
         case "set_value":
-            guard let n = try elementNode(a, t) else { throw HelperError("set_value needs element or target") }
+            guard let n = try await elementNode(a, t) else { throw HelperError("set_value needs element or target") }
             if Policy.isSecure(n.element), !Policy.config.allowSecureFields { throw Policy.secureRefusal() }
             let text = a["value"] as? String ?? a["text"] as? String ?? ""
             let shown = try await reveal(n, aimName(a))  // scrolled to first if it's out of view, as for every action
@@ -2085,11 +2113,11 @@ enum Handlers {
             if !AX.setValue(n, text) { throw HelperError("the \(n.name) did not accept a value") }
             VerifyEdit.valueSet(n, text)  // when the act checks its edits
         case "focus":
-            guard let n = try elementNode(a, t) else { throw HelperError("focus needs element or target") }
+            guard let n = try await elementNode(a, t) else { throw HelperError("focus needs element or target") }
             _ = try await reveal(n, aimName(a))
             if !AX.focus(n) { throw HelperError("the \(n.name) can't take focus") }
         case "ax", "secondary", "perform":
-            guard let n = try elementNode(a, t) else { throw HelperError("\(type) needs element or target") }
+            guard let n = try await elementNode(a, t) else { throw HelperError("\(type) needs element or target") }
             let name = a["name"] as? String ?? a["ax_action"] as? String ?? "press"
             let idx = num(a["element"]) ?? 0
             if ["press", "axpress", "confirm", "axconfirm", "pick", "axpick"].contains(name.lowercased()), let pid = pid(t) {
@@ -2209,10 +2237,341 @@ enum Handlers {
         throw refused(r, keyboardRefusal(elsewhere(r, key: key)), retry: keyboardRetry(app: app, target: r.wid))
     }
 
+    /// When `r` routed a pointer action to a popover/menu over window `t` (`!r.primer || r.wid != w.id`),
+    /// return the main window route for keyboard checks and prompts so `FocusPrompt` never targets a transient popup.
+    static func mainRoute(_ t: Target, _ r: Route) -> Route {
+        if case .window(let w) = t, !r.primer || r.wid != w.id {
+            return Route(pid: w.pid, wid: w.id, frame: Windows.info(w.id)?.frame ?? w.frame, foreground: r.foreground)
+        }
+        return r
+    }
+
+    /// CG top-left frame of the user's active front window, used to pick the display for `FocusPrompt`.
+    static func activeWindowFrame() -> CGRect? {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier, pid != Windows.ownPID else { return nil }
+        if let wid = keyWindow(pid, timeout: 0.05), let f = Windows.info(wid)?.frame { return f }
+        return Windows.all(onScreenOnly: true).first { $0.pid == pid && $0.layer == 0 }?.frame
+    }
+
+    /// Whether the session holds an active, unrevoked `FocusGrant` for `pid` (and `wid`, when given).
+    static func validFocusGrant(pid: pid_t, wid: CGWindowID?) -> Bool {
+        guard let g = Session.current.focusGrant else { return false }
+        return g.isValid(pid: pid, wid: wid, now: ProcessInfo.processInfo.systemUptime,
+                         presses: Input.userPresses(), sinceExtra: Run.sinceUser(FocusGrant.extraRevokers))
+    }
+
+    /// Whether rebasing `Session.current.baseline` across a focus change is safe: never absorb a covered/frozen
+    /// window redraw or a title change into the baseline signature.
+    static func safeToFlipBaseline(_ w: WinInfo) -> Bool {
+        guard Session.current.baseline?.wid == w.id else { return false }
+        let m = meta[w.id]
+        guard m?.frozen == nil else { return false }
+        guard coverOf(w).cover == .inView else { return false }
+        if let seenTitle = m?.title, let nowTitle = Windows.info(w.id)?.title, nowTitle != seenTitle { return false }
+        return true
+    }
+
+    /// Move a background app's keyboard to the agent's own window `w` from `from` via a primer click, preserving
+    /// `Session.current.keyMove` (when moving off a user/shared window), wrapping in `baseline.flip` when safe,
+    /// and appending the note on success.
+    @discardableResult
+    static func moveKeyboardInBackground(_ w: WinInfo, from: CGWindowID, flip: Bool = true) async throws -> Bool {
+        guard !Hold.isFront(w.pid), owner(w.id) == .agent else { return false }
+        let fromAgent = owner(from) == .agent
+        let move: () async throws -> Void = {
+            if Hold.held[w.pid] != w.id {
+                _ = Hold.activate(pid: w.pid, wid: w.id)
+                try await Task.sleep(nanoseconds: 30_000_000)
+            }
+            SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
+            if !fromAgent { Session.current.keyMove = KeyMove(pid: w.pid, wid: w.id, from: from) }
+            await Input.primer(try route(.window(w), at: nil, foreground: false), force: true)
+            await Input.afterPrimer()
+            try await Run.pause(0.1)
+        }
+        if flip, let base = Session.current.baseline, safeToFlipBaseline(w) {
+            try await base.flip(move)
+        } else {
+            try await move()
+        }
+        guard AX.focusedWindow(pid: w.pid) == w.id else { return false }
+        if !fromAgent { Session.current.keyMove?.took = true }
+        let app = Policy.appName(w.pid)
+        if fromAgent {
+            notes.append("moved \(app)'s keyboard here from your other window #\(from)")
+        } else {
+            notes.append("moved \(app)'s keyboard to your window #\(w.id) from "
+                + (owner(from) == .shared ? "your #\(from), which the user has used" : "the user's #\(from)")
+                + "; it'll be in front when they next switch to \(app)")
+        }
+        return true
+    }
+
+    /// Activate `w` as its frontmost app's key window after the user clicked Approve on `FocusPrompt`, issuing a
+    /// `FocusGrant` if no new user key/click arrived during `raiseToKey`. Returns the window that kept focus if
+    /// raising failed (e.g. a modal sheet on another window), or nil on success.
+    static func activateApprovedFront(_ w: WinInfo, presses: Fronts.Presses, at: TimeInterval,
+                                      allowBaselineFlip: Bool, run: Run? = nil) async -> CGWindowID? {
+        var other: CGWindowID?
+        let raise: () async -> Void = {
+            SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
+            if let win = AX.window(pid: w.pid, wid: w.id) { AX.write(win, kAXMainAttribute, kCFBooleanTrue) }
+            other = try? await raiseToKey(w, pause: 0.08, wait: Run.pause)
+        }
+        if allowBaselineFlip, let base = Session.current.baseline, safeToFlipBaseline(w) {
+            await base.flip(raise)
+            if !base.typed, let run, run.changeBase?.wid == w.id, let sig = try? await changeLook(.window(w)) {
+                run.changeBase = (wid: w.id, sig: sig)
+            }
+        } else {
+            await raise()
+        }
+        guard !Connection.hungUp else { return other }
+        guard other == nil else { return other }
+        Fronts.watch()
+        if Input.userPresses() == presses {
+            Session.current.focusGrant = FocusGrant(pid: w.pid, wid: w.id, presses: presses, grantedAt: at)
+        }
+        if Session.current.owned[w.id] != nil {
+            Session.current.owned[w.id]?.since = ProcessInfo.processInfo.systemUptime
+            Session.current.owned[w.id]?.input = Input.userPresses()
+        }
+        Session.current.keyMove = nil
+        Session.current.refusals[w.id] = nil
+        return nil
+    }
+
+    /// Switch `w` to be its background app's key window after the user clicked Approve while in another app
+    /// (`back`), flashing briefly and returning focus to `back` before restoring the AppKit hold.
+    static func activateApprovedBackground(_ w: WinInfo, back: NSRunningApplication,
+                                           presses: Fronts.Presses, at: TimeInterval) async throws {
+        Hold.flashing[w.pid] = .infinity
+        SkyLight.makeKeyWindow(pid: w.pid, wid: w.id)
+        if let win = AX.window(pid: w.pid, wid: w.id) { AX.write(win, kAXMainAttribute, kCFBooleanTrue) }
+        let other = try? await raiseToKey(w, pause: 0.08) { await Input.sleep($0) }
+        if !Hold.isFront(w.pid) {
+            AX.write(AXUIElementCreateApplication(w.pid), kAXFrontmostAttribute, kCFBooleanTrue)
+            _ = await cameForward(w.pid, within: 0.2)
+        }
+        if back.processIdentifier != Windows.ownPID { _ = await giveBack(back) }
+        Hold.flashing[w.pid] = ProcessInfo.processInfo.systemUptime + 0.35
+        if !Hold.isFront(w.pid) {
+            if Hold.held[w.pid] == w.id {
+                Hold.restore(w.pid)
+            } else {
+                _ = Hold.activate(pid: w.pid, wid: w.id)
+                Hold.fresh.insert(w.pid)
+            }
+        } else {
+            Fronts.watch()
+            if Input.userPresses() == presses {
+                Session.current.focusGrant = FocusGrant(pid: w.pid, wid: w.id, presses: presses, grantedAt: at)
+            }
+            if Session.current.owned[w.id] != nil {
+                Session.current.owned[w.id]?.since = ProcessInfo.processInfo.systemUptime
+                Session.current.owned[w.id]?.input = Input.userPresses()
+            }
+        }
+        if let other {
+            throw HelperError("\(AgentBrowser.label(w)) didn't switch its keyboard to #\(w.id) (still on #\(other)), so the action didn't run")
+        }
+        guard AX.focusedWindow(pid: w.pid) == w.id else {
+            throw HelperError("\(AgentBrowser.label(w))'s keyboard didn't stay on #\(w.id), so the action didn't run")
+        }
+        Session.current.keyMove = nil
+        Session.current.refusals[w.id] = nil
+    }
+
+    /// Top-level pre-check for keyboard, menu, and modifier actions: fast-passes when `r` already safely owns its
+    /// app's keyboard, attempts silent background recovery for the agent's own window when applicable, and
+    /// otherwise asks the user via `FocusPrompt` when eligible before falling back to `guardKeyboard`.
+    static func ensureKeyboard(_ r: Route, run: Run? = nil, action: String? = nil) async throws {
+        try Connection.check()
+        if keysReachTarget(r) && switchedIn(r) == nil && !userAtKeys(r) { return }
+
+        func classify() -> (trigger: FocusPrompt.Trigger?, key: CGWindowID?) {
+            if switchedIn(r) != nil { return (.switchedIn, AX.focusedWindow(pid: r.pid)) }
+            if !keysReachTarget(r) { return (.otherWindow, AX.focusedWindow(pid: r.pid)) }
+            return (nil, nil)  // keysReachTarget && userAtKeys -> keyboardBusy: never prompt
+        }
+
+        func trySilentBackgroundMove(trigger: FocusPrompt.Trigger?, key: CGWindowID?) async throws -> Bool {
+            guard trigger == .otherWindow, !r.foreground, r.wid != 0, !Hold.isFront(r.pid),
+                  owner(r.wid) == .agent, let key, key != r.wid, let w = Windows.info(r.wid) else { return false }
+            if owner(key) != .agent, Session.current.keyMove?.wid == r.wid { return false }
+            _ = try await moveKeyboardInBackground(w, from: key)
+            return keysReachTarget(r) && switchedIn(r) == nil && !userAtKeys(r)
+        }
+
+        func hasHeldInput() -> Bool {
+            !Input.held.isEmpty || Run.active.values.contains {
+                $0.session === Session.current && ($0.run.heldButton != nil || !$0.run.heldKeys.isEmpty)
+            }
+        }
+
+        var (trigger, key) = classify()
+        if try await trySilentBackgroundMove(trigger: trigger, key: key) { return }
+        (trigger, key) = classify()
+
+        func checkEligible(_ trig: FocusPrompt.Trigger?) -> (ok: Bool, cooldown: FocusPrompt.CooldownReason?, win: WinInfo?) {
+            let win = Windows.info(r.wid)
+            let held = hasHeldInput()
+            let cooldown = FocusPrompt.activeCooldown(pid: r.pid)
+            let ok = FocusPrompt.shouldPromptKeyboard(
+                enabled: Connection.current?.focusPrompt ?? false,
+                quitting: Connection.quitting, foreground: r.foreground, wid: r.wid,
+                screenLocked: Windows.screenLocked, onScreen: win?.onScreen == true,
+                heldInput: held, inCooldown: cooldown != nil, trigger: trig
+            )
+            if !ok, let reason = cooldown,
+               FocusPrompt.shouldPromptKeyboard(enabled: Connection.current?.focusPrompt ?? false,
+                                                quitting: Connection.quitting, foreground: r.foreground, wid: r.wid,
+                                                screenLocked: Windows.screenLocked, onScreen: win?.onScreen == true,
+                                                heldInput: held, inCooldown: false, trigger: trig) {
+                return (false, reason, win)
+            }
+            return (ok, nil, win)
+        }
+
+        let initial = checkEligible(trigger)
+        if !initial.ok {
+            if let reason = initial.cooldown {
+                let app = initial.win.map { AgentBrowser.label($0) } ?? Policy.appName(r.pid)
+                throw HelperError(FocusPrompt.cooldownKeyboardError(app: app, wid: r.wid, reason: reason))
+            }
+            try guardKeyboard(r)
+            return
+        }
+
+        do { try await FocusPrompt.acquireGate() } catch {
+            Connection.current?.work.promptCancelled = true
+            throw Cancelled()
+        }
+        defer { FocusPrompt.releaseGate() }
+
+        if Connection.hungUp || Connection.quitting {
+            Connection.current?.work.promptCancelled = true
+            throw Cancelled()
+        }
+        if keysReachTarget(r) && switchedIn(r) == nil && !userAtKeys(r) { return }
+
+        (trigger, key) = classify()
+        if try await trySilentBackgroundMove(trigger: trigger, key: key) { return }
+        (trigger, key) = classify()
+
+        let again = checkEligible(trigger)
+        if !again.ok {
+            if let reason = again.cooldown {
+                let app = again.win.map { AgentBrowser.label($0) } ?? Policy.appName(r.pid)
+                throw HelperError(FocusPrompt.cooldownKeyboardError(app: app, wid: r.wid, reason: reason))
+            }
+            try guardKeyboard(r)
+            return
+        }
+
+        guard let targetWin = again.win, let trig = trigger else {
+            try guardKeyboard(r)
+            return
+        }
+        let front = Hold.isFront(r.pid)
+        let keyInfo = key.flatMap { Windows.info($0) }
+        let appLabel = AgentBrowser.label(targetWin)
+        let targetOwner = owner(r.wid)
+        let req = FocusPrompt.Request(
+            pid: r.pid, wid: r.wid, app: appLabel, title: targetWin.title,
+            targetOwner: targetOwner, keyWid: key, keyTitle: keyInfo?.title ?? "",
+            keyOwner: key.map { owner($0) } ?? .user, trigger: trig, action: action ?? "",
+            front: front, sessionOrdinal: Session.current.ordinal,
+            anchorFrame: (front ? keyInfo?.frame : nil) ?? activeWindowFrame()
+        )
+        let outcome = await FocusPrompt.ask(req) {
+            guard Windows.info(r.wid)?.onScreen == true,
+                  NSRunningApplication(processIdentifier: r.pid)?.isTerminated == false else { return .windowGone }
+            switch trig {
+            case .switchedIn:
+                if !Hold.isFront(r.pid) { return .clearedBackground }
+                return nil
+            case .otherWindow:
+                if !Hold.isFront(r.pid) && owner(r.wid) == .agent { return .clearedBackground }
+                if keyWindow(r.pid, timeout: 0.05) == r.wid { return .clearedFocused }
+                return nil
+            case .frozen:
+                return nil
+            }
+        }
+        let keyDesc: String? = trig == .switchedIn ? nil : key.map { k in
+            let kt = FocusPrompt.sanitizeTitle(keyInfo?.title ?? "", limit: 40)
+            return kt.isEmpty ? "#\(k)" : "#\(k) \"\(kt)\""
+        }
+        switch outcome {
+        case .approved(let presses, let at):
+            FocusPrompt.clearCooldown(pid: r.pid)
+            if Connection.hungUp || Connection.quitting {
+                Connection.current?.work.promptCancelled = true
+                throw Cancelled()
+            }
+            guard let fresh = Windows.info(r.wid), fresh.onScreen else {
+                throw HelperError("window #\(r.wid) is no longer on screen")
+            }
+            let liveFront = Hold.isFront(r.pid)
+            let back = NSWorkspace.shared.frontmostApplication
+            if liveFront || back == nil || back?.processIdentifier == Windows.ownPID {
+                if let other = await activateApprovedFront(fresh, presses: presses, at: at, allowBaselineFlip: true, run: run) {
+                    throw HelperError("\(appLabel) didn't switch its keyboard to #\(r.wid) (still on #\(other)), so the action didn't run")
+                }
+                if Connection.hungUp || Connection.quitting {
+                    Connection.current?.work.promptCancelled = true
+                    throw Cancelled()
+                }
+                let verb = trig == .switchedIn ? "allowed continuing in" : "approved switching \(appLabel) to"
+                Connection.current?.ownerNotes.append("the user \(verb) #\(r.wid)")
+            } else {
+                try await activateApprovedBackground(fresh, back: back!, presses: presses, at: at)
+                Connection.current?.ownerNotes.append("the user approved switching \(appLabel) to #\(r.wid) in the background")
+            }
+            try guardKeyboard(r)
+        case .declined:
+            FocusPrompt.recordDecline(pid: r.pid)
+            throw HelperError(FocusPrompt.declinedKeyboardError(app: appLabel, wid: r.wid, title: targetWin.title,
+                                                                targetOwner: targetOwner, keyDesc: keyDesc))
+        case .timedOut:
+            FocusPrompt.recordTimeout(pid: r.pid)
+            throw HelperError(FocusPrompt.timedOutKeyboardError(app: appLabel, wid: r.wid, title: targetWin.title,
+                                                                targetOwner: targetOwner, keyDesc: keyDesc,
+                                                                seconds: Int(FocusPrompt.timeout.rounded())))
+        case .clearedBackground:
+            if trig == .otherWindow, !Hold.isFront(r.pid), let fresh = Windows.info(r.wid),
+               let keyNow = AX.focusedWindow(pid: r.pid), keyNow != r.wid, owner(r.wid) == .agent {
+                _ = try await moveKeyboardInBackground(fresh, from: keyNow)
+            }
+            try guardKeyboard(r)
+        case .clearedFocused, .windowGone, .unavailable, .clearedInView:
+            try guardKeyboard(r)
+        case .cancelled:
+            Connection.current?.work.promptCancelled = true
+            throw Cancelled()
+        }
+    }
+
     /// Whether keys for `r`, whose window has its app's keyboard, wait for the user (`waitsForUser`), as things are now.
+    /// An active `FocusGrant` (from clicking Approve on `FocusPrompt`) lets keys through despite post-click mouse drift;
+    /// any real user input immediately marks it revoked and pauses keys until the user is quiet again (including on `.user` windows).
     static func userAtKeys(_ r: Route) -> Bool {
-        r.wid != 0 && waitsForUser(foreground: r.foreground, front: Hold.isFront(r.pid), targetOwner: owner(r.wid),
-                                   quiet: Input.userQuiet())
+        guard r.wid != 0, !r.foreground else { return false }
+        if var g = Session.current.focusGrant, g.matches(pid: r.pid, wid: r.wid) {
+            if g.isValid(pid: r.pid, wid: r.wid, now: ProcessInfo.processInfo.systemUptime,
+                         presses: Input.userPresses(), sinceExtra: Run.sinceUser(FocusGrant.extraRevokers)) {
+                return false
+            }
+            if !g.revoked {
+                g.revoked = true
+                Session.current.focusGrant = g
+            }
+            if !Input.userQuiet() { return true }
+            Session.current.focusGrant = nil
+        }
+        return waitsForUser(foreground: r.foreground, front: Hold.isFront(r.pid), targetOwner: owner(r.wid),
+                            quiet: Input.userQuiet())
     }
 
     /// Whether keys going to one of the agent's windows that has its app's keyboard (`targetOwner` not the user's)
@@ -2785,17 +3144,7 @@ enum Handlers {
                     // keyboard that never comes back by itself. Not once the user has come into the app: there
                     // their keyboard stays where they left it (guardKeyboard says so).
                     guard let from = focused, !Hold.isFront(w.pid) else { break }
-                    Session.current.keyMove = KeyMove(pid: w.pid, wid: w.id, from: from)
-                    await Input.primer(try route(t, at: nil, foreground: false), force: true)
-                    await Input.afterPrimer()
-                    try await Run.pause(0.1)
-                    // Didn't take: the keys stop, saying it won't move by itself.
-                    guard AX.focusedWindow(pid: w.pid) == w.id else { break }
-                    Session.current.keyMove?.took = true
-                    let app = Policy.appName(w.pid)
-                    notes.append("moved \(app)'s keyboard to your window #\(w.id) from "
-                        + (owner(from) == .shared ? "your #\(from), which the user has used" : "the user's #\(from)")
-                        + "; it'll be in front when they next switch to \(app)")
+                    _ = try await moveKeyboardInBackground(w, from: from, flip: false)
                 case .freshHold, .none:
                     break  // a new hold's click waits for the first key or menu command (`primeKeys`)
                 }
@@ -2862,6 +3211,7 @@ enum Handlers {
             Connection.current?.work.typed = 0
             Connection.current?.work.did = []
             Connection.current?.work.fields = nil
+            Connection.current?.work.promptCancelled = false
             if opening, i == 1 {
                 guard case .window(let w) = run.target, !noWindow() else {
                     errors.append("action \(base + 2) (\(kind(a))): there's no window to do it in: open brought up no "
@@ -3041,8 +3391,12 @@ enum Handlers {
             } catch {
                 if error is Cancelled || Connection.hungUp {
                     cancelled = true
-                    // (A wait or look that was cut short did nothing.)
-                    if done == i, !["wait", "sleep", "wait_for", "waitfor", "screenshot"].contains(kind(a)) {
+                    // (A wait, look, or pre-side-effect focus prompt that was cut short did nothing.)
+                    let promptOnly = Connection.current.map {
+                        let w = $0.work
+                        return w.promptCancelled && w.fields == nil && w.typed == 0 && w.did.isEmpty
+                    } == true
+                    if done == i, !promptOnly, !["wait", "sleep", "wait_for", "waitfor", "screenshot"].contains(kind(a)) {
                         Connection.current?.work.partial = partway(base + i + 1, a)
                     }
                     break
@@ -3113,6 +3467,7 @@ enum Handlers {
             }
             target = .window(nw)
             agentWindows.insert(nw.id)
+            if validFocusGrant(pid: nw.pid, wid: nil) { Session.current.focusGrant?.wid = nw.id }
             Connection.current?.work.opened.append(nw.id)
             current = nw.id
             before = nil

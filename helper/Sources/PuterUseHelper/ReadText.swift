@@ -114,9 +114,9 @@ extension Handlers {
     /// `read`: the element's text from `offset` (`limit` characters, as `clipboard` pages; a negative offset
     /// counts from the end), with what it is and where that part is in the whole: `read_range` = [start, end,
     /// total]. With a `query`, where that is in the text instead (`readReply`).
-    static func readText(_ t: Target, _ what: Any, _ p: [String: Any]) throws -> [String: Any] {
+    static func readText(_ t: Target, _ what: Any, _ p: [String: Any]) async throws -> [String: Any] {
         guard case .window(let w) = t else { throw HelperError("read needs a window, not the screen") }
-        var out = try readPart(try readTarget(what, w, t), p, in: w)
+        var out = try readPart(try await readTarget(what, w, t), p, in: w)
         out["window"] = describe(t)
         return out
     }
@@ -313,17 +313,16 @@ extension Handlers {
             let text = try await regionText(t, w, try regionRect(t, r))
             return ["read_of": regionName(r), "read": text]
         case .focused:
-            out = try readPart(try readFocused(w, t, asked: "read with no element, target or region"), a, in: w, takes: takes,
+            out = try readPart(try await readFocused(w, t, asked: "read with no element, target or region"), a, in: w, takes: takes,
                                again: false)
         case .element(let idx):
-            out = try readPart((idx, try numbered(w, idx, t)), a, in: w, takes: takes, again: false)
+            out = try readPart((idx, try await numbered(w, idx, t)), a, in: w, takes: takes, again: false)
         case .target(let v):
             // A macro step: what it read, where it was when the macro was saved (`elementNode` knows macro steps).
-            if a["units"] as? String == "pt", let n = try elementNode(a, t) {
+            if a["units"] as? String == "pt", let n = try await elementNode(a, t) {
                 out = try readPart((AX.registry(w.id).number(n), n), a, in: w, takes: takes, again: false)
             } else {
-                let found: (Int, AX.Node)
-                do { found = try findOne(v, t) } catch let e as NotFound { throw try missError(e, v, t) }
+                let found = try await findOneOrRevive(v, t)
                 out = try readPart(found, a, in: w, takes: takes, again: false)
             }
         }
@@ -345,10 +344,10 @@ extension Handlers {
 
     /// The element `what` names in `w`: a number (`12`, `"12"` or `"#12"`), what it shows (as `target`), or true
     /// for the focused text.
-    static func readTarget(_ what: Any, _ w: WinInfo, _ t: Target) throws -> (Int, AX.Node) {
-        if CFGetTypeID(what as CFTypeRef) == CFBooleanGetTypeID() { return try readFocused(w, t) }
-        if let idx = elementNumber(what) { return (idx, try numbered(w, idx, t)) }
-        do { return try findOne(what, t) } catch let e as NotFound { throw try missError(e, what, t) }  // as a target's miss
+    static func readTarget(_ what: Any, _ w: WinInfo, _ t: Target) async throws -> (Int, AX.Node) {
+        if CFGetTypeID(what as CFTypeRef) == CFBooleanGetTypeID() { return try await readFocused(w, t) }
+        if let idx = elementNumber(what) { return (idx, try await numbered(w, idx, t)) }
+        return try await findOneOrRevive(what, t)
     }
 
     /// The text that has the keyboard focus in `w` (or in what's open over it); else the window's only
@@ -358,7 +357,7 @@ extension Handlers {
     /// A window showing a web page reads the page instead: the page has the focus, or a link or button or
     /// field in it does, or the browser's own address bar does, or nothing does. Only a text area being
     /// written in on a page (a comment box, an editor) is read as itself.
-    static func readFocused(_ w: WinInfo, _ t: Target, asked: String = "read: true") throws -> (Int, AX.Node) {
+    static func readFocused(_ w: WinInfo, _ t: Target, asked: String = "read: true", again: Bool = false) async throws -> (Int, AX.Node) {
         if let f = AX.value(AX.appElement(w.pid), kAXFocusedUIElementAttribute), CFGetTypeID(f) == AXUIElementGetTypeID() {
             let el = f as! AXUIElement
             let role = AX.value(el, kAXRoleAttribute) as? String ?? ""
@@ -381,6 +380,13 @@ extension Handlers {
             }
         }
         if let page = windowPage(w) { return page }
+        if !again, isBrowser(w.pid) {
+            do { try await checkDrawn(t) } catch is Redrawn {
+                return try await readFocused(w, t, asked: asked, again: true)
+            } catch let e as NotDrawn {
+                throw e
+            }
+        }
         let areas = AX.search(pid: w.pid, windows: [w.id], query: "", role: "textarea", limit: 10)
         if areas.count == 1 {
             let id = number(areas[0], w.id)

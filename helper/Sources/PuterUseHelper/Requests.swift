@@ -32,6 +32,8 @@ final class Connection: @unchecked Sendable {  // only touched on the main threa
     var reviewed = Set<pid_t>()  // apps whose agent windows it has looked at for that (`Handlers.reviewOwnership`)
     var changeReviewed = Set<CGWindowID>()  // the agent's windows it's about, looked at for another site or tab count (`Handlers.reviewChange`)
     var bringForward = true  // its app may be brought forward to redraw one of the agent's windows (`Handlers.revive`)
+    var focusPrompt = true  // show a non-activating popup to ask the user before switching windows (`FocusPrompt`)
+    var promptWait: TimeInterval = 0  // seconds spent waiting on user focus prompts in this request (excluded from action timeouts)
     private var gone = false
 
     init(fd: Int32, key: RequestKey?, reports: Bool = true) {
@@ -84,6 +86,7 @@ struct Work {
     var did: [String] = []  // what else the action under way has done ("emptied the field", "pressed Return")
     var fields: (done: Int, of: Int)?  // a fill under way: the fields it has filled
     var opened: [CGWindowID] = []
+    var promptCancelled = false  // cancelled while waiting on FocusPrompt before side effects ran
 
     /// The note, or nil if it did nothing an agent would need to know about.
     func summary() -> String? {
